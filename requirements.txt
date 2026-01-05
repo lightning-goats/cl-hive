@@ -1,0 +1,8 @@
+# cl-hive: Distributed swarm intelligence for Core Lightning
+# Python dependencies
+
+# Core Lightning Python bindings
+# Provides Plugin base class, RPC methods, custom messaging
+pyln-client>=24.0
+
+# Note: sqlite3 is part of Python stdlib, no external dependency needed
