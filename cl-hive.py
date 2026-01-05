@@ -49,6 +49,7 @@ from modules.protocol import (
 from modules.handshake import HandshakeManager, Ticket
 from modules.state_manager import StateManager
 from modules.gossip import GossipManager
+from modules.intent_manager import IntentManager, Intent, IntentType
 
 # Initialize the plugin
 plugin = Plugin()
@@ -135,6 +136,7 @@ safe_plugin: Optional[ThreadSafePluginProxy] = None
 handshake_mgr: Optional[HandshakeManager] = None
 state_manager: Optional[StateManager] = None
 gossip_mgr: Optional[GossipManager] = None
+intent_mgr: Optional[IntentManager] = None
 
 
 # =============================================================================
@@ -276,6 +278,26 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Gossip manager initialized")
     
+    # Initialize intent manager (Phase 3)
+    # Get our pubkey for tie-breaker logic
+    our_pubkey = safe_plugin.rpc.getinfo()['id']
+    intent_mgr = IntentManager(
+        database,
+        safe_plugin,
+        our_pubkey=our_pubkey,
+        hold_seconds=config.intent_hold_seconds
+    )
+    plugin.log("cl-hive: Intent manager initialized")
+    
+    # Start background threads (Phase 3)
+    intent_thread = threading.Thread(
+        target=intent_monitor_loop,
+        name="cl-hive-intent-monitor",
+        daemon=True
+    )
+    intent_thread.start()
+    plugin.log("cl-hive: Intent monitor thread started")
+    
     # Verify cl-revenue-ops dependency (Circuit Breaker pattern)
     try:
         status = safe_plugin.rpc.call("revenue-status")
@@ -369,8 +391,13 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_state_hash(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.FULL_SYNC:
             return handle_full_sync(peer_id, msg_payload, plugin)
+        # Phase 3: Intent Lock Protocol
+        elif msg_type == HiveMessageType.INTENT:
+            return handle_intent(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.INTENT_ABORT:
+            return handle_intent_abort(peer_id, msg_payload, plugin)
         else:
-            # Known but unimplemented message type (Phase 3+)
+            # Known but unimplemented message type (Phase 4+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
             
@@ -666,6 +693,156 @@ def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
         })
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+
+
+# =============================================================================
+# PHASE 3: INTENT LOCK HANDLERS
+# =============================================================================
+
+def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_INTENT message (remote lock request).
+    
+    When we receive an intent from another node:
+    1. Record it for visibility
+    2. Check for conflicts with our pending intents
+    3. If conflict, apply tie-breaker (lowest pubkey wins)
+    4. If we lose, abort our local intent
+    """
+    if not intent_mgr:
+        return {"result": "continue"}
+    
+    # Parse the remote intent
+    remote_intent = Intent.from_dict(payload)
+    
+    # Record for visibility
+    intent_mgr.record_remote_intent(remote_intent)
+    
+    # Check for conflicts
+    has_conflict, we_win = intent_mgr.check_conflicts(remote_intent)
+    
+    if has_conflict:
+        if we_win:
+            # We win the tie-breaker - they should abort
+            plugin.log(f"cl-hive: INTENT conflict with {peer_id[:16]}..., we WIN tie-breaker")
+        else:
+            # We lose - abort our local intent
+            plugin.log(f"cl-hive: INTENT conflict with {peer_id[:16]}..., we LOSE tie-breaker")
+            intent_mgr.abort_local_intent(
+                target=remote_intent.target,
+                intent_type=remote_intent.intent_type
+            )
+            
+            # Broadcast our abort
+            broadcast_intent_abort(remote_intent.target, remote_intent.intent_type)
+    
+    return {"result": "continue"}
+
+
+def handle_intent_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_INTENT_ABORT message (remote node yielding).
+    
+    Update our record to show the remote node aborted their intent.
+    """
+    if not intent_mgr:
+        return {"result": "continue"}
+    
+    intent_type = payload.get('intent_type')
+    target = payload.get('target')
+    initiator = payload.get('initiator')
+    
+    intent_mgr.record_remote_abort(intent_type, target, initiator)
+    plugin.log(f"cl-hive: INTENT_ABORT from {peer_id[:16]}... for {target[:16]}...")
+    
+    return {"result": "continue"}
+
+
+def broadcast_intent_abort(target: str, intent_type: str) -> None:
+    """
+    Broadcast HIVE_INTENT_ABORT to all Hive members.
+    
+    Called when we lose a tie-breaker and need to yield.
+    """
+    if not database or not safe_plugin or not intent_mgr:
+        return
+    
+    members = database.get_all_members()
+    abort_payload = {
+        'intent_type': intent_type,
+        'target': target,
+        'initiator': intent_mgr.our_pubkey,
+        'reason': 'tie_breaker_loss'
+    }
+    abort_msg = serialize(HiveMessageType.INTENT_ABORT, abort_payload)
+    
+    for member in members:
+        member_id = member['peer_id']
+        if member_id == intent_mgr.our_pubkey:
+            continue  # Skip self
+        
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": member_id,
+                "msg": abort_msg.hex()
+            })
+        except Exception as e:
+            safe_plugin.log(f"Failed to send INTENT_ABORT to {member_id[:16]}...: {e}", level='debug')
+
+
+# =============================================================================
+# PHASE 3: INTENT MONITOR BACKGROUND THREAD
+# =============================================================================
+
+def intent_monitor_loop():
+    """
+    Background thread that monitors pending intents and commits them.
+    
+    Runs every 5 seconds and:
+    1. Checks for intents where hold period has elapsed
+    2. Commits them if no abort signal was received
+    3. Cleans up expired/stale intents
+    """
+    MONITOR_INTERVAL = 5  # seconds
+    
+    while not shutdown_event.is_set():
+        try:
+            if intent_mgr and database and config:
+                process_ready_intents()
+                intent_mgr.cleanup_expired_intents()
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Intent monitor error: {e}", level='warn')
+        
+        # Wait for next iteration or shutdown
+        shutdown_event.wait(MONITOR_INTERVAL)
+
+
+def process_ready_intents():
+    """
+    Process intents that are ready to commit.
+    
+    An intent is ready if:
+    - Status is 'pending'
+    - Current time > timestamp + hold_seconds
+    """
+    if not intent_mgr or not database or not config:
+        return
+    
+    ready_intents = database.get_pending_intents_ready(config.intent_hold_seconds)
+    
+    for intent_row in ready_intents:
+        intent_id = intent_row.get('id')
+        intent_type = intent_row.get('intent_type')
+        target = intent_row.get('target')
+        
+        # Commit the intent
+        if intent_mgr.commit_intent(intent_id):
+            if safe_plugin:
+                safe_plugin.log(f"cl-hive: Committed intent {intent_id}: {intent_type} -> {target[:16]}...")
+            
+            # Execute the action (callback registry)
+            intent_mgr.execute_committed_intent(intent_row)
 
 
 # =============================================================================
