@@ -41,6 +41,12 @@ from pyln.client import Plugin, RpcError
 # Import our modules
 from modules.config import HiveConfig
 from modules.database import HiveDatabase
+from modules.protocol import (
+    HIVE_MAGIC, HiveMessageType, 
+    is_hive_message, deserialize, serialize,
+    create_challenge, create_welcome
+)
+from modules.handshake import HandshakeManager, Ticket
 
 # Initialize the plugin
 plugin = Plugin()
@@ -124,6 +130,7 @@ class ThreadSafePluginProxy:
 database: Optional[HiveDatabase] = None
 config: Optional[HiveConfig] = None
 safe_plugin: Optional[ThreadSafePluginProxy] = None
+handshake_mgr: Optional[HandshakeManager] = None
 
 
 # =============================================================================
@@ -216,10 +223,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     1. Parse and validate options
     2. Initialize database
     3. Create thread-safe plugin proxy
-    4. Verify cl-revenue-ops dependency
-    5. Set up signal handlers for graceful shutdown
+    4. Initialize handshake manager
+    5. Verify cl-revenue-ops dependency
+    6. Set up signal handlers for graceful shutdown
     """
-    global database, config, safe_plugin
+    global database, config, safe_plugin, handshake_mgr
     
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
     
@@ -246,6 +254,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     database = HiveDatabase(config.db_path, safe_plugin)
     database.initialize()
     plugin.log(f"cl-hive: Database initialized at {config.db_path}")
+    
+    # Initialize handshake manager
+    handshake_mgr = HandshakeManager(safe_plugin.rpc, database, safe_plugin)
+    plugin.log("cl-hive: Handshake manager initialized")
     
     # Verify cl-revenue-ops dependency (Circuit Breaker pattern)
     try:
@@ -282,6 +294,247 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log(f"cl-hive: Could not set signal handlers: {e}", level='debug')
     
     plugin.log("cl-hive: Initialization complete. Swarm Intelligence ready.")
+
+
+# =============================================================================
+# CUSTOM MESSAGE HOOK (BOLT 8 Protocol Layer)
+# =============================================================================
+
+@plugin.hook("custommsg")
+def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
+    """
+    Handle incoming custom BOLT 8 messages.
+    
+    Security: Implements "Peek & Check" pattern.
+    - Read first 4 bytes of payload
+    - If != HIVE_MAGIC (0x48495645), return continue immediately
+    - Only process messages with valid Hive magic prefix
+    
+    This ensures cl-hive coexists peacefully with other plugins
+    using the experimental message range (32768+).
+    """
+    if not database or not handshake_mgr:
+        return {"result": "continue"}
+    
+    # Decode hex payload to bytes
+    try:
+        data = bytes.fromhex(payload)
+    except ValueError:
+        return {"result": "continue"}
+    
+    # SECURITY: Peek & Check - Fast rejection of non-Hive messages
+    if not is_hive_message(data):
+        # Not our message, let other plugins handle it
+        return {"result": "continue"}
+    
+    # Deserialize the Hive message
+    msg_type, msg_payload = deserialize(data)
+    
+    if msg_type is None:
+        # Malformed Hive message (magic matched but parse failed)
+        plugin.log(f"cl-hive: Malformed message from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+    
+    # Dispatch based on message type
+    try:
+        if msg_type == HiveMessageType.HELLO:
+            return handle_hello(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.CHALLENGE:
+            return handle_challenge(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.ATTEST:
+            return handle_attest(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.WELCOME:
+            return handle_welcome(peer_id, msg_payload, plugin)
+        else:
+            # Known but unimplemented message type (Phase 2+)
+            plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+            
+    except Exception as e:
+        plugin.log(f"cl-hive: Error handling {msg_type.name}: {e}", level='warn')
+        return {"result": "continue"}
+
+
+def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_HELLO message (ticket presentation).
+    
+    A candidate is presenting their invite ticket.
+    Verify the ticket and respond with a CHALLENGE.
+    """
+    ticket_b64 = payload.get('ticket')
+    if not ticket_b64:
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... missing ticket", level='warn')
+        return {"result": "continue"}
+    
+    # Verify the ticket
+    is_valid, ticket, error = handshake_mgr.verify_ticket(ticket_b64)
+    
+    if not is_valid:
+        plugin.log(f"cl-hive: Invalid ticket from {peer_id[:16]}...: {error}", level='warn')
+        return {"result": "continue"}
+    
+    # Generate challenge nonce
+    nonce = handshake_mgr.generate_challenge(peer_id)
+    
+    # Get Hive ID from an existing admin
+    members = database.get_all_members()
+    hive_id = "unknown"
+    for m in members:
+        if m['tier'] == 'admin' and m.get('metadata'):
+            import json
+            metadata = json.loads(m['metadata'])
+            hive_id = metadata.get('hive_id', 'unknown')
+            break
+    
+    # Send CHALLENGE response
+    challenge_msg = create_challenge(nonce, hive_id)
+    
+    try:
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": challenge_msg.hex()
+        })
+        plugin.log(f"cl-hive: Sent CHALLENGE to {peer_id[:16]}...")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to send CHALLENGE: {e}", level='warn')
+    
+    return {"result": "continue"}
+
+
+def handle_challenge(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_CHALLENGE message (nonce received).
+    
+    We received a challenge nonce - create and send attestation.
+    """
+    nonce = payload.get('nonce')
+    hive_id = payload.get('hive_id')
+    
+    if not nonce:
+        plugin.log(f"cl-hive: CHALLENGE from {peer_id[:16]}... missing nonce", level='warn')
+        return {"result": "continue"}
+    
+    # Create attestation manifest
+    try:
+        attest_data = handshake_mgr.create_manifest(nonce)
+        
+        # Build ATTEST message
+        from modules.protocol import create_attest
+        attest_msg = create_attest(
+            pubkey=attest_data['manifest']['pubkey'],
+            version=attest_data['manifest']['version'],
+            features=attest_data['manifest']['features'],
+            nonce_signature=attest_data['nonce_signature'],
+            manifest_signature=attest_data['manifest_signature']
+        )
+        
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": attest_msg.hex()
+        })
+        plugin.log(f"cl-hive: Sent ATTEST to {peer_id[:16]}...")
+        
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to create/send ATTEST: {e}", level='warn')
+    
+    return {"result": "continue"}
+
+
+def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_ATTEST message (manifest verification).
+    
+    Verify the candidate's attestation and send WELCOME if valid.
+    """
+    # Get the challenge we sent
+    expected_nonce = handshake_mgr.get_pending_challenge(peer_id)
+    if not expected_nonce:
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... but no pending challenge", level='warn')
+        return {"result": "continue"}
+    
+    # Reconstruct manifest for verification
+    manifest_data = {
+        "pubkey": payload.get('pubkey'),
+        "version": payload.get('version'),
+        "features": payload.get('features', []),
+        "timestamp": payload.get('timestamp', 0),
+        "nonce": expected_nonce  # Use our expected nonce
+    }
+    
+    nonce_sig = payload.get('nonce_signature')
+    manifest_sig = payload.get('manifest_signature')
+    
+    if not nonce_sig or not manifest_sig:
+        plugin.log(f"cl-hive: ATTEST from {peer_id[:16]}... missing signatures", level='warn')
+        return {"result": "continue"}
+    
+    # Verify manifest
+    is_valid, error = handshake_mgr.verify_manifest(
+        manifest_data, nonce_sig, manifest_sig, expected_nonce
+    )
+    
+    if not is_valid:
+        plugin.log(f"cl-hive: Invalid ATTEST from {peer_id[:16]}...: {error}", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+    
+    # Verification passed! Add as Neophyte member
+    import time
+    database.add_member(
+        peer_id=peer_id,
+        tier='neophyte',
+        joined_at=int(time.time())
+    )
+    
+    handshake_mgr.clear_challenge(peer_id)
+    
+    # Get Hive info for WELCOME
+    members = database.get_all_members()
+    hive_id = "hive"
+    for m in members:
+        if m['tier'] == 'admin' and m.get('metadata'):
+            import json
+            metadata = json.loads(m['metadata'])
+            hive_id = metadata.get('hive_id', 'hive')
+            break
+    
+    # TODO: Calculate real state hash
+    state_hash = "0" * 64
+    
+    # Send WELCOME
+    welcome_msg = create_welcome(hive_id, 'neophyte', len(members), state_hash)
+    
+    try:
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": welcome_msg.hex()
+        })
+        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new neophyte)")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
+    
+    return {"result": "continue"}
+
+
+def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HIVE_WELCOME message (session established).
+    
+    We've been accepted into the Hive!
+    """
+    hive_id = payload.get('hive_id')
+    tier = payload.get('tier')
+    member_count = payload.get('member_count')
+    
+    plugin.log(
+        f"cl-hive: WELCOME received! Joined '{hive_id}' as {tier} "
+        f"(Hive has {member_count} members)"
+    )
+    
+    # TODO: Store Hive membership info, initiate state sync
+    
+    return {"result": "continue"}
 
 
 # =============================================================================
@@ -340,52 +593,110 @@ def hive_members(plugin: Plugin):
 
 
 @plugin.method("hive-genesis")
-def hive_genesis(plugin: Plugin):
+def hive_genesis(plugin: Plugin, hive_id: str = None):
     """
     Initialize this node as the Genesis (Admin) node of a new Hive.
     
-    This creates the first member record with admin privileges.
-    Can only be called once per Hive.
+    This creates the first member record with admin privileges and
+    generates a self-signed genesis ticket.
+    
+    Args:
+        hive_id: Optional custom Hive identifier (auto-generated if not provided)
     
     Returns:
         Dict with genesis status and admin ticket
     """
-    if not database or not safe_plugin:
+    if not database or not safe_plugin or not handshake_mgr:
         return {"error": "Hive not initialized"}
     
-    # Check if genesis already occurred
-    members = database.get_all_members()
-    if members:
-        return {"error": "Hive already has members. Genesis can only be called once."}
-    
-    # Get our node ID
     try:
-        info = safe_plugin.rpc.getinfo()
-        our_id = info.get("id", "")
+        result = handshake_mgr.genesis(hive_id)
+        return result
+    except ValueError as e:
+        return {"error": str(e)}
     except Exception as e:
-        return {"error": f"Could not get node info: {e}"}
+        return {"error": f"Genesis failed: {e}"}
+
+
+@plugin.method("hive-invite")
+def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0):
+    """
+    Generate an invitation ticket for a new member.
     
-    if not our_id:
-        return {"error": "Could not determine node ID"}
+    Only Admins can generate invite tickets.
     
-    # Create admin record
-    import time
-    now = int(time.time())
+    Args:
+        valid_hours: Hours until ticket expires (default: 24)
+        requirements: Bitmask of required features (default: 0 = none)
     
-    database.add_member(
-        peer_id=our_id,
-        tier='admin',
-        joined_at=now,
-        promoted_at=now,
-    )
+    Returns:
+        Dict with base64-encoded ticket
+    """
+    if not handshake_mgr:
+        return {"error": "Hive not initialized"}
     
-    plugin.log(f"cl-hive: Genesis complete. Node {our_id[:16]}... is now Hive Admin.")
+    try:
+        ticket = handshake_mgr.generate_invite_ticket(valid_hours, requirements)
+        return {
+            "status": "ticket_generated",
+            "ticket": ticket,
+            "valid_hours": valid_hours,
+            "instructions": "Share this ticket with the candidate. They should use 'hive-join <ticket>' to request membership."
+        }
+    except PermissionError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Failed to generate ticket: {e}"}
+
+
+@plugin.method("hive-join")
+def hive_join(plugin: Plugin, ticket: str, peer_id: str = None):
+    """
+    Request to join a Hive using an invitation ticket.
     
-    return {
-        "status": "genesis_complete",
-        "admin_id": our_id,
-        "message": "This node is now the Genesis Admin. Use 'hive-invite' to add members.",
-    }
+    This initiates the handshake protocol by sending a HELLO message
+    to a known Hive member.
+    
+    Args:
+        ticket: Base64-encoded invitation ticket
+        peer_id: Node ID of a known Hive member (optional, extracted from ticket if not provided)
+    
+    Returns:
+        Dict with join request status
+    """
+    if not handshake_mgr or not safe_plugin:
+        return {"error": "Hive not initialized"}
+    
+    # Decode ticket to get admin pubkey if peer_id not provided
+    try:
+        ticket_obj = Ticket.from_base64(ticket)
+        if not peer_id:
+            peer_id = ticket_obj.admin_pubkey
+    except Exception as e:
+        return {"error": f"Invalid ticket format: {e}"}
+    
+    # Check if ticket is expired
+    if ticket_obj.is_expired():
+        return {"error": "Ticket has expired"}
+    
+    # Send HELLO message
+    from modules.protocol import create_hello
+    hello_msg = create_hello(ticket)
+    
+    try:
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": hello_msg.hex()
+        })
+        
+        return {
+            "status": "join_requested",
+            "target_peer": peer_id[:16] + "...",
+            "hive_id": ticket_obj.hive_id,
+            "message": "HELLO sent. Awaiting CHALLENGE from Hive member."
+        }
+    except Exception as e:
+        return {"error": f"Failed to send HELLO: {e}"}
 
 
 # =============================================================================
