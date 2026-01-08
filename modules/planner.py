@@ -30,6 +30,18 @@ except ImportError:
         """Stub RpcError for testing."""
         pass
 
+try:
+    from modules.intent_manager import IntentType
+    from modules.protocol import serialize, HiveMessageType
+except ImportError:
+    # For testing - define stubs
+    class IntentType:
+        CHANNEL_OPEN = 'channel_open'
+    class HiveMessageType:
+        INTENT = 'intent'
+    def serialize(msg_type, payload):
+        return b''
+
 
 # =============================================================================
 # CONSTANTS
@@ -46,6 +58,15 @@ SATURATION_RELEASE_THRESHOLD_PCT = 0.15  # Release ignore at 15%
 
 # Minimum public capacity to consider a target (anti-Sybil)
 MIN_TARGET_CAPACITY_SATS = 100_000_000  # 1 BTC
+
+# Underserved threshold (targets with low Hive share)
+UNDERSERVED_THRESHOLD_PCT = 0.05  # < 5% Hive share = underserved
+
+# Minimum channel size for expansion (sats)
+MIN_CHANNEL_SIZE_SATS = 100_000  # 100k sats minimum
+
+# Maximum expansion proposals per cycle (rate limiting)
+MAX_EXPANSIONS_PER_CYCLE = 1
 
 
 # =============================================================================
@@ -73,6 +94,15 @@ class SaturationResult:
     should_release: bool
 
 
+@dataclass
+class UnderservedResult:
+    """Result identifying an underserved target for expansion."""
+    target: str
+    public_capacity_sats: int
+    hive_share_pct: float
+    score: float  # Higher = more attractive for expansion
+
+
 # =============================================================================
 # PLANNER CLASS
 # =============================================================================
@@ -92,7 +122,8 @@ class Planner:
     - No sleeping inside run_cycle
     """
 
-    def __init__(self, state_manager, database, bridge, clboss_bridge, plugin=None):
+    def __init__(self, state_manager, database, bridge, clboss_bridge, plugin=None,
+                 intent_manager=None):
         """
         Initialize the Planner.
 
@@ -102,12 +133,14 @@ class Planner:
             bridge: Integration Bridge for cl-revenue-ops
             clboss_bridge: CLBossBridge for ignore/unignore operations
             plugin: Plugin reference for RPC and logging
+            intent_manager: IntentManager for coordinated channel opens
         """
         self.state_manager = state_manager
         self.db = database
         self.bridge = bridge
         self.clboss = clboss_bridge
         self.plugin = plugin
+        self.intent_manager = intent_manager
 
         # Network cache (refreshed each cycle)
         self._network_cache: Dict[str, List[ChannelInfo]] = {}
@@ -115,6 +148,9 @@ class Planner:
 
         # Track currently ignored peers (to avoid duplicate ignores)
         self._ignored_peers: Set[str] = set()
+
+        # Track expansion proposals this cycle (rate limiting)
+        self._expansions_this_cycle: int = 0
 
     def _log(self, msg: str, level: str = "info") -> None:
         """Log a message if plugin is available."""
@@ -582,6 +618,299 @@ class Planner:
         return decisions
 
     # =========================================================================
+    # EXPANSION LOGIC (Ticket 6-02)
+    # =========================================================================
+
+    def get_underserved_targets(self, cfg) -> List[UnderservedResult]:
+        """
+        Get targets with low Hive coverage that are candidates for expansion.
+
+        Criteria:
+        - Public capacity > MIN_TARGET_CAPACITY_SATS (1 BTC)
+        - Hive share < UNDERSERVED_THRESHOLD_PCT (5%)
+        - Target exists in public graph (verified via network cache)
+
+        Returns:
+            List of UnderservedResult sorted by score (highest first)
+        """
+        underserved = []
+
+        for target in self._network_cache.keys():
+            # Check minimum capacity (anti-Sybil)
+            public_capacity = self._get_public_capacity_to_target(target)
+            if public_capacity < MIN_TARGET_CAPACITY_SATS:
+                continue
+
+            # Calculate Hive share
+            result = self._calculate_hive_share(target, cfg)
+
+            # Check if underserved (< 5% Hive share)
+            if result.hive_share_pct >= UNDERSERVED_THRESHOLD_PCT:
+                continue
+
+            # Calculate score: higher capacity + lower Hive share = more attractive
+            # Score = capacity_btc * (1 - hive_share)
+            capacity_btc = public_capacity / 100_000_000
+            score = capacity_btc * (1 - result.hive_share_pct)
+
+            underserved.append(UnderservedResult(
+                target=target,
+                public_capacity_sats=public_capacity,
+                hive_share_pct=result.hive_share_pct,
+                score=score
+            ))
+
+        # Sort by score (highest first)
+        underserved.sort(key=lambda r: r.score, reverse=True)
+        return underserved
+
+    def _get_local_onchain_balance(self) -> int:
+        """
+        Get local confirmed onchain balance.
+
+        Returns:
+            Confirmed balance in satoshis, or 0 on error
+        """
+        if not self.plugin:
+            return 0
+
+        try:
+            funds = self.plugin.rpc.listfunds()
+            outputs = funds.get('outputs', [])
+
+            confirmed_sats = 0
+            for output in outputs:
+                # Only count confirmed outputs
+                if output.get('status') == 'confirmed':
+                    # Handle both msat and satoshi formats
+                    amount = output.get('amount_msat')
+                    if amount is not None:
+                        if isinstance(amount, int):
+                            confirmed_sats += amount // 1000
+                        elif isinstance(amount, str) and amount.endswith('msat'):
+                            confirmed_sats += int(amount[:-4]) // 1000
+                    else:
+                        # Fallback to value field
+                        confirmed_sats += output.get('value', 0)
+
+            return confirmed_sats
+        except RpcError as e:
+            self._log(f"listfunds RPC failed: {e}", level='warn')
+            return 0
+        except Exception as e:
+            self._log(f"Error getting onchain balance: {e}", level='warn')
+            return 0
+
+    def _has_pending_intent(self, target: str) -> bool:
+        """
+        Check if there's already a pending intent for this target.
+
+        Args:
+            target: Target pubkey to check
+
+        Returns:
+            True if a pending intent exists, False otherwise
+        """
+        if not self.db:
+            return False
+
+        pending = self.db.get_pending_intents()
+        for intent in pending:
+            if intent.get('target') == target and intent.get('status') == 'pending':
+                return True
+        return False
+
+    def _propose_expansion(self, cfg, run_id: str) -> List[Dict[str, Any]]:
+        """
+        Propose channel expansions to underserved targets.
+
+        Security constraints:
+        - Only when planner_enable_expansions is True
+        - Max 1 expansion per cycle
+        - Must have sufficient onchain funds (> 2 * MIN_CHANNEL_SIZE)
+        - Target must exist in public graph
+        - No existing pending intent for target
+        - Governance mode must be 'autonomous' to broadcast
+
+        Args:
+            cfg: Config snapshot
+            run_id: Unique identifier for this cycle
+
+        Returns:
+            List of decision records
+        """
+        decisions = []
+
+        # Check if expansions are enabled
+        if not cfg.planner_enable_expansions:
+            return decisions
+
+        # Check rate limit
+        if self._expansions_this_cycle >= MAX_EXPANSIONS_PER_CYCLE:
+            self._log("Expansion rate limit reached for this cycle", level='debug')
+            return decisions
+
+        # Check if we have an intent manager
+        if not self.intent_manager:
+            self._log("IntentManager not available, skipping expansions", level='debug')
+            return decisions
+
+        # Check onchain balance
+        onchain_balance = self._get_local_onchain_balance()
+        min_required = MIN_CHANNEL_SIZE_SATS * 2
+
+        if onchain_balance < min_required:
+            self._log(
+                f"Insufficient onchain funds for expansion: "
+                f"{onchain_balance} < {min_required} sats",
+                level='debug'
+            )
+            self.db.log_planner_action(
+                action_type='expansion',
+                result='skipped',
+                details={
+                    'reason': 'insufficient_funds',
+                    'onchain_balance': onchain_balance,
+                    'min_required': min_required,
+                    'run_id': run_id
+                }
+            )
+            return decisions
+
+        # Get underserved targets
+        underserved = self.get_underserved_targets(cfg)
+        if not underserved:
+            self._log("No underserved targets found", level='debug')
+            return decisions
+
+        # Find a target without pending intent
+        selected_target = None
+        for candidate in underserved:
+            if not self._has_pending_intent(candidate.target):
+                selected_target = candidate
+                break
+
+        if not selected_target:
+            self._log("All underserved targets have pending intents", level='debug')
+            return decisions
+
+        # Create intent and potentially broadcast
+        self._log(
+            f"Proposing expansion to {selected_target.target[:16]}... "
+            f"(share={selected_target.hive_share_pct:.1%}, "
+            f"capacity={selected_target.public_capacity_sats} sats)"
+        )
+
+        try:
+            # Create the intent
+            intent = self.intent_manager.create_intent(
+                intent_type=IntentType.CHANNEL_OPEN.value if hasattr(IntentType.CHANNEL_OPEN, 'value') else IntentType.CHANNEL_OPEN,
+                target=selected_target.target
+            )
+
+            self._expansions_this_cycle += 1
+
+            # Log the decision
+            self.db.log_planner_action(
+                action_type='expansion',
+                result='proposed',
+                target=selected_target.target,
+                details={
+                    'intent_id': intent.intent_id,
+                    'public_capacity_sats': selected_target.public_capacity_sats,
+                    'hive_share_pct': round(selected_target.hive_share_pct, 4),
+                    'score': round(selected_target.score, 4),
+                    'onchain_balance': onchain_balance,
+                    'run_id': run_id
+                }
+            )
+
+            decisions.append({
+                'action': 'expansion_proposed',
+                'target': selected_target.target,
+                'intent_id': intent.intent_id,
+                'hive_share_pct': selected_target.hive_share_pct
+            })
+
+            # Broadcast intent only in autonomous mode
+            if cfg.governance_mode == 'autonomous':
+                self._broadcast_intent(intent)
+                decisions[-1]['broadcast'] = True
+            else:
+                # In advisor mode, just queue the intent (already in DB)
+                self._log(
+                    f"Intent queued (mode={cfg.governance_mode}), not broadcasting",
+                    level='debug'
+                )
+                decisions[-1]['broadcast'] = False
+
+        except Exception as e:
+            self._log(f"Failed to create expansion intent: {e}", level='warn')
+            self.db.log_planner_action(
+                action_type='expansion',
+                result='failed',
+                target=selected_target.target,
+                details={
+                    'error': str(e),
+                    'run_id': run_id
+                }
+            )
+            decisions.append({
+                'action': 'expansion_failed',
+                'target': selected_target.target,
+                'error': str(e)
+            })
+
+        return decisions
+
+    def _broadcast_intent(self, intent) -> bool:
+        """
+        Broadcast an intent to all Hive members.
+
+        Args:
+            intent: Intent object to broadcast
+
+        Returns:
+            True if broadcast was successful, False otherwise
+        """
+        if not self.plugin or not self.db or not self.intent_manager:
+            return False
+
+        try:
+            # Create intent message payload
+            payload = self.intent_manager.create_intent_message(intent)
+            msg_bytes = serialize(HiveMessageType.INTENT, payload)
+
+            # Get all Hive members
+            members = self.db.get_all_members()
+            our_pubkey = self.intent_manager.our_pubkey
+
+            broadcast_count = 0
+            for member in members:
+                member_id = member.get('peer_id')
+                if not member_id or member_id == our_pubkey:
+                    continue
+
+                try:
+                    self.plugin.rpc.call("sendcustommsg", {
+                        "node_id": member_id,
+                        "msg": msg_bytes.hex()
+                    })
+                    broadcast_count += 1
+                except Exception as e:
+                    self._log(
+                        f"Failed to send INTENT to {member_id[:16]}...: {e}",
+                        level='debug'
+                    )
+
+            self._log(f"Broadcast INTENT to {broadcast_count} peers")
+            return broadcast_count > 0
+
+        except Exception as e:
+            self._log(f"Broadcast failed: {e}", level='warn')
+            return False
+
+    # =========================================================================
     # RUN CYCLE
     # =========================================================================
 
@@ -612,6 +941,9 @@ class Planner:
         self._log(f"Starting planner cycle (run_id={run_id})")
         decisions = []
 
+        # Reset per-cycle counters
+        self._expansions_this_cycle = 0
+
         try:
             # Refresh network cache first
             if not self._refresh_network_cache(force=True):
@@ -631,8 +963,9 @@ class Planner:
             release_decisions = self._release_saturation(cfg, run_id)
             decisions.extend(release_decisions)
 
-            # NOTE: Expansion logic will be added in Ticket 6-03
-            # For now, this ticket only implements saturation detection and guard
+            # Propose channel expansions (Ticket 6-02)
+            expansion_decisions = self._propose_expansion(cfg, run_id)
+            decisions.extend(expansion_decisions)
 
             self._log(f"Planner cycle complete (run_id={run_id}): {len(decisions)} decisions")
             self.db.log_planner_action(

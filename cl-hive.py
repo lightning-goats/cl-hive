@@ -444,7 +444,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database=database,
         bridge=bridge,
         clboss_bridge=clboss_bridge,
-        plugin=safe_plugin
+        plugin=safe_plugin,
+        intent_manager=intent_mgr
     )
     plugin.log("cl-hive: Planner initialized")
 

@@ -565,5 +565,248 @@ class TestSaturationRelease:
         assert target not in planner._ignored_peers
 
 
+# =============================================================================
+# EXPANSION LOGIC TESTS (Ticket 6-02)
+# =============================================================================
+
+class TestExpansionLogic:
+    """Test expansion proposal logic."""
+
+    def test_expansion_disabled_by_default(self, planner, mock_config):
+        """Expansion should not run when planner_enable_expansions is False."""
+        mock_config.planner_enable_expansions = False
+
+        decisions = planner._propose_expansion(mock_config, 'test-disabled')
+
+        assert decisions == []
+
+    def test_expansion_requires_intent_manager(self, planner, mock_config):
+        """Expansion should skip if intent_manager is not available."""
+        mock_config.planner_enable_expansions = True
+        planner.intent_manager = None
+
+        decisions = planner._propose_expansion(mock_config, 'test-no-intent-mgr')
+
+        assert decisions == []
+
+    def test_expansion_requires_sufficient_funds(self, planner, mock_config, mock_plugin):
+        """Expansion should skip if onchain balance is insufficient."""
+        mock_config.planner_enable_expansions = True
+
+        # Setup mock intent manager
+        mock_intent_mgr = MagicMock()
+        planner.intent_manager = mock_intent_mgr
+
+        # Mock insufficient funds
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [
+                {'status': 'confirmed', 'amount_msat': 50000000}  # 50k sats < 200k required
+            ]
+        }
+
+        decisions = planner._propose_expansion(mock_config, 'test-low-funds')
+
+        assert decisions == []
+        mock_intent_mgr.create_intent.assert_not_called()
+
+    def test_expansion_proposes_to_underserved_target(self, planner, mock_config, mock_plugin, mock_database):
+        """Should propose expansion to underserved target when all conditions are met."""
+        mock_config.planner_enable_expansions = True
+        mock_config.governance_mode = 'autonomous'
+
+        target = '02' + 'u' * 64
+
+        # Setup mock intent manager
+        mock_intent_mgr = MagicMock()
+        mock_intent = MagicMock()
+        mock_intent.intent_id = 123
+        mock_intent_mgr.create_intent.return_value = mock_intent
+        mock_intent_mgr.our_pubkey = '02' + 'a' * 64
+        mock_intent_mgr.create_intent_message.return_value = {'intent_type': 'channel_open', 'target': target}
+        planner.intent_manager = mock_intent_mgr
+
+        # Mock sufficient funds
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [
+                {'status': 'confirmed', 'amount_msat': 500000000}  # 500k sats
+            ]
+        }
+
+        # Mock underserved targets
+        from modules.planner import UnderservedResult
+        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
+            mock_get_underserved.return_value = [
+                UnderservedResult(
+                    target=target,
+                    public_capacity_sats=200_000_000,
+                    hive_share_pct=0.02,
+                    score=2.0
+                )
+            ]
+
+            # Mock no pending intents
+            mock_database.get_pending_intents.return_value = []
+
+            # Mock members for broadcast
+            mock_database.get_all_members.return_value = [
+                {'peer_id': '02' + 'b' * 64}
+            ]
+
+            decisions = planner._propose_expansion(mock_config, 'test-propose')
+
+        assert len(decisions) == 1
+        assert decisions[0]['action'] == 'expansion_proposed'
+        assert decisions[0]['target'] == target
+        mock_intent_mgr.create_intent.assert_called_once()
+
+    def test_expansion_skips_target_with_pending_intent(self, planner, mock_config, mock_plugin, mock_database):
+        """Should skip targets that already have pending intents."""
+        mock_config.planner_enable_expansions = True
+
+        target = '02' + 'v' * 64
+
+        # Setup mock intent manager
+        mock_intent_mgr = MagicMock()
+        planner.intent_manager = mock_intent_mgr
+
+        # Mock sufficient funds
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+        }
+
+        # Mock underserved targets
+        from modules.planner import UnderservedResult
+        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
+            mock_get_underserved.return_value = [
+                UnderservedResult(
+                    target=target,
+                    public_capacity_sats=200_000_000,
+                    hive_share_pct=0.02,
+                    score=2.0
+                )
+            ]
+
+            # Mock existing pending intent for target
+            mock_database.get_pending_intents.return_value = [
+                {'target': target, 'status': 'pending'}
+            ]
+
+            decisions = planner._propose_expansion(mock_config, 'test-pending')
+
+        assert decisions == []
+        mock_intent_mgr.create_intent.assert_not_called()
+
+    def test_expansion_rate_limit(self, planner, mock_config, mock_plugin, mock_database):
+        """Should respect max expansions per cycle limit."""
+        mock_config.planner_enable_expansions = True
+
+        # Simulate already at rate limit
+        planner._expansions_this_cycle = 1  # MAX_EXPANSIONS_PER_CYCLE is 1
+
+        mock_intent_mgr = MagicMock()
+        planner.intent_manager = mock_intent_mgr
+
+        decisions = planner._propose_expansion(mock_config, 'test-rate-limit')
+
+        assert decisions == []
+        mock_intent_mgr.create_intent.assert_not_called()
+
+    def test_expansion_advisor_mode_no_broadcast(self, planner, mock_config, mock_plugin, mock_database):
+        """In advisor mode, intent should be queued but not broadcast."""
+        mock_config.planner_enable_expansions = True
+        mock_config.governance_mode = 'advisor'
+
+        target = '02' + 'w' * 64
+
+        # Setup mock intent manager
+        mock_intent_mgr = MagicMock()
+        mock_intent = MagicMock()
+        mock_intent.intent_id = 456
+        mock_intent_mgr.create_intent.return_value = mock_intent
+        planner.intent_manager = mock_intent_mgr
+
+        # Mock sufficient funds
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+        }
+
+        from modules.planner import UnderservedResult
+        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
+            mock_get_underserved.return_value = [
+                UnderservedResult(
+                    target=target,
+                    public_capacity_sats=200_000_000,
+                    hive_share_pct=0.02,
+                    score=2.0
+                )
+            ]
+
+            mock_database.get_pending_intents.return_value = []
+
+            decisions = planner._propose_expansion(mock_config, 'test-advisor')
+
+        assert len(decisions) == 1
+        assert decisions[0]['broadcast'] is False
+
+
+class TestUnderservedTargets:
+    """Test underserved target identification."""
+
+    def test_get_underserved_targets_basic(self, planner, mock_config, mock_plugin, mock_database, mock_state_manager):
+        """Should identify targets with low Hive share."""
+        target = '02' + 'x' * 64
+
+        # Setup network cache with high-capacity target
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'd' * 64,
+                    'destination': target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 200_000_000,  # 2 BTC
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        # No Hive members to calculate share
+        mock_database.get_all_members.return_value = []
+        mock_state_manager.get_all_peer_states.return_value = []
+
+        underserved = planner.get_underserved_targets(mock_config)
+
+        # Should find targets since Hive share is 0%
+        # Both source and destination are indexed, so we may get both
+        assert len(underserved) >= 1
+        # Our specific target should be in the results
+        target_results = [u for u in underserved if u.target == target]
+        assert len(target_results) == 1
+        assert target_results[0].hive_share_pct == 0.0
+
+    def test_get_underserved_skips_small_targets(self, planner, mock_config, mock_plugin):
+        """Should skip targets below minimum capacity."""
+        small_target = '02' + 'y' * 64
+
+        # Setup network cache with small target
+        mock_plugin.rpc.listchannels.return_value = {
+            'channels': [
+                {
+                    'source': '02' + 'd' * 64,
+                    'destination': small_target,
+                    'short_channel_id': '100x1x0',
+                    'satoshis': 50_000_000,  # 0.5 BTC < 1 BTC threshold
+                    'active': True
+                }
+            ]
+        }
+        planner._refresh_network_cache(force=True)
+
+        underserved = planner.get_underserved_targets(mock_config)
+
+        # Should not find the target (too small)
+        assert len(underserved) == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
