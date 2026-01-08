@@ -162,6 +162,62 @@ class HiveDatabase:
             CREATE INDEX IF NOT EXISTS idx_contribution_peer_time 
             ON contribution_ledger(peer_id, timestamp)
         """)
+
+        # =====================================================================
+        # PROMOTION VOUCHES TABLE
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS promotion_vouches (
+                target_peer_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                voucher_peer_id TEXT NOT NULL,
+                sig TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                PRIMARY KEY (target_peer_id, request_id, voucher_peer_id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_promotion_vouches_target_req
+            ON promotion_vouches(target_peer_id, request_id)
+        """)
+
+        # =====================================================================
+        # PROMOTION REQUESTS TABLE
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS promotion_requests (
+                target_peer_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (target_peer_id, request_id)
+            )
+        """)
+
+        # =====================================================================
+        # PEER PRESENCE TABLE
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_presence (
+                peer_id TEXT PRIMARY KEY,
+                last_change_ts INTEGER NOT NULL,
+                is_online INTEGER NOT NULL,
+                online_seconds_rolling INTEGER NOT NULL,
+                window_start_ts INTEGER NOT NULL
+            )
+        """)
+
+        # =====================================================================
+        # LEECH FLAGS TABLE
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leech_flags (
+                peer_id TEXT PRIMARY KEY,
+                low_since_ts INTEGER NOT NULL,
+                ban_triggered INTEGER NOT NULL DEFAULT 0
+            )
+        """)
         
         # =====================================================================
         # HIVE BANS TABLE
@@ -449,6 +505,33 @@ class HiveDatabase:
             INSERT INTO contribution_ledger (peer_id, direction, amount_sats, timestamp)
             VALUES (?, ?, ?, ?)
         """, (peer_id, direction, amount_sats, now))
+
+    def get_contribution_stats(self, peer_id: str, window_days: int = 30) -> Dict[str, int]:
+        """
+        Get contribution totals within the window.
+        
+        Returns:
+            Dict with forwarded and received totals in sats
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (window_days * 86400)
+        
+        rows = conn.execute("""
+            SELECT direction, SUM(amount_sats) as total
+            FROM contribution_ledger
+            WHERE peer_id = ? AND timestamp > ?
+            GROUP BY direction
+        """, (peer_id, cutoff)).fetchall()
+        
+        forwarded = 0
+        received = 0
+        for row in rows:
+            if row['direction'] == 'forwarded':
+                forwarded = row['total'] or 0
+            elif row['direction'] == 'received':
+                received = row['total'] or 0
+        
+        return {"forwarded": forwarded, "received": received}
     
     def get_contribution_ratio(self, peer_id: str, window_days: int = 30) -> float:
         """
@@ -487,7 +570,7 @@ class HiveDatabase:
         
         return forwarded / received
     
-    def prune_old_contributions(self, older_than_days: int = 90) -> int:
+    def prune_old_contributions(self, older_than_days: int = 45) -> int:
         """Remove contribution records older than specified days."""
         conn = self._get_connection()
         cutoff = int(time.time()) - (older_than_days * 86400)
@@ -496,6 +579,177 @@ class HiveDatabase:
             (cutoff,)
         )
         return result.rowcount
+
+    # =========================================================================
+    # PROMOTION VOUCHES
+    # =========================================================================
+
+    def add_promotion_vouch(self, target_peer_id: str, request_id: str,
+                            voucher_peer_id: str, sig: str, timestamp: int) -> bool:
+        """Insert a promotion vouch (idempotent)."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT INTO promotion_vouches
+                (target_peer_id, request_id, voucher_peer_id, sig, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (target_peer_id, request_id, voucher_peer_id, sig, timestamp))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def get_promotion_vouches(self, target_peer_id: str, request_id: str) -> List[Dict[str, Any]]:
+        """Get vouches for a promotion request."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM promotion_vouches
+            WHERE target_peer_id = ? AND request_id = ?
+            ORDER BY timestamp
+        """, (target_peer_id, request_id)).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_old_vouches(self, older_than_seconds: int) -> int:
+        """Remove old vouches outside the TTL."""
+        conn = self._get_connection()
+        cutoff = int(time.time()) - older_than_seconds
+        result = conn.execute(
+            "DELETE FROM promotion_vouches WHERE timestamp < ?",
+            (cutoff,)
+        )
+        return result.rowcount
+
+    # =========================================================================
+    # PROMOTION REQUESTS
+    # =========================================================================
+
+    def add_promotion_request(self, target_peer_id: str, request_id: str,
+                              status: str = "pending") -> bool:
+        """Record a promotion request (idempotent)."""
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            conn.execute("""
+                INSERT INTO promotion_requests (target_peer_id, request_id, status, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (target_peer_id, request_id, status, now))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def get_promotion_request(self, target_peer_id: str, request_id: str) -> Optional[Dict[str, Any]]:
+        """Get a promotion request record."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM promotion_requests
+            WHERE target_peer_id = ? AND request_id = ?
+        """, (target_peer_id, request_id)).fetchone()
+        return dict(row) if row else None
+
+    def update_promotion_request_status(self, target_peer_id: str, request_id: str,
+                                        status: str) -> bool:
+        """Update a promotion request status."""
+        conn = self._get_connection()
+        result = conn.execute("""
+            UPDATE promotion_requests
+            SET status = ?
+            WHERE target_peer_id = ? AND request_id = ?
+        """, (status, target_peer_id, request_id))
+        return result.rowcount > 0
+
+    # =========================================================================
+    # PEER PRESENCE
+    # =========================================================================
+
+    def get_presence(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """Get presence record for a peer."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM peer_presence WHERE peer_id = ?",
+            (peer_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_presence(self, peer_id: str, is_online: bool, now_ts: int,
+                        window_seconds: int) -> None:
+        """
+        Update presence using a rolling accumulator.
+        """
+        conn = self._get_connection()
+        existing = self.get_presence(peer_id)
+        if not existing:
+            conn.execute("""
+                INSERT INTO peer_presence
+                (peer_id, last_change_ts, is_online, online_seconds_rolling, window_start_ts)
+                VALUES (?, ?, ?, ?, ?)
+            """, (peer_id, now_ts, 1 if is_online else 0, 0, now_ts))
+            return
+
+        last_change_ts = existing["last_change_ts"]
+        online_seconds = existing["online_seconds_rolling"]
+        window_start_ts = existing["window_start_ts"]
+        was_online = bool(existing["is_online"])
+
+        if was_online:
+            online_seconds += max(0, now_ts - last_change_ts)
+
+        if now_ts - window_start_ts > window_seconds:
+            window_start_ts = now_ts - window_seconds
+            if online_seconds > window_seconds:
+                online_seconds = window_seconds
+
+        conn.execute("""
+            UPDATE peer_presence
+            SET last_change_ts = ?, is_online = ?, online_seconds_rolling = ?, window_start_ts = ?
+            WHERE peer_id = ?
+        """, (now_ts, 1 if is_online else 0, online_seconds, window_start_ts, peer_id))
+
+    def prune_presence(self, window_seconds: int) -> int:
+        """Clamp rolling windows to the configured window length."""
+        conn = self._get_connection()
+        now = int(time.time())
+        cutoff = now - window_seconds
+        result = conn.execute("""
+            UPDATE peer_presence
+            SET window_start_ts = ?, 
+                online_seconds_rolling = CASE
+                    WHEN online_seconds_rolling > ? THEN ?
+                    ELSE online_seconds_rolling
+                END
+            WHERE window_start_ts < ?
+        """, (cutoff, window_seconds, window_seconds, cutoff))
+        return result.rowcount
+
+    # =========================================================================
+    # LEECH FLAGS
+    # =========================================================================
+
+    def get_leech_flag(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """Get leech flag for a peer."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM leech_flags WHERE peer_id = ?",
+            (peer_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_leech_flag(self, peer_id: str, low_since_ts: int, ban_triggered: bool) -> None:
+        """Upsert a leech flag."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT INTO leech_flags (peer_id, low_since_ts, ban_triggered)
+            VALUES (?, ?, ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                low_since_ts = excluded.low_since_ts,
+                ban_triggered = excluded.ban_triggered
+        """, (peer_id, low_since_ts, 1 if ban_triggered else 0))
+
+    def clear_leech_flag(self, peer_id: str) -> None:
+        """Clear leech flag."""
+        conn = self._get_connection()
+        conn.execute(
+            "DELETE FROM leech_flags WHERE peer_id = ?",
+            (peer_id,)
+        )
     
     # =========================================================================
     # BAN LIST OPERATIONS

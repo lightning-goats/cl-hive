@@ -35,6 +35,7 @@ import os
 import signal
 import threading
 import time
+import secrets
 from typing import Dict, Optional, Any
 
 from pyln.client import Plugin, RpcError
@@ -45,6 +46,8 @@ from modules.database import HiveDatabase
 from modules.protocol import (
     HIVE_MAGIC, HiveMessageType, 
     MAX_MESSAGE_BYTES, is_hive_message, deserialize, serialize,
+    validate_promotion_request, validate_vouch, validate_promotion,
+    VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
     create_challenge, create_welcome
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
@@ -52,6 +55,8 @@ from modules.state_manager import StateManager
 from modules.gossip import GossipManager
 from modules.intent_manager import IntentManager, Intent, IntentType
 from modules.bridge import Bridge, BridgeStatus, CircuitOpenError
+from modules.contribution import ContributionManager
+from modules.membership import MembershipManager, MembershipTier
 
 # Initialize the plugin
 plugin = Plugin()
@@ -144,6 +149,18 @@ state_manager: Optional[StateManager] = None
 gossip_mgr: Optional[GossipManager] = None
 intent_mgr: Optional[IntentManager] = None
 bridge: Optional[Bridge] = None
+membership_mgr: Optional[MembershipManager] = None
+contribution_mgr: Optional[ContributionManager] = None
+our_pubkey: Optional[str] = None
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    """Parse a boolean-ish option value safely."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 # =============================================================================
@@ -205,6 +222,30 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='hive-membership-enabled',
+    default='true',
+    description='Enable membership & promotion protocol (default: true)'
+)
+
+plugin.add_option(
+    name='hive-auto-vouch',
+    default='true',
+    description='Auto-vouch for eligible neophytes (default: true)'
+)
+
+plugin.add_option(
+    name='hive-auto-promote',
+    default='true',
+    description='Auto-promote when quorum reached (default: true)'
+)
+
+plugin.add_option(
+    name='hive-ban-autotrigger',
+    default='false',
+    description='Auto-trigger ban proposal on sustained leeching (default: false)'
+)
+
+plugin.add_option(
     name='hive-intent-hold-seconds',
     default='60',
     description='Hold period before committing an Intent (conflict resolution)'
@@ -251,6 +292,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     config = HiveConfig(
         db_path=options.get('hive-db-path', '~/.lightning/cl_hive.db'),
         governance_mode=options.get('hive-governance-mode', 'advisor'),
+        membership_enabled=_parse_bool(options.get('hive-membership-enabled', 'true')),
+        auto_vouch_enabled=_parse_bool(options.get('hive-auto-vouch', 'true')),
+        auto_promote_enabled=_parse_bool(options.get('hive-auto-promote', 'true')),
+        ban_autotrigger_enabled=_parse_bool(options.get('hive-ban-autotrigger', 'false')),
         neophyte_fee_discount_pct=float(options.get('hive-neophyte-fee-discount', '0.5')),
         member_fee_ppm=int(options.get('hive-member-fee-ppm', '0')),
         probation_days=int(options.get('hive-probation-days', '30')),
@@ -287,6 +332,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize intent manager (Phase 3)
     # Get our pubkey for tie-breaker logic
+    global our_pubkey
     our_pubkey = safe_plugin.rpc.getinfo()['id']
     intent_mgr = IntentManager(
         database,
@@ -323,6 +369,28 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             "Hive policy integration will be unavailable. Recommended: v1.4.0+",
             level='warn'
         )
+
+    # Initialize contribution and membership managers (Phase 5)
+    global contribution_mgr, membership_mgr
+    contribution_mgr = ContributionManager(safe_plugin.rpc, database, safe_plugin, config)
+    membership_mgr = MembershipManager(
+        database,
+        state_manager,
+        contribution_mgr,
+        bridge,
+        config,
+        safe_plugin
+    )
+    plugin.log("cl-hive: Membership and contribution managers initialized")
+
+    # Start membership maintenance thread (Phase 5)
+    membership_thread = threading.Thread(
+        target=membership_maintenance_loop,
+        name="cl-hive-membership-maintenance",
+        daemon=True
+    )
+    membership_thread.start()
+    plugin.log("cl-hive: Membership maintenance thread started")
     
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
@@ -403,6 +471,13 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_intent(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.INTENT_ABORT:
             return handle_intent_abort(peer_id, msg_payload, plugin)
+        # Phase 5: Membership Promotion
+        elif msg_type == HiveMessageType.PROMOTION_REQUEST:
+            return handle_promotion_request(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.VOUCH:
+            return handle_vouch(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.PROMOTION:
+            return handle_promotion(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type (Phase 4+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -739,6 +814,10 @@ def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
     member = database.get_member(peer_id)
     if not member:
         return  # Not a Hive member, ignore
+
+    now = int(time.time())
+    database.update_member(peer_id, last_seen=now)
+    database.update_presence(peer_id, is_online=True, now_ts=now, window_seconds=30 * 86400)
     
     plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
     
@@ -753,6 +832,31 @@ def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
         })
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+
+
+@plugin.subscribe("peer_disconnected")
+def on_peer_disconnected(peer_id: str, plugin: Plugin, **kwargs):
+    """Update presence for disconnected peers."""
+    if not database:
+        return
+    member = database.get_member(peer_id)
+    if not member:
+        return
+    now = int(time.time())
+    database.update_member(peer_id, last_seen=now)
+    database.update_presence(peer_id, is_online=False, now_ts=now, window_seconds=30 * 86400)
+
+
+@plugin.subscribe("forward_event")
+def on_forward_event(plugin: Plugin, **payload):
+    """Track forwarding events for contribution and leech detection."""
+    if not contribution_mgr:
+        return
+    try:
+        contribution_mgr.handle_forward_event(payload)
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"Forward event handling error: {e}", level="warn")
 
 
 # =============================================================================
@@ -873,6 +977,230 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
 
 
 # =============================================================================
+# PHASE 5: PROMOTION PROTOCOL HANDLERS
+# =============================================================================
+
+def _broadcast_to_members(message_bytes: bytes) -> None:
+    if not database or not safe_plugin:
+        return
+    for member in database.get_all_members():
+        if member.get("tier") != MembershipTier.MEMBER.value:
+            continue
+        member_id = member["peer_id"]
+        if member_id == our_pubkey:
+            continue
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": member_id,
+                "msg": message_bytes.hex()
+            })
+        except Exception as e:
+            safe_plugin.log(f"Failed to send promotion msg to {member_id[:16]}...: {e}", level='debug')
+
+
+def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    if not config or not config.membership_enabled or not membership_mgr:
+        return {"result": "continue"}
+
+    if not validate_promotion_request(payload):
+        plugin.log(f"cl-hive: PROMOTION_REQUEST from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    target_pubkey = payload["target_pubkey"]
+    request_id = payload["request_id"]
+    timestamp = payload["timestamp"]
+
+    if target_pubkey != peer_id:
+        plugin.log(f"cl-hive: PROMOTION_REQUEST from {peer_id[:16]}... target mismatch", level='warn')
+        return {"result": "continue"}
+
+    target_member = database.get_member(target_pubkey)
+    if not target_member or target_member.get("tier") != MembershipTier.NEOPHYTE.value:
+        return {"result": "continue"}
+
+    database.add_promotion_request(target_pubkey, request_id, status="pending")
+
+    our_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
+    if our_tier != MembershipTier.MEMBER.value:
+        return {"result": "continue"}
+
+    if not config.auto_vouch_enabled:
+        return {"result": "continue"}
+
+    eval_result = membership_mgr.evaluate_promotion(target_pubkey)
+    if not eval_result["eligible"]:
+        return {"result": "continue"}
+
+    existing_vouches = database.get_promotion_vouches(target_pubkey, request_id)
+    for vouch in existing_vouches:
+        if vouch.get("voucher_peer_id") == our_pubkey:
+            return {"result": "continue"}
+
+    vouch_ts = int(time.time())
+    canonical = membership_mgr.build_vouch_message(target_pubkey, request_id, vouch_ts)
+    try:
+        sig = safe_plugin.rpc.signmessage(canonical)["signature"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign vouch: {e}", level='warn')
+        return {"result": "continue"}
+
+    vouch_payload = {
+        "target_pubkey": target_pubkey,
+        "request_id": request_id,
+        "timestamp": vouch_ts,
+        "voucher_pubkey": our_pubkey,
+        "sig": sig
+    }
+    vouch_msg = serialize(HiveMessageType.VOUCH, vouch_payload)
+    _broadcast_to_members(vouch_msg)
+    return {"result": "continue"}
+
+
+def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    if not config or not config.membership_enabled or not membership_mgr:
+        return {"result": "continue"}
+
+    if not validate_vouch(payload):
+        plugin.log(f"cl-hive: VOUCH from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    if payload["voucher_pubkey"] != peer_id:
+        plugin.log(f"cl-hive: VOUCH from {peer_id[:16]}... voucher mismatch", level='warn')
+        return {"result": "continue"}
+
+    voucher = database.get_member(peer_id)
+    if not voucher or voucher.get("tier") != MembershipTier.MEMBER.value:
+        return {"result": "continue"}
+
+    target_member = database.get_member(payload["target_pubkey"])
+    if not target_member or target_member.get("tier") != MembershipTier.NEOPHYTE.value:
+        return {"result": "continue"}
+
+    now = int(time.time())
+    if now - payload["timestamp"] > VOUCH_TTL_SECONDS:
+        return {"result": "continue"}
+
+    canonical = membership_mgr.build_vouch_message(
+        payload["target_pubkey"], payload["request_id"], payload["timestamp"]
+    )
+    try:
+        result = safe_plugin.rpc.checkmessage(canonical, payload["sig"])
+    except Exception as e:
+        plugin.log(f"cl-hive: VOUCH signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    if not result.get("verified") or result.get("pubkey") != payload["voucher_pubkey"]:
+        return {"result": "continue"}
+
+    if database.is_banned(payload["voucher_pubkey"]):
+        return {"result": "continue"}
+
+    local_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
+    if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
+        return {"result": "continue"}
+
+    stored = database.add_promotion_vouch(
+        payload["target_pubkey"],
+        payload["request_id"],
+        payload["voucher_pubkey"],
+        payload["sig"],
+        payload["timestamp"]
+    )
+    if not stored:
+        return {"result": "continue"}
+
+    if local_tier != MembershipTier.MEMBER.value:
+        return {"result": "continue"}
+
+    active_members = membership_mgr.get_active_members()
+    quorum = membership_mgr.calculate_quorum(len(active_members))
+    vouches = database.get_promotion_vouches(payload["target_pubkey"], payload["request_id"])
+    if len(vouches) < quorum:
+        return {"result": "continue"}
+
+    if not config.auto_promote_enabled:
+        return {"result": "continue"}
+
+    promotion_payload = {
+        "target_pubkey": payload["target_pubkey"],
+        "request_id": payload["request_id"],
+        "vouches": [
+            {
+                "target_pubkey": v["target_peer_id"],
+                "request_id": v["request_id"],
+                "timestamp": v["timestamp"],
+                "voucher_pubkey": v["voucher_peer_id"],
+                "sig": v["sig"]
+            } for v in vouches[:MAX_VOUCHES_IN_PROMOTION]
+        ]
+    }
+    promo_msg = serialize(HiveMessageType.PROMOTION, promotion_payload)
+    _broadcast_to_members(promo_msg)
+    return {"result": "continue"}
+
+
+def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    if not config or not config.membership_enabled or not membership_mgr:
+        return {"result": "continue"}
+
+    if not validate_promotion(payload):
+        plugin.log(f"cl-hive: PROMOTION from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    sender = database.get_member(peer_id)
+    if not sender or sender.get("tier") != MembershipTier.MEMBER.value:
+        return {"result": "continue"}
+
+    target_pubkey = payload["target_pubkey"]
+    request_id = payload["request_id"]
+
+    target_member = database.get_member(target_pubkey)
+    if not target_member or target_member.get("tier") != MembershipTier.NEOPHYTE.value:
+        return {"result": "continue"}
+
+    request = database.get_promotion_request(target_pubkey, request_id)
+    if request and request.get("status") == "accepted":
+        return {"result": "continue"}
+
+    active_members = membership_mgr.get_active_members()
+    quorum = membership_mgr.calculate_quorum(len(active_members))
+
+    seen_vouchers = set()
+    valid_vouches = []
+    now = int(time.time())
+
+    for vouch in payload["vouches"]:
+        if vouch["voucher_pubkey"] in seen_vouchers:
+            continue
+        if now - vouch["timestamp"] > VOUCH_TTL_SECONDS:
+            continue
+        if database.is_banned(vouch["voucher_pubkey"]):
+            continue
+        member = database.get_member(vouch["voucher_pubkey"])
+        if not member or member.get("tier") != MembershipTier.MEMBER.value:
+            continue
+        canonical = membership_mgr.build_vouch_message(
+            vouch["target_pubkey"], vouch["request_id"], vouch["timestamp"]
+        )
+        try:
+            result = safe_plugin.rpc.checkmessage(canonical, vouch["sig"])
+        except Exception:
+            continue
+        if not result.get("verified") or result.get("pubkey") != vouch["voucher_pubkey"]:
+            continue
+        seen_vouchers.add(vouch["voucher_pubkey"])
+        valid_vouches.append(vouch)
+
+    if len(valid_vouches) < quorum:
+        return {"result": "continue"}
+
+    database.add_promotion_request(target_pubkey, request_id, status="accepted")
+    database.update_promotion_request_status(target_pubkey, request_id, status="accepted")
+    membership_mgr.set_tier(target_pubkey, MembershipTier.MEMBER.value)
+    return {"result": "continue"}
+
+
+# =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
 
@@ -925,14 +1253,38 @@ def process_ready_intents():
             
             # Execute the action (callback registry) only when governance allows
             if config.governance_mode != "autonomous":
-                if safe_plugin:
-                    safe_plugin.log(
-                        f"cl-hive: Skipping execution for intent {intent_id} "
-                        f"(mode={config.governance_mode})",
-                        level='warn'
-                    )
+            if safe_plugin:
+                safe_plugin.log(
+                    f"cl-hive: Skipping execution for intent {intent_id} "
+                    f"(mode={config.governance_mode})",
+                    level='warn'
+                )
                 continue
             intent_mgr.execute_committed_intent(intent_row)
+
+
+# =============================================================================
+# PHASE 5: MEMBERSHIP MAINTENANCE LOOP
+# =============================================================================
+
+def membership_maintenance_loop():
+    """
+    Periodic pruning of membership-related data.
+    """
+    MAINTENANCE_INTERVAL = 3600  # seconds
+    PRESENCE_WINDOW_SECONDS = 30 * 86400
+
+    while not shutdown_event.is_set():
+        try:
+            if database:
+                database.prune_old_contributions(older_than_days=45)
+                database.prune_old_vouches(older_than_seconds=VOUCH_TTL_SECONDS)
+                database.prune_presence(window_seconds=PRESENCE_WINDOW_SECONDS)
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Membership maintenance error: {e}", level='warn')
+
+        shutdown_event.wait(MAINTENANCE_INTERVAL)
 
 
 # =============================================================================
@@ -987,6 +1339,41 @@ def hive_members(plugin: Plugin):
     return {
         "count": len(members),
         "members": members,
+    }
+
+
+@plugin.method("hive-request-promotion")
+def hive_request_promotion(plugin: Plugin):
+    """
+    Request promotion from neophyte to member.
+    """
+    if not config or not config.membership_enabled:
+        return {"error": "membership_disabled"}
+    if not membership_mgr or not our_pubkey:
+        return {"error": "membership_unavailable"}
+
+    tier = membership_mgr.get_tier(our_pubkey)
+    if tier != MembershipTier.NEOPHYTE.value:
+        return {"error": "permission_denied", "required_tier": "neophyte"}
+
+    request_id = secrets.token_hex(16)
+    now = int(time.time())
+    database.add_promotion_request(our_pubkey, request_id, status="pending")
+
+    payload = {
+        "target_pubkey": our_pubkey,
+        "request_id": request_id,
+        "timestamp": now
+    }
+    msg = serialize(HiveMessageType.PROMOTION_REQUEST, payload)
+    _broadcast_to_members(msg)
+
+    active_members = membership_mgr.get_active_members()
+    quorum = membership_mgr.calculate_quorum(len(active_members))
+    return {
+        "status": "requested",
+        "request_id": request_id,
+        "vouches_needed": quorum
     }
 
 

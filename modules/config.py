@@ -23,6 +23,10 @@ IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
 # Type mapping for config fields (for validation)
 CONFIG_FIELD_TYPES: Dict[str, type] = {
     'governance_mode': str,
+    'membership_enabled': bool,
+    'auto_vouch_enabled': bool,
+    'auto_promote_enabled': bool,
+    'ban_autotrigger_enabled': bool,
     'neophyte_fee_discount_pct': float,
     'member_fee_ppm': int,
     'probation_days': int,
@@ -68,6 +72,12 @@ class HiveConfig:
     
     # Governance Mode
     governance_mode: str = 'advisor'  # 'advisor', 'autonomous', 'oracle'
+
+    # Phase 5 safety knobs
+    membership_enabled: bool = True
+    auto_vouch_enabled: bool = True
+    auto_promote_enabled: bool = True
+    ban_autotrigger_enabled: bool = False
     
     # Membership Economics
     neophyte_fee_discount_pct: float = 0.5    # 50% of public rate for neophytes
@@ -133,6 +143,10 @@ class HiveConfigSnapshot:
     # Core settings (immutable snapshot)
     db_path: str
     governance_mode: str
+    membership_enabled: bool
+    auto_vouch_enabled: bool
+    auto_promote_enabled: bool
+    ban_autotrigger_enabled: bool
     neophyte_fee_discount_pct: float
     member_fee_ppm: int
     probation_days: int
@@ -152,6 +166,10 @@ class HiveConfigSnapshot:
         return cls(
             db_path=config.db_path,
             governance_mode=config.governance_mode,
+            membership_enabled=config.membership_enabled,
+            auto_vouch_enabled=config.auto_vouch_enabled,
+            auto_promote_enabled=config.auto_promote_enabled,
+            ban_autotrigger_enabled=config.ban_autotrigger_enabled,
             neophyte_fee_discount_pct=config.neophyte_fee_discount_pct,
             member_fee_ppm=config.member_fee_ppm,
             probation_days=config.probation_days,

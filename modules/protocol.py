@@ -74,6 +74,21 @@ class HiveMessageType(IntEnum):
     VOUCH = 32789       # Member vouching for promotion
     BAN = 32791         # Ban announcement
     PROMOTION = 32793   # Promotion confirmation
+    PROMOTION_REQUEST = 32795  # Neophyte requesting promotion
+
+
+# =============================================================================
+# PHASE 5 VALIDATION CONSTANTS
+# =============================================================================
+
+# Maximum number of vouches allowed in a promotion message
+MAX_VOUCHES_IN_PROMOTION = 50
+
+# Maximum length of request_id
+MAX_REQUEST_ID_LEN = 64
+
+# Vouch validity window (7 days)
+VOUCH_TTL_SECONDS = 7 * 24 * 3600
 
 
 # =============================================================================
@@ -207,6 +222,80 @@ def is_hive_message(data: bytes) -> bool:
         True if magic prefix matches, False otherwise
     """
     return len(data) >= 4 and data[:4] == HIVE_MAGIC
+
+
+# =============================================================================
+# PHASE 5 PAYLOAD VALIDATION
+# =============================================================================
+
+def _valid_request_id(request_id: Any) -> bool:
+    if not isinstance(request_id, str):
+        return False
+    if not request_id or len(request_id) > MAX_REQUEST_ID_LEN:
+        return False
+    return all(c in "0123456789abcdef" for c in request_id)
+
+
+def validate_promotion_request(payload: Dict[str, Any]) -> bool:
+    """Validate PROMOTION_REQUEST payload schema."""
+    if not isinstance(payload, dict):
+        return False
+    target_pubkey = payload.get("target_pubkey")
+    request_id = payload.get("request_id")
+    timestamp = payload.get("timestamp")
+    if not isinstance(target_pubkey, str) or not target_pubkey:
+        return False
+    if not _valid_request_id(request_id):
+        return False
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+    return True
+
+
+def validate_vouch(payload: Dict[str, Any]) -> bool:
+    """Validate VOUCH payload schema."""
+    if not isinstance(payload, dict):
+        return False
+    required = ["target_pubkey", "request_id", "timestamp", "voucher_pubkey", "sig"]
+    for key in required:
+        if key not in payload:
+            return False
+    if not isinstance(payload["target_pubkey"], str) or not payload["target_pubkey"]:
+        return False
+    if not _valid_request_id(payload["request_id"]):
+        return False
+    if not isinstance(payload["timestamp"], int) or payload["timestamp"] < 0:
+        return False
+    if not isinstance(payload["voucher_pubkey"], str) or not payload["voucher_pubkey"]:
+        return False
+    if not isinstance(payload["sig"], str) or not payload["sig"]:
+        return False
+    return True
+
+
+def validate_promotion(payload: Dict[str, Any]) -> bool:
+    """Validate PROMOTION payload schema and vouch list caps."""
+    if not isinstance(payload, dict):
+        return False
+    target_pubkey = payload.get("target_pubkey")
+    request_id = payload.get("request_id")
+    vouches = payload.get("vouches")
+    if not isinstance(target_pubkey, str) or not target_pubkey:
+        return False
+    if not _valid_request_id(request_id):
+        return False
+    if not isinstance(vouches, list):
+        return False
+    if len(vouches) > MAX_VOUCHES_IN_PROMOTION:
+        return False
+    for vouch in vouches:
+        if not validate_vouch(vouch):
+            return False
+        if vouch.get("target_pubkey") != target_pubkey:
+            return False
+        if vouch.get("request_id") != request_id:
+            return False
+    return True
 
 
 # =============================================================================
