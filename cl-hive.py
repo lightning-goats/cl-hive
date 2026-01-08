@@ -856,16 +856,29 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle HIVE_FULL_SYNC message (complete state transfer).
-    
+
     Merge the received state with our local state, preferring
     higher version numbers for each peer.
+
+    SECURITY: Only accept FULL_SYNC from Hive members to prevent
+    state poisoning attacks from arbitrary peers.
     """
     if not gossip_mgr:
         return {"result": "continue"}
-    
+
+    # SECURITY: Membership check to prevent state poisoning (Issue #8)
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(
+                f"cl-hive: FULL_SYNC rejected from non-member {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+
     updated = gossip_mgr.process_full_sync(peer_id, payload)
     plugin.log(f"cl-hive: FULL_SYNC from {peer_id[:16]}...: {updated} states updated")
-    
+
     return {"result": "continue"}
 
 
@@ -1322,26 +1335,29 @@ def process_ready_intents():
         return
     
     ready_intents = database.get_pending_intents_ready(config.intent_hold_seconds)
-    
+
     for intent_row in ready_intents:
         intent_id = intent_row.get('id')
         intent_type = intent_row.get('intent_type')
         target = intent_row.get('target')
-        
-        # Commit the intent
+
+        # SECURITY (Issue #12): Check governance mode BEFORE committing
+        # to prevent state inconsistency where intents are COMMITTED but never executed
+        if config.governance_mode != "autonomous":
+            if safe_plugin:
+                safe_plugin.log(
+                    f"cl-hive: Intent {intent_id} ready but not committing "
+                    f"(mode={config.governance_mode})",
+                    level='debug'
+                )
+            continue
+
+        # Commit the intent (only in autonomous mode)
         if intent_mgr.commit_intent(intent_id):
             if safe_plugin:
                 safe_plugin.log(f"cl-hive: Committed intent {intent_id}: {intent_type} -> {target[:16]}...")
-            
-            # Execute the action (callback registry) only when governance allows
-            if config.governance_mode != "autonomous":
-                if safe_plugin:
-                    safe_plugin.log(
-                        f"cl-hive: Skipping execution for intent {intent_id} "
-                        f"(mode={config.governance_mode})",
-                        level='warn'
-                    )
-                continue
+
+            # Execute the action (callback registry)
             intent_mgr.execute_committed_intent(intent_row)
 
 

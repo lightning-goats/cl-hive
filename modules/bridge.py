@@ -32,6 +32,7 @@ from pyln.client import RpcError
 MAX_FAILURES = 3          # Consecutive failures before opening circuit
 RESET_TIMEOUT = 60        # Seconds to wait before probing (OPEN -> HALF_OPEN)
 RPC_TIMEOUT = 5           # Timeout for RPC calls (seconds)
+HALF_OPEN_SUCCESS_THRESHOLD = 3  # Consecutive successes needed to close circuit (Issue #10)
 
 # Minimum required version of cl-revenue-ops
 MIN_REVENUE_OPS_VERSION = (1, 4, 0)
@@ -90,21 +91,25 @@ class CircuitBreaker:
     """
     
     def __init__(self, name: str, max_failures: int = MAX_FAILURES,
-                 reset_timeout: int = RESET_TIMEOUT):
+                 reset_timeout: int = RESET_TIMEOUT,
+                 half_open_success_threshold: int = HALF_OPEN_SUCCESS_THRESHOLD):
         """
         Initialize Circuit Breaker.
-        
+
         Args:
             name: Identifier for logging
             max_failures: Failures before opening circuit
             reset_timeout: Seconds before probing
+            half_open_success_threshold: Consecutive successes needed in HALF_OPEN
         """
         self.name = name
         self.max_failures = max_failures
         self.reset_timeout = reset_timeout
-        
+        self.half_open_success_threshold = half_open_success_threshold
+
         self._state = CircuitState.CLOSED
         self._failure_count = 0
+        self._half_open_success_count = 0  # Track consecutive successes in HALF_OPEN
         self._last_failure_time = 0
         self._last_success_time = 0
     
@@ -123,22 +128,35 @@ class CircuitBreaker:
         return self.state != CircuitState.OPEN
     
     def record_success(self) -> None:
-        """Record a successful call."""
+        """
+        Record a successful call.
+
+        SECURITY (Issue #10): In HALF_OPEN state, require multiple consecutive
+        successes before fully closing the circuit to prevent rapid flapping
+        with unstable dependencies.
+        """
         self._failure_count = 0
         self._last_success_time = int(time.time())
-        
+
         if self._state == CircuitState.HALF_OPEN:
-            # Probe succeeded, close the circuit
-            self._state = CircuitState.CLOSED
+            self._half_open_success_count += 1
+            # Only close after multiple consecutive successes
+            if self._half_open_success_count >= self.half_open_success_threshold:
+                self._state = CircuitState.CLOSED
+                self._half_open_success_count = 0
+        else:
+            # Reset counter when in CLOSED state
+            self._half_open_success_count = 0
     
     def record_failure(self) -> None:
         """Record a failed call."""
         self._failure_count += 1
         self._last_failure_time = int(time.time())
-        
+
         if self._state == CircuitState.HALF_OPEN:
-            # Probe failed, re-open the circuit
+            # Probe failed, re-open the circuit and reset success counter
             self._state = CircuitState.OPEN
+            self._half_open_success_count = 0
         elif self._failure_count >= self.max_failures:
             # Too many failures, open the circuit
             self._state = CircuitState.OPEN
@@ -147,6 +165,7 @@ class CircuitBreaker:
         """Reset circuit breaker to initial state."""
         self._state = CircuitState.CLOSED
         self._failure_count = 0
+        self._half_open_success_count = 0
         self._last_failure_time = 0
     
     def get_stats(self) -> Dict[str, Any]:

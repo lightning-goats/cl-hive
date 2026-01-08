@@ -43,6 +43,9 @@ CHALLENGE_TTL_SECONDS = 300
 # Cap to prevent unbounded pending challenge growth
 MAX_PENDING_CHALLENGES = 1000
 
+# SECURITY (Issue #11): Per-peer rate limit for challenge generation
+CHALLENGE_RATE_LIMIT_SECONDS = 10  # Minimum seconds between challenges per peer
+
 # Plugin version for manifest
 PLUGIN_VERSION = "cl-hive v0.1.0"
 
@@ -76,9 +79,22 @@ class Ticket:
         """Encode full ticket (including signature) as base64."""
         return base64.b64encode(json.dumps(asdict(self)).encode()).decode()
     
+    # SECURITY: Maximum ticket size to prevent memory exhaustion DoS (Issue #9)
+    MAX_TICKET_SIZE = 10 * 1024  # 10KB
+
     @classmethod
     def from_base64(cls, encoded: str) -> 'Ticket':
-        """Decode ticket from base64."""
+        """
+        Decode ticket from base64.
+
+        SECURITY: Enforces size limit to prevent memory exhaustion DoS.
+        """
+        # Check size before decoding
+        if len(encoded) > cls.MAX_TICKET_SIZE:
+            raise ValueError(
+                f"Ticket too large: {len(encoded)} bytes exceeds "
+                f"{cls.MAX_TICKET_SIZE} byte limit"
+            )
         data = json.loads(base64.b64decode(encoded))
         return cls(**data)
     
@@ -422,21 +438,39 @@ class HandshakeManager:
     def generate_challenge(self, peer_id: str, requirements: int) -> str:
         """
         Generate a challenge nonce for a peer.
-        
+
         Args:
             peer_id: Peer's public key
             requirements: Bitmask requirements from the invite ticket
-            
+
         Returns:
             Hex-encoded random nonce
+
+        Raises:
+            ValueError: If rate limit exceeded for this peer
+
+        SECURITY (Issue #11): Per-peer rate limiting to prevent DoS via
+        challenge flooding that would evict legitimate pending challenges.
         """
-        nonce = secrets.token_hex(NONCE_SIZE)
         now = int(time.time())
+
+        # Check per-peer rate limit
+        existing = self._pending_challenges.get(peer_id)
+        if existing:
+            time_since_last = now - existing["issued_at"]
+            if time_since_last < CHALLENGE_RATE_LIMIT_SECONDS:
+                raise ValueError(
+                    f"Rate limit exceeded: wait {CHALLENGE_RATE_LIMIT_SECONDS - time_since_last}s"
+                )
+
+        nonce = secrets.token_hex(NONCE_SIZE)
         self._pending_challenges[peer_id] = {
             "nonce": nonce,
             "issued_at": now,
             "requirements": requirements
         }
+
+        # LRU eviction if over limit
         if len(self._pending_challenges) > MAX_PENDING_CHALLENGES:
             oldest = sorted(
                 self._pending_challenges.items(),
