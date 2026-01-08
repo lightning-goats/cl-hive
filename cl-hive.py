@@ -57,6 +57,8 @@ from modules.intent_manager import IntentManager, Intent, IntentType
 from modules.bridge import Bridge, BridgeStatus, CircuitOpenError
 from modules.contribution import ContributionManager
 from modules.membership import MembershipManager, MembershipTier
+from modules.planner import Planner
+from modules.clboss_bridge import CLBossBridge
 
 # Initialize the plugin
 plugin = Plugin()
@@ -177,6 +179,8 @@ intent_mgr: Optional[IntentManager] = None
 bridge: Optional[Bridge] = None
 membership_mgr: Optional[MembershipManager] = None
 contribution_mgr: Optional[ContributionManager] = None
+planner: Optional[Planner] = None
+clboss_bridge: Optional[CLBossBridge] = None
 our_pubkey: Optional[str] = None
 
 
@@ -289,6 +293,18 @@ plugin.add_option(
     description='Heartbeat broadcast interval in seconds (default: 5 min)'
 )
 
+plugin.add_option(
+    name='hive-planner-interval',
+    default='3600',
+    description='Planner cycle interval in seconds (default: 1 hour, minimum: 300)'
+)
+
+plugin.add_option(
+    name='hive-planner-enable-expansions',
+    default='false',
+    description='Enable expansion proposals (new channel openings) in Planner'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -332,6 +348,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         intent_hold_seconds=int(options.get('hive-intent-hold-seconds', '60')),
         gossip_threshold_pct=float(options.get('hive-gossip-threshold', '0.10')),
         heartbeat_interval=int(options.get('hive-heartbeat-interval', '300')),
+        planner_interval=int(options.get('hive-planner-interval', '3600')),
+        planner_enable_expansions=_parse_bool(options.get('hive-planner-enable-expansions', 'false')),
     )
     
     # Initialize database
@@ -417,7 +435,28 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     membership_thread.start()
     plugin.log("cl-hive: Membership maintenance thread started")
-    
+
+    # Initialize Planner (Phase 6)
+    global planner, clboss_bridge
+    clboss_bridge = CLBossBridge(safe_plugin.rpc, safe_plugin)
+    planner = Planner(
+        state_manager=state_manager,
+        database=database,
+        bridge=bridge,
+        clboss_bridge=clboss_bridge,
+        plugin=safe_plugin
+    )
+    plugin.log("cl-hive: Planner initialized")
+
+    # Start planner loop thread (Phase 6)
+    planner_thread = threading.Thread(
+        target=planner_loop,
+        name="cl-hive-planner",
+        daemon=True
+    )
+    planner_thread.start()
+    plugin.log("cl-hive: Planner thread started")
+
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
         plugin.log("cl-hive: Received shutdown signal, cleaning up...")
@@ -1330,6 +1369,77 @@ def membership_maintenance_loop():
 
 
 # =============================================================================
+# PHASE 6: PLANNER BACKGROUND LOOP
+# =============================================================================
+
+# Security: Hard minimum interval to prevent Intent Storms
+PLANNER_MIN_INTERVAL_SECONDS = 300  # 5 minutes minimum
+
+# Jitter range to prevent all Hive nodes waking simultaneously
+PLANNER_JITTER_SECONDS = 300  # ±5 minutes
+
+
+def planner_loop():
+    """
+    Background thread that runs Planner cycles for topology optimization.
+
+    Runs periodically to:
+    1. Detect saturated targets and issue clboss-ignore
+    2. Release ignores when saturation drops below threshold
+    3. (If enabled) Propose channel expansions to underserved targets
+
+    Security:
+    - Enforces hard minimum interval (300s) to prevent Intent Storms
+    - Adds random jitter to prevent simultaneous wake-up across swarm
+    - Respects shutdown_event for graceful termination
+    """
+    # Run first cycle immediately on startup (for testing)
+    first_run = True
+
+    while not shutdown_event.is_set():
+        try:
+            if planner and config:
+                # Take config snapshot at cycle start (determinism)
+                cfg_snapshot = config.snapshot()
+                run_id = secrets.token_hex(8)
+
+                if safe_plugin:
+                    safe_plugin.log(f"cl-hive: Planner cycle starting (run_id={run_id})")
+
+                # Run the planner cycle
+                decisions = planner.run_cycle(
+                    cfg_snapshot,
+                    shutdown_event=shutdown_event,
+                    run_id=run_id
+                )
+
+                if safe_plugin:
+                    safe_plugin.log(
+                        f"cl-hive: Planner cycle complete: {len(decisions)} decisions"
+                    )
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Planner loop error: {e}", level='warn')
+
+        # Calculate next sleep interval
+        if first_run:
+            first_run = False
+
+        if config:
+            # SECURITY: Enforce hard minimum interval
+            interval = max(config.planner_interval, PLANNER_MIN_INTERVAL_SECONDS)
+
+            # Add random jitter (±5 minutes) to prevent synchronization
+            jitter = secrets.randbelow(PLANNER_JITTER_SECONDS * 2) - PLANNER_JITTER_SECONDS
+            sleep_time = interval + jitter
+        else:
+            sleep_time = 3600  # Default 1 hour if config unavailable
+
+        # Wait for next cycle or shutdown
+        shutdown_event.wait(sleep_time)
+
+
+# =============================================================================
 # RPC COMMANDS
 # =============================================================================
 
@@ -1370,17 +1480,68 @@ def hive_status(plugin: Plugin):
 def hive_members(plugin: Plugin):
     """
     List all Hive members with their tier and stats.
-    
+
     Returns:
         List of member records with tier, contribution ratio, uptime, etc.
     """
     if not database:
         return {"error": "Hive not initialized"}
-    
+
     members = database.get_all_members()
     return {
         "count": len(members),
         "members": members,
+    }
+
+
+@plugin.method("hive-topology")
+def hive_topology(plugin: Plugin):
+    """
+    Get current topology analysis from the Planner.
+
+    Returns:
+        Dict with saturated targets, planner stats, and config.
+    """
+    if not planner:
+        return {"error": "Planner not initialized"}
+    if not config:
+        return {"error": "Config not initialized"}
+
+    # Take config snapshot
+    cfg = config.snapshot()
+
+    # Refresh network cache before analysis
+    planner._refresh_network_cache(force=True)
+
+    # Get saturated targets
+    saturated = planner.get_saturated_targets(cfg)
+    saturated_list = [
+        {
+            "target": r.target[:16] + "...",
+            "target_full": r.target,
+            "hive_capacity_sats": r.hive_capacity_sats,
+            "public_capacity_sats": r.public_capacity_sats,
+            "hive_share_pct": round(r.hive_share_pct * 100, 2),
+        }
+        for r in saturated
+    ]
+
+    # Get planner stats
+    stats = planner.get_planner_stats()
+
+    return {
+        "saturated_targets": saturated_list,
+        "saturated_count": len(saturated_list),
+        "ignored_peers": stats.get("ignored_peers", []),
+        "ignored_count": stats.get("ignored_peers_count", 0),
+        "network_cache_size": stats.get("network_cache_size", 0),
+        "network_cache_age_seconds": stats.get("network_cache_age_seconds", 0),
+        "config": {
+            "market_share_cap_pct": cfg.market_share_cap_pct,
+            "planner_interval_seconds": cfg.planner_interval,
+            "expansions_enabled": cfg.planner_enable_expansions,
+            "governance_mode": cfg.governance_mode,
+        }
     }
 
 

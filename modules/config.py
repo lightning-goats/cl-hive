@@ -38,6 +38,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'intent_expire_seconds': int,
     'gossip_threshold_pct': float,
     'heartbeat_interval': int,
+    'planner_interval': int,
+    'planner_enable_expansions': bool,
 }
 
 # Range constraints for numeric fields
@@ -53,6 +55,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'intent_expire_seconds': (60, 3600),
     'gossip_threshold_pct': (0.01, 0.5),
     'heartbeat_interval': (60, 3600),
+    'planner_interval': (300, 86400),  # Min 5 minutes, max 24 hours
 }
 
 # Valid governance modes
@@ -99,7 +102,11 @@ class HiveConfig:
     # Gossip Protocol
     gossip_threshold_pct: float = 0.10         # 10% capacity change triggers gossip
     heartbeat_interval: int = 300              # 5 minutes between heartbeats
-    
+
+    # Planner (Phase 6)
+    planner_interval: int = 3600               # 1 hour between planner cycles
+    planner_enable_expansions: bool = False    # Disabled by default (safety)
+
     # Internal version tracking
     _version: int = field(default=0, repr=False, compare=False)
     
@@ -158,6 +165,8 @@ class HiveConfigSnapshot:
     intent_expire_seconds: int
     gossip_threshold_pct: float
     heartbeat_interval: int
+    planner_interval: int
+    planner_enable_expansions: bool
     version: int
     
     @classmethod
@@ -181,5 +190,7 @@ class HiveConfigSnapshot:
             intent_expire_seconds=config.intent_expire_seconds,
             gossip_threshold_pct=config.gossip_threshold_pct,
             heartbeat_interval=config.heartbeat_interval,
+            planner_interval=config.planner_interval,
+            planner_enable_expansions=config.planner_enable_expansions,
             version=config._version,
         )
