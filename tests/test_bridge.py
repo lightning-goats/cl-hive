@@ -114,11 +114,17 @@ class TestCircuitBreaker:
         assert circuit_breaker.is_available() is True
     
     def test_half_open_success_closes_circuit(self, circuit_breaker):
-        """Successful probe in HALF_OPEN closes circuit."""
+        """Successful probes in HALF_OPEN closes circuit after threshold reached."""
         circuit_breaker._state = CircuitState.HALF_OPEN
-        
+
+        # Security fix (Issue #10): Requires 3 consecutive successes in HALF_OPEN
         circuit_breaker.record_success()
-        
+        assert circuit_breaker.state == CircuitState.HALF_OPEN  # Not yet closed
+
+        circuit_breaker.record_success()
+        assert circuit_breaker.state == CircuitState.HALF_OPEN  # Not yet closed
+
+        circuit_breaker.record_success()  # Third success closes circuit
         assert circuit_breaker.state == CircuitState.CLOSED
     
     def test_half_open_failure_reopens_circuit(self, circuit_breaker):
@@ -314,16 +320,22 @@ class TestSafeCall:
         mock_rpc.call.assert_not_called()
 
     def test_safe_call_half_open_success_closes(self, bridge, mock_rpc):
-        """Half-open probe success closes the circuit."""
+        """Half-open probe success closes the circuit after threshold reached."""
         bridge._status = BridgeStatus.ENABLED
         mock_rpc.call.return_value = {"result": "ok"}
 
         bridge._revenue_ops_cb._state = CircuitState.OPEN
         bridge._revenue_ops_cb._last_failure_time = int(time.time()) - RESET_TIMEOUT - 1
 
+        # Security fix (Issue #10): Requires 3 consecutive successes in HALF_OPEN
         result = bridge.safe_call("test-method")
-
         assert result == {"result": "ok"}
+        assert bridge._revenue_ops_cb.state == CircuitState.HALF_OPEN  # Not yet closed
+
+        result = bridge.safe_call("test-method")
+        assert bridge._revenue_ops_cb.state == CircuitState.HALF_OPEN  # Not yet closed
+
+        result = bridge.safe_call("test-method")  # Third success closes circuit
         assert bridge._revenue_ops_cb.state == CircuitState.CLOSED
 
 

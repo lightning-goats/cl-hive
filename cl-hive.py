@@ -1562,6 +1562,31 @@ def hive_topology(plugin: Plugin):
     }
 
 
+@plugin.method("hive-planner-log")
+def hive_planner_log(plugin: Plugin, limit: int = 50):
+    """
+    Get recent Planner decision logs.
+
+    Args:
+        limit: Maximum number of log entries to return (default: 50)
+
+    Returns:
+        Dict with log entries and count.
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Bound limit to prevent excessive queries
+    limit = min(max(1, limit), 500)
+
+    logs = database.get_planner_logs(limit=limit)
+    return {
+        "count": len(logs),
+        "limit": limit,
+        "logs": logs,
+    }
+
+
 @plugin.method("hive-request-promotion")
 def hive_request_promotion(plugin: Plugin):
     """
