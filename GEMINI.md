@@ -24,9 +24,9 @@ Transition `cl-hive` from a group of independent nodes into a **deterministic, c
 | :--- | :--- | :--- |
 | **Phase 1-5** | ✅ PASS | Core Protocol, State, Intent, Bridge, and Membership. |
 | **Phase 6** | ✅ PASS | Topology Optimization (Planner logic & Background loop). |
-| **Phase 7** | 🏗️ IN PROGRESS | **Governance Decision Engine** (Ticket 7-01, 7-02). |
-| **Phase 8** | 🏗️ IN PROGRESS | **Management RPCs** (Ticket 8-01, 8-02). |
-| **Phase 9** | 📅 PLANNED | **Maintenance & Pruning** (Ticket 9-01). |
+| **Phase 7** | ✅ PASS | **Governance Decision Engine** (Ticket 7-01, 7-02). |
+| **Phase 8** | ✅ PASS | **Management RPCs** (Ticket 8-01, 8-02). |
+| **Phase 9** | ✅ PASS | **Maintenance & Pruning** (Ticket 9-01). |
 
 ---
 
@@ -60,4 +60,4 @@ The `on_custommsg` hook MUST implement fast-rejection based on the 4-byte `HIVE_
 - **Documentation:** Synchronize `IMPLEMENTATION_PLAN.md` every time a Ticket is closed.
 
 ---
-*Manifest established: January 8, 2026*
+*Manifest updated: January 9, 2026*

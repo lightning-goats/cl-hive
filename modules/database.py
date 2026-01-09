@@ -970,12 +970,18 @@ class HiveDatabase:
     # PLANNER LOGGING (Phase 6)
     # =========================================================================
 
-    def log_planner_action(self, action_type: str, result: str, 
-                           target: Optional[str] = None, 
+    # Absolute cap on planner log rows (GEMINI.md Rule #2: Unbounded Input Protection)
+    MAX_PLANNER_LOG_ROWS = 10000
+
+    def log_planner_action(self, action_type: str, result: str,
+                           target: Optional[str] = None,
                            details: Optional[Dict[str, Any]] = None) -> None:
         """
         Log a decision made by the Planner.
-        
+
+        Implements ring-buffer behavior: when MAX_PLANNER_LOG_ROWS is exceeded,
+        oldest 10% of entries are pruned to make room.
+
         Args:
             action_type: What the planner did (e.g., 'saturation_check', 'expansion')
             result: Outcome ('success', 'skipped', 'failed', 'proposed')
@@ -985,7 +991,22 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         details_json = json.dumps(details) if details else None
-        
+
+        # Check row count and prune if at cap (ring-buffer behavior)
+        row = conn.execute("SELECT COUNT(*) as cnt FROM hive_planner_log").fetchone()
+        if row and row['cnt'] >= self.MAX_PLANNER_LOG_ROWS:
+            # Delete oldest 10% to make room
+            prune_count = self.MAX_PLANNER_LOG_ROWS // 10
+            conn.execute("""
+                DELETE FROM hive_planner_log WHERE id IN (
+                    SELECT id FROM hive_planner_log ORDER BY timestamp ASC LIMIT ?
+                )
+            """, (prune_count,))
+            self.plugin.log(
+                f"HiveDatabase: Planner log at cap ({self.MAX_PLANNER_LOG_ROWS}), pruned {prune_count} oldest entries",
+                level='debug'
+            )
+
         conn.execute("""
             INSERT INTO hive_planner_log (timestamp, action_type, target, result, details)
             VALUES (?, ?, ?, ?, ?)
@@ -1045,6 +1066,6 @@ class HiveDatabase:
         cutoff = int(time.time()) - (older_than_days * 86400)
         result = conn.execute("""
             DELETE FROM pending_actions
-            WHERE status != 'pending' AND created_at < ?
+            WHERE status != 'pending' AND proposed_at < ?
         """, (cutoff,))
         return result.rowcount

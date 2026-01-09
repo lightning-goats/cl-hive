@@ -195,6 +195,50 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
+    """
+    Check if the local node has the required tier for an RPC command.
+
+    Permission model (from IMPLEMENTATION_PLAN.md Section 8.5):
+    - Admin Only: hive-genesis, hive-invite, hive-ban, hive-set-mode
+    - Member Only: hive-vouch, hive-approve, hive-reject
+    - Any Tier: hive-status, hive-members, hive-contribution, hive-topology
+
+    Args:
+        required_tier: 'admin' or 'member'
+
+    Returns:
+        None if permission granted, or error dict if denied
+    """
+    if not our_pubkey or not database:
+        return {"error": "Not initialized"}
+
+    member = database.get_member(our_pubkey)
+    if not member:
+        return {"error": "Not a Hive member", "required_tier": required_tier}
+
+    current_tier = member.get('tier', 'neophyte')
+
+    if required_tier == 'admin':
+        if current_tier != 'admin':
+            return {
+                "error": "permission_denied",
+                "message": "This command requires admin privileges",
+                "current_tier": current_tier,
+                "required_tier": "admin"
+            }
+    elif required_tier == 'member':
+        if current_tier not in ('admin', 'member'):
+            return {
+                "error": "permission_denied",
+                "message": "This command requires member or admin privileges",
+                "current_tier": current_tier,
+                "required_tier": "member"
+            }
+
+    return None  # Permission granted
+
+
 # =============================================================================
 # PLUGIN OPTIONS
 # =============================================================================
@@ -1636,7 +1680,14 @@ def hive_approve_action(plugin: Plugin, action_id: int):
 
     Returns:
         Dict with approval result.
+
+    Permission: Member or Admin only
     """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
     if not database:
         return {"error": "Database not initialized"}
 
@@ -1739,7 +1790,14 @@ def hive_reject_action(plugin: Plugin, action_id: int):
 
     Returns:
         Dict with rejection result.
+
+    Permission: Member or Admin only
     """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
     if not database:
         return {"error": "Database not initialized"}
 
@@ -1779,8 +1837,15 @@ def hive_set_mode(plugin: Plugin, mode: str):
 
     Returns:
         Dict with new mode and previous mode.
+
+    Permission: Admin only
     """
     from modules.config import VALID_GOVERNANCE_MODES
+
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
 
     if not config:
         return {"error": "Config not initialized"}
@@ -1912,7 +1977,14 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
 
     Returns:
         Dict with ban status.
+
+    Permission: Admin only
     """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
     if not database or not our_pubkey:
         return {"error": "Database not initialized"}
 
@@ -2069,16 +2141,23 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
 def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0):
     """
     Generate an invitation ticket for a new member.
-    
+
     Only Admins can generate invite tickets.
-    
+
     Args:
         valid_hours: Hours until ticket expires (default: 24)
         requirements: Bitmask of required features (default: 0 = none)
-    
+
     Returns:
         Dict with base64-encoded ticket
+
+    Permission: Admin only
     """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
     if not handshake_mgr:
         return {"error": "Hive not initialized"}
     
