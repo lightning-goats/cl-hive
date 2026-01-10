@@ -37,6 +37,11 @@ HALF_OPEN_SUCCESS_THRESHOLD = 3  # Consecutive successes needed to close circuit
 # Minimum required version of cl-revenue-ops
 MIN_REVENUE_OPS_VERSION = (1, 4, 0)
 
+# Security hardening (Issue #27)
+POLICY_RATE_LIMIT_SECONDS = 60       # Min seconds between policy changes per peer
+MAX_REBALANCE_SATS = 10_000_000      # 0.1 BTC max per single rebalance (safety cap)
+MAX_DAILY_REBALANCE_SATS = 50_000_000  # 0.5 BTC max per day (aggregate cap)
+
 
 # =============================================================================
 # ENUMS
@@ -228,6 +233,11 @@ class Bridge:
         # Circuit breakers for each integration
         self._revenue_ops_cb = CircuitBreaker("revenue-ops")
         self._clboss_cb = CircuitBreaker("clboss")
+
+        # Security hardening: Rate limiting (Issue #27)
+        self._policy_last_change: Dict[str, float] = {}  # peer_id -> timestamp
+        self._daily_rebalance_sats = 0  # Aggregate rebalance amount today
+        self._daily_rebalance_reset = 0  # Timestamp of last daily reset
 
     def _resolve_rpc_socket(self) -> Optional[str]:
         """Resolve the Core Lightning RPC socket path if available."""
@@ -463,21 +473,39 @@ class Bridge:
     # REVENUE-OPS INTEGRATION
     # =========================================================================
     
-    def set_hive_policy(self, peer_id: str, is_member: bool) -> bool:
+    def set_hive_policy(self, peer_id: str, is_member: bool,
+                        bypass_rate_limit: bool = False) -> bool:
         """
         Set Hive fee policy for a peer.
-        
+
         Args:
             peer_id: Node public key
             is_member: True for Hive member (0 PPM), False for non-member
-            
+            bypass_rate_limit: Skip rate limiting (use sparingly, e.g., initial setup)
+
         Returns:
             True if policy was set successfully
+
+        Security:
+            Rate limited to one change per peer per POLICY_RATE_LIMIT_SECONDS (Issue #27)
         """
         if self._status == BridgeStatus.DISABLED:
             self._log(f"Cannot set policy for {peer_id[:16]}...: Bridge disabled")
             return False
-        
+
+        # Security: Rate limit policy changes per peer (Issue #27)
+        now = time.time()
+        if not bypass_rate_limit:
+            last_change = self._policy_last_change.get(peer_id, 0)
+            if now - last_change < POLICY_RATE_LIMIT_SECONDS:
+                wait_time = int(POLICY_RATE_LIMIT_SECONDS - (now - last_change))
+                self._log(
+                    f"Rate limited: Cannot change policy for {peer_id[:16]}... "
+                    f"(wait {wait_time}s)",
+                    level='debug'
+                )
+                return False
+
         try:
             if is_member:
                 # Set HIVE strategy with rebalancing enabled
@@ -494,15 +522,16 @@ class Bridge:
                     "peer_id": peer_id,
                     "strategy": "dynamic"
                 })
-            
+
             success = result.get("status") == "success"
             if success:
+                self._policy_last_change[peer_id] = now  # Update rate limit tracker
                 self._log(f"Set {'hive' if is_member else 'dynamic'} policy for {peer_id[:16]}...")
             else:
                 self._log(f"Policy set returned: {result}", level='warn')
-            
+
             return success
-            
+
         except CircuitOpenError:
             self._log(f"Circuit open, cannot set policy for {peer_id[:16]}...")
             return False
@@ -537,6 +566,29 @@ class Bridge:
             self._log(f"Failed to get SCID for {peer_id[:16]}...: {e}", level='debug')
             return None
 
+    def _check_daily_rebalance_budget(self, amount_sats: int) -> bool:
+        """
+        Check if rebalance fits within daily budget.
+
+        Resets the daily counter if a new day has started (UTC).
+
+        Args:
+            amount_sats: Amount to check
+
+        Returns:
+            True if within budget, False if would exceed
+        """
+        now = time.time()
+        # Reset daily counter at midnight UTC
+        current_day = int(now // 86400)
+        last_reset_day = int(self._daily_rebalance_reset // 86400) if self._daily_rebalance_reset else 0
+
+        if current_day > last_reset_day:
+            self._daily_rebalance_sats = 0
+            self._daily_rebalance_reset = now
+
+        return (self._daily_rebalance_sats + amount_sats) <= MAX_DAILY_REBALANCE_SATS
+
     def trigger_rebalance(self, target_peer: str, amount_sats: int,
                           source_peer: str) -> bool:
         """
@@ -552,12 +604,37 @@ class Bridge:
         Returns:
             True if rebalance was initiated successfully
 
+        Security (Issue #27):
+            - Single rebalance capped at MAX_REBALANCE_SATS (0.1 BTC)
+            - Daily aggregate capped at MAX_DAILY_REBALANCE_SATS (0.5 BTC)
+
         Note:
             Both source_peer and target_peer are resolved to SCIDs before calling
             cl-revenue-ops. The Strategic Exemption allows negative-EV rebalances
             to Hive members up to the configured tolerance.
         """
         if self._status == BridgeStatus.DISABLED:
+            return False
+
+        # Security: Validate amount bounds (Issue #27)
+        if amount_sats <= 0:
+            self._log("Rebalance rejected: amount must be positive", level='warn')
+            return False
+
+        if amount_sats > MAX_REBALANCE_SATS:
+            self._log(
+                f"Rebalance rejected: {amount_sats} sats exceeds max "
+                f"{MAX_REBALANCE_SATS} sats per operation",
+                level='warn'
+            )
+            return False
+
+        if not self._check_daily_rebalance_budget(amount_sats):
+            self._log(
+                f"Rebalance rejected: would exceed daily limit of "
+                f"{MAX_DAILY_REBALANCE_SATS} sats (current: {self._daily_rebalance_sats})",
+                level='warn'
+            )
             return False
 
         # Look up target channel SCID
@@ -581,6 +658,7 @@ class Bridge:
 
             success = result.get("status") in ("success", "initiated", "pending")
             if success:
+                self._daily_rebalance_sats += amount_sats  # Track for daily budget
                 self._log(f"Rebalance initiated: {amount_sats} sats {source_scid} -> {target_scid}")
 
             return success
@@ -689,7 +767,7 @@ class Bridge:
         return self._status
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get bridge statistics."""
+        """Get bridge statistics including security limits."""
         return {
             "status": self._status.value,
             "revenue_ops": {
@@ -699,5 +777,12 @@ class Bridge:
             "clboss": {
                 "available": self._clboss_available,
                 "circuit_breaker": self._clboss_cb.get_stats() if self._clboss_available else None
+            },
+            "security_limits": {
+                "policy_rate_limit_seconds": POLICY_RATE_LIMIT_SECONDS,
+                "max_rebalance_sats": MAX_REBALANCE_SATS,
+                "max_daily_rebalance_sats": MAX_DAILY_REBALANCE_SATS,
+                "daily_rebalance_used_sats": self._daily_rebalance_sats,
+                "daily_rebalance_remaining_sats": max(0, MAX_DAILY_REBALANCE_SATS - self._daily_rebalance_sats)
             }
         }
