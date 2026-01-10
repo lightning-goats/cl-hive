@@ -1156,7 +1156,9 @@ def _broadcast_to_members(message_bytes: bytes) -> None:
     if not database or not safe_plugin:
         return
     for member in database.get_all_members():
-        if member.get("tier") != MembershipTier.MEMBER.value:
+        tier = member.get("tier")
+        # Broadcast to both members and admins
+        if tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
             continue
         member_id = member["peer_id"]
         if member_id == our_pubkey:
@@ -1281,7 +1283,8 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not stored:
         return {"result": "continue"}
 
-    if local_tier != MembershipTier.MEMBER.value:
+    # Only members and admins can trigger auto-promotion
+    if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
         return {"result": "continue"}
 
     active_members = membership_mgr.get_active_members()
@@ -1320,7 +1323,8 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     sender = database.get_member(peer_id)
-    if not sender or sender.get("tier") != MembershipTier.MEMBER.value:
+    sender_tier = sender.get("tier") if sender else None
+    if sender_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
         return {"result": "continue"}
 
     target_pubkey = payload["target_pubkey"]
@@ -1349,7 +1353,8 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         if database.is_banned(vouch["voucher_pubkey"]):
             continue
         member = database.get_member(vouch["voucher_pubkey"])
-        if not member or member.get("tier") != MembershipTier.MEMBER.value:
+        member_tier = member.get("tier") if member else None
+        if member_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
             continue
         canonical = membership_mgr.build_vouch_message(
             vouch["target_pubkey"], vouch["request_id"], vouch["timestamp"]
@@ -1980,6 +1985,31 @@ def hive_vouch(plugin: Plugin, peer_id: str):
     all_vouches = database.get_promotion_vouches(peer_id, request_id)
     active_members = membership_mgr.get_active_members()
     quorum = membership_mgr.calculate_quorum(len(active_members))
+    quorum_reached = len(all_vouches) >= quorum
+
+    # Auto-promote if quorum reached
+    if quorum_reached and config.auto_promote_enabled:
+        # Update member tier
+        database.update_member(peer_id, tier=MembershipTier.MEMBER.value, promoted_at=int(time.time()))
+        database.update_promotion_request_status(peer_id, request_id, "accepted")
+        plugin.log(f"cl-hive: Promoted {peer_id[:16]}... to member (quorum reached)")
+
+        # Broadcast PROMOTION message
+        promotion_payload = {
+            "target_pubkey": peer_id,
+            "request_id": request_id,
+            "vouches": [
+                {
+                    "target_pubkey": v["target_peer_id"],
+                    "request_id": v["request_id"],
+                    "timestamp": v["timestamp"],
+                    "voucher_pubkey": v["voucher_peer_id"],
+                    "sig": v["sig"]
+                } for v in all_vouches[:MAX_VOUCHES_IN_PROMOTION]
+            ]
+        }
+        promo_msg = serialize(HiveMessageType.PROMOTION, promotion_payload)
+        _broadcast_to_members(promo_msg)
 
     return {
         "status": "vouched",
@@ -1987,7 +2017,7 @@ def hive_vouch(plugin: Plugin, peer_id: str):
         "request_id": request_id,
         "vouch_count": len(all_vouches),
         "quorum_needed": quorum,
-        "quorum_reached": len(all_vouches) >= quorum,
+        "quorum_reached": quorum_reached,
     }
 
 
