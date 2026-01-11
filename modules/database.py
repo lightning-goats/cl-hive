@@ -196,6 +196,53 @@ class HiveDatabase:
         """)
 
         # =====================================================================
+        # ADMIN PROMOTION TABLE (requires 100% admin approval)
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_promotions (
+                target_peer_id TEXT PRIMARY KEY,
+                proposed_by TEXT NOT NULL,
+                proposed_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_promotion_approvals (
+                target_peer_id TEXT NOT NULL,
+                approver_peer_id TEXT NOT NULL,
+                approved_at INTEGER NOT NULL,
+                PRIMARY KEY (target_peer_id, approver_peer_id)
+            )
+        """)
+
+        # =====================================================================
+        # BAN PROPOSAL TABLES (Hybrid Governance)
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ban_proposals (
+                proposal_id TEXT PRIMARY KEY,
+                target_peer_id TEXT NOT NULL,
+                proposer_peer_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                proposed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ban_votes (
+                proposal_id TEXT NOT NULL,
+                voter_peer_id TEXT NOT NULL,
+                vote TEXT NOT NULL,
+                voted_at INTEGER NOT NULL,
+                signature TEXT NOT NULL,
+                PRIMARY KEY (proposal_id, voter_peer_id)
+            )
+        """)
+
+        # =====================================================================
         # PEER PRESENCE TABLE
         # =====================================================================
         conn.execute("""
@@ -717,6 +764,181 @@ class HiveDatabase:
             ORDER BY created_at DESC
         """, (target_peer_id,)).fetchall()
         return [dict(row) for row in rows]
+
+    # =========================================================================
+    # ADMIN PROMOTIONS (100% admin approval required)
+    # =========================================================================
+
+    def create_admin_promotion(self, target_peer_id: str, proposed_by: str) -> bool:
+        """Create or update an admin promotion proposal."""
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO admin_promotions
+                (target_peer_id, proposed_by, proposed_at, status)
+                VALUES (?, ?, ?, 'pending')
+            """, (target_peer_id, proposed_by, now))
+            return True
+        except Exception:
+            return False
+
+    def get_admin_promotion(self, target_peer_id: str) -> Optional[Dict[str, Any]]:
+        """Get admin promotion proposal for a peer."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM admin_promotions WHERE target_peer_id = ?
+        """, (target_peer_id,)).fetchone()
+        return dict(row) if row else None
+
+    def add_admin_promotion_approval(self, target_peer_id: str,
+                                      approver_peer_id: str) -> bool:
+        """Add an admin's approval for a promotion."""
+        conn = self._get_connection()
+        now = int(time.time())
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO admin_promotion_approvals
+                (target_peer_id, approver_peer_id, approved_at)
+                VALUES (?, ?, ?)
+            """, (target_peer_id, approver_peer_id, now))
+            return True
+        except Exception:
+            return False
+
+    def get_admin_promotion_approvals(self, target_peer_id: str) -> List[Dict[str, Any]]:
+        """Get all approvals for an admin promotion."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM admin_promotion_approvals WHERE target_peer_id = ?
+        """, (target_peer_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete_admin_promotion(self, target_peer_id: str) -> bool:
+        """Mark admin promotion as complete."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                UPDATE admin_promotions SET status = 'complete'
+                WHERE target_peer_id = ?
+            """, (target_peer_id,))
+            return True
+        except Exception:
+            return False
+
+    def get_pending_admin_promotions(self) -> List[Dict[str, Any]]:
+        """Get all pending admin promotions."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM admin_promotions WHERE status = 'pending'
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # BAN PROPOSALS (Hybrid Governance)
+    # =========================================================================
+
+    def create_ban_proposal(self, proposal_id: str, target_peer_id: str,
+                           proposer_peer_id: str, reason: str,
+                           proposed_at: int, expires_at: int) -> bool:
+        """Create a new ban proposal."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT INTO ban_proposals
+                (proposal_id, target_peer_id, proposer_peer_id, reason,
+                 proposed_at, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            """, (proposal_id, target_peer_id, proposer_peer_id, reason,
+                  proposed_at, expires_at))
+            conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def get_ban_proposal(self, proposal_id: str) -> Optional[Dict[str, Any]]:
+        """Get a ban proposal by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM ban_proposals WHERE proposal_id = ?",
+            (proposal_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_ban_proposal_for_target(self, target_peer_id: str) -> Optional[Dict[str, Any]]:
+        """Get pending ban proposal for a target peer."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM ban_proposals
+            WHERE target_peer_id = ? AND status = 'pending'
+            ORDER BY proposed_at DESC LIMIT 1
+        """, (target_peer_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_ban_proposals(self) -> List[Dict[str, Any]]:
+        """Get all pending ban proposals."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM ban_proposals WHERE status = 'pending'
+            ORDER BY proposed_at DESC
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_ban_proposal_status(self, proposal_id: str, status: str) -> bool:
+        """Update ban proposal status (pending, approved, rejected, expired)."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                UPDATE ban_proposals SET status = ? WHERE proposal_id = ?
+            """, (status, proposal_id))
+            conn.commit()
+            return conn.total_changes > 0
+        except Exception:
+            return False
+
+    def add_ban_vote(self, proposal_id: str, voter_peer_id: str,
+                    vote: str, voted_at: int, signature: str) -> bool:
+        """Add or update a vote on a ban proposal."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO ban_votes
+                (proposal_id, voter_peer_id, vote, voted_at, signature)
+                VALUES (?, ?, ?, ?, ?)
+            """, (proposal_id, voter_peer_id, vote, voted_at, signature))
+            conn.commit()
+            return True
+        except Exception:
+            return False
+
+    def get_ban_votes(self, proposal_id: str) -> List[Dict[str, Any]]:
+        """Get all votes for a ban proposal."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM ban_votes WHERE proposal_id = ?",
+            (proposal_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_ban_vote(self, proposal_id: str, voter_peer_id: str) -> Optional[Dict[str, Any]]:
+        """Get a specific vote on a ban proposal."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM ban_votes
+            WHERE proposal_id = ? AND voter_peer_id = ?
+        """, (proposal_id, voter_peer_id)).fetchone()
+        return dict(row) if row else None
+
+    def cleanup_expired_ban_proposals(self, now: int) -> int:
+        """Mark expired ban proposals and return count."""
+        conn = self._get_connection()
+        conn.execute("""
+            UPDATE ban_proposals
+            SET status = 'expired'
+            WHERE status = 'pending' AND expires_at < ?
+        """, (now,))
+        conn.commit()
+        return conn.total_changes
 
     # =========================================================================
     # PEER PRESENCE

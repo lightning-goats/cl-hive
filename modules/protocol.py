@@ -72,9 +72,12 @@ class HiveMessageType(IntEnum):
     
     # Phase 5: Governance (deferred)
     VOUCH = 32789       # Member vouching for promotion
-    BAN = 32791         # Ban announcement
+    BAN = 32791         # Ban announcement (executed ban)
     PROMOTION = 32793   # Promotion confirmation
     PROMOTION_REQUEST = 32795  # Neophyte requesting promotion
+    MEMBER_LEFT = 32797  # Member voluntarily leaving hive
+    BAN_PROPOSAL = 32799  # Propose banning a member (requires vote)
+    BAN_VOTE = 32801     # Vote on a pending ban proposal
 
 
 # =============================================================================
@@ -295,6 +298,114 @@ def validate_promotion(payload: Dict[str, Any]) -> bool:
             return False
         if vouch.get("request_id") != request_id:
             return False
+    return True
+
+
+def validate_member_left(payload: Dict[str, Any]) -> bool:
+    """Validate MEMBER_LEFT payload schema."""
+    if not isinstance(payload, dict):
+        return False
+    peer_id = payload.get("peer_id")
+    timestamp = payload.get("timestamp")
+    reason = payload.get("reason")
+    signature = payload.get("signature")
+
+    # peer_id must be valid pubkey (66 hex chars)
+    if not isinstance(peer_id, str) or len(peer_id) != 66:
+        return False
+    if not all(c in "0123456789abcdef" for c in peer_id):
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # reason must be a non-empty string
+    if not isinstance(reason, str) or not reason:
+        return False
+
+    # signature must be present (zbase encoded)
+    if not isinstance(signature, str) or not signature:
+        return False
+
+    return True
+
+
+def _valid_pubkey(pubkey: Any) -> bool:
+    """Check if value is a valid 66-char hex pubkey."""
+    if not isinstance(pubkey, str) or len(pubkey) != 66:
+        return False
+    return all(c in "0123456789abcdef" for c in pubkey)
+
+
+def validate_ban_proposal(payload: Dict[str, Any]) -> bool:
+    """Validate BAN_PROPOSAL payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    target_peer_id = payload.get("target_peer_id")
+    proposer_peer_id = payload.get("proposer_peer_id")
+    proposal_id = payload.get("proposal_id")
+    reason = payload.get("reason")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # Validate pubkeys
+    if not _valid_pubkey(target_peer_id):
+        return False
+    if not _valid_pubkey(proposer_peer_id):
+        return False
+
+    # proposal_id must be valid hex string
+    if not _valid_request_id(proposal_id):
+        return False
+
+    # reason must be non-empty string
+    if not isinstance(reason, str) or not reason or len(reason) > 500:
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # signature must be present
+    if not isinstance(signature, str) or not signature:
+        return False
+
+    return True
+
+
+def validate_ban_vote(payload: Dict[str, Any]) -> bool:
+    """Validate BAN_VOTE payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    proposal_id = payload.get("proposal_id")
+    voter_peer_id = payload.get("voter_peer_id")
+    vote = payload.get("vote")  # "approve" or "reject"
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # proposal_id must be valid hex string
+    if not _valid_request_id(proposal_id):
+        return False
+
+    # voter must be valid pubkey
+    if not _valid_pubkey(voter_peer_id):
+        return False
+
+    # vote must be "approve" or "reject"
+    if vote not in ("approve", "reject"):
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # signature must be present
+    if not isinstance(signature, str) or not signature:
+        return False
+
     return True
 
 

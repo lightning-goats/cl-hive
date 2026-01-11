@@ -58,7 +58,7 @@ PLUGIN_VERSION = "cl-hive v0.1.0"
 class Ticket:
     """
     Invitation ticket structure.
-    
+
     An Admin generates this to authorize new members to join.
     The ticket is signed by the Admin's node key.
     """
@@ -68,6 +68,7 @@ class Ticket:
     issued_at: int          # Unix timestamp
     expires_at: int         # Unix timestamp
     signature: str          # signmessage result
+    initial_tier: str = 'neophyte'  # Starting tier: 'neophyte' or 'admin' (bootstrap)
     
     def to_json(self) -> str:
         """Serialize to JSON (excluding signature for signing)."""
@@ -150,18 +151,20 @@ class HandshakeManager:
     - Challenge-response protocol
     """
     
-    def __init__(self, rpc_proxy, db, plugin):
+    def __init__(self, rpc_proxy, db, plugin, min_vouch_count: int = 3):
         """
         Initialize the handshake manager.
-        
+
         Args:
             rpc_proxy: ThreadSafeRpcProxy for CLN RPC calls
             db: HiveDatabase instance
             plugin: Plugin reference for logging
+            min_vouch_count: Minimum vouches for promotion (for bootstrap check)
         """
         self.rpc = rpc_proxy
         self.db = db
         self.plugin = plugin
+        self.min_vouch_count = min_vouch_count
         self._our_pubkey: Optional[str] = None
         self._pending_challenges: Dict[str, Dict[str, Any]] = {}
     
@@ -258,35 +261,54 @@ class HandshakeManager:
     # TICKET OPERATIONS
     # =========================================================================
     
-    def generate_invite_ticket(self, 
+    def generate_invite_ticket(self,
                                 valid_hours: int = DEFAULT_TICKET_HOURS,
-                                requirements: int = Requirements.NONE) -> str:
+                                requirements: int = Requirements.NONE,
+                                initial_tier: str = 'neophyte') -> str:
         """
         Generate an invitation ticket for a new member.
-        
-        Only Admins can generate invite tickets.
-        
+
+        Only Admins can generate invite tickets. Bootstrap tickets (initial_tier='member')
+        can only be generated when hive member count < min_vouch_count.
+
         Args:
             valid_hours: Hours until ticket expires
             requirements: Bitmask of required features
-            
+            initial_tier: Starting tier for new member ('neophyte' or 'member')
+
         Returns:
             Base64-encoded signed ticket
-            
+
         Raises:
             PermissionError: If caller is not an Admin
+            ValueError: If bootstrap ticket requested but hive is not in bootstrap phase
         """
         our_pubkey = self.get_our_pubkey()
-        
+
         # Verify we're an Admin
         member = self.db.get_member(our_pubkey)
         if not member or member['tier'] != 'admin':
             raise PermissionError("Only Admins can generate invite tickets")
-        
+
+        # Validate initial_tier
+        if initial_tier not in ('neophyte', 'admin'):
+            raise ValueError(f"Invalid initial_tier: {initial_tier}. Use 'neophyte' or 'admin' (bootstrap)")
+
+        # Bootstrap check: admin tier only allowed for second admin
+        # Bootstrap creates exactly 2 admins (genesis + 1 bootstrap invite)
+        if initial_tier == 'admin':
+            all_members = self.db.get_all_members()
+            admin_count = sum(1 for m in all_members if m.get('tier') == 'admin')
+            if admin_count >= 2:
+                raise ValueError(
+                    f"Bootstrap complete: hive already has {admin_count} admins. "
+                    f"Use normal invite (tier=neophyte) and vouch process."
+                )
+
         # Get Hive ID from metadata
         metadata = json.loads(member.get('metadata', '{}'))
         hive_id = metadata.get('hive_id', 'unknown')
-        
+
         # Create ticket
         now = int(time.time())
         ticket_data = {
@@ -295,16 +317,18 @@ class HandshakeManager:
             "requirements": requirements,
             "issued_at": now,
             "expires_at": now + (valid_hours * 3600),
+            "initial_tier": initial_tier,
         }
-        
+
         # Sign
         ticket_json = json.dumps(ticket_data, sort_keys=True, separators=(',', ':'))
         sig_result = self.rpc.signmessage(ticket_json)
-        
+
         ticket = Ticket(**ticket_data, signature=sig_result['zbase'])
-        
-        self.plugin.log(f"Generated invite ticket (expires in {valid_hours}h)")
-        
+
+        tier_desc = " (BOOTSTRAP)" if initial_tier == 'member' else ""
+        self.plugin.log(f"Generated invite ticket{tier_desc} (expires in {valid_hours}h)")
+
         return ticket.to_base64()
     
     def verify_ticket(self, ticket_b64: str) -> Tuple[bool, Optional[Ticket], str]:
@@ -435,13 +459,15 @@ class HandshakeManager:
     # CHALLENGE-RESPONSE
     # =========================================================================
     
-    def generate_challenge(self, peer_id: str, requirements: int) -> str:
+    def generate_challenge(self, peer_id: str, requirements: int,
+                            initial_tier: str = 'neophyte') -> str:
         """
         Generate a challenge nonce for a peer.
 
         Args:
             peer_id: Peer's public key
             requirements: Bitmask requirements from the invite ticket
+            initial_tier: Starting tier for new member ('neophyte' or 'member')
 
         Returns:
             Hex-encoded random nonce
@@ -467,7 +493,8 @@ class HandshakeManager:
         self._pending_challenges[peer_id] = {
             "nonce": nonce,
             "issued_at": now,
-            "requirements": requirements
+            "requirements": requirements,
+            "initial_tier": initial_tier
         }
 
         # LRU eviction if over limit

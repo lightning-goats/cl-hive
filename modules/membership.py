@@ -42,15 +42,18 @@ class MembershipManager:
 
     def set_tier(self, peer_id: str, tier: str) -> bool:
         now = int(time.time())
-        promoted_at = now if tier == MembershipTier.MEMBER.value else None
+        # Set promoted_at for member and admin tiers
+        promoted_at = now if tier in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value) else None
 
         updated = self.db.update_member(peer_id, tier=tier, promoted_at=promoted_at)
         if not updated:
             return False
 
+        # Members and admins get hive policy (0 PPM fees)
+        is_full_member = tier in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
         if self.bridge and getattr(self.bridge, "status", None) and self.bridge.status.value == "enabled":
             try:
-                self.bridge.set_hive_policy(peer_id, is_member=(tier == MembershipTier.MEMBER.value))
+                self.bridge.set_hive_policy(peer_id, is_member=is_full_member)
             except Exception:
                 self._log(f"Bridge policy update failed for {peer_id[:16]}...", level="warn")
 

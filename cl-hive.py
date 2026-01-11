@@ -45,9 +45,10 @@ from pyln.client import Plugin, RpcError
 from modules.config import HiveConfig
 from modules.database import HiveDatabase
 from modules.protocol import (
-    HIVE_MAGIC, HiveMessageType, 
+    HIVE_MAGIC, HiveMessageType,
     MAX_MESSAGE_BYTES, is_hive_message, deserialize, serialize,
     validate_promotion_request, validate_vouch, validate_promotion,
+    validate_member_left, validate_ban_proposal, validate_ban_vote,
     VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
     create_challenge, create_welcome
 )
@@ -413,7 +414,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     plugin.log(f"cl-hive: Database initialized at {config.db_path}")
     
     # Initialize handshake manager
-    handshake_mgr = HandshakeManager(safe_plugin.rpc, database, safe_plugin)
+    handshake_mgr = HandshakeManager(
+        safe_plugin.rpc, database, safe_plugin,
+        min_vouch_count=config.min_vouch_count
+    )
     plugin.log("cl-hive: Handshake manager initialized")
     
     # Initialize state manager (Phase 2)
@@ -610,6 +614,12 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_vouch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PROMOTION:
             return handle_promotion(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.MEMBER_LEFT:
+            return handle_member_left(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.BAN_PROPOSAL:
+            return handle_ban_proposal(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.BAN_VOTE:
+            return handle_ban_vote(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type (Phase 4+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -634,13 +644,16 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     
     # Verify the ticket
     is_valid, ticket, error = handshake_mgr.verify_ticket(ticket_b64)
-    
+
     if not is_valid:
         plugin.log(f"cl-hive: Invalid ticket from {peer_id[:16]}...: {error}", level='warn')
         return {"result": "continue"}
-    
-    # Generate challenge nonce
-    nonce = handshake_mgr.generate_challenge(peer_id, ticket.requirements)
+
+    # Get initial tier from ticket (default to neophyte for backwards compatibility)
+    initial_tier = getattr(ticket, 'initial_tier', 'neophyte')
+
+    # Generate challenge nonce (stores initial_tier for use after ATTEST)
+    nonce = handshake_mgr.generate_challenge(peer_id, ticket.requirements, initial_tier)
     
     # Get Hive ID from an existing admin
     members = database.get_all_members()
@@ -791,15 +804,22 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
 
-    # Verification passed! Add as Neophyte member
+    # Get initial tier from pending challenge (bootstrap support)
+    initial_tier = pending.get('initial_tier', 'neophyte')
+
+    # Verification passed! Add member with appropriate tier
     database.add_member(
         peer_id=peer_id,
-        tier='neophyte',
+        tier=initial_tier,
         joined_at=int(time.time())
     )
-    
+
+    # If admin tier (bootstrap), also trigger policy sync
+    if initial_tier == 'admin' and membership_mgr:
+        membership_mgr.set_tier(peer_id, initial_tier)
+
     handshake_mgr.clear_challenge(peer_id)
-    
+
     # Get Hive info for WELCOME
     members = database.get_all_members()
     hive_id = "hive"
@@ -809,22 +829,23 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             metadata = json.loads(m['metadata'])
             hive_id = metadata.get('hive_id', 'hive')
             break
-    
+
     # Calculate real state hash via StateManager
     if state_manager:
         state_hash = state_manager.calculate_fleet_hash()
     else:
         state_hash = "0" * 64
-    
-    # Send WELCOME
-    welcome_msg = create_welcome(hive_id, 'neophyte', len(members), state_hash)
+
+    # Send WELCOME with actual tier
+    welcome_msg = create_welcome(hive_id, initial_tier, len(members), state_hash)
 
     try:
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": welcome_msg.hex()
         })
-        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new neophyte)")
+        bootstrap_note = " [BOOTSTRAP]" if initial_tier == 'admin' else ""
+        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new {initial_tier}){bootstrap_note}")
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
 
@@ -1601,6 +1622,268 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
+def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle MEMBER_LEFT message - a member voluntarily leaving the hive.
+
+    Validates the signature and removes the member from the hive.
+    """
+    if not config or not database or not safe_plugin:
+        return {"result": "continue"}
+
+    if not validate_member_left(payload):
+        plugin.log(f"cl-hive: MEMBER_LEFT from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    leaving_peer_id = payload["peer_id"]
+    timestamp = payload["timestamp"]
+    reason = payload["reason"]
+    signature = payload["signature"]
+
+    # Verify the message came from the leaving peer (self-signed)
+    # The sender (peer_id) should match the leaving peer
+    if peer_id != leaving_peer_id:
+        plugin.log(f"cl-hive: MEMBER_LEFT sender mismatch: {peer_id[:16]}... != {leaving_peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Check if member exists
+    member = database.get_member(leaving_peer_id)
+    if not member:
+        plugin.log(f"cl-hive: MEMBER_LEFT for unknown peer {leaving_peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    canonical = f"hive:leave:{leaving_peer_id}:{timestamp}:{reason}"
+    try:
+        result = safe_plugin.rpc.checkmessage(canonical, signature)
+        if not result.get("verified") or result.get("pubkey") != leaving_peer_id:
+            plugin.log(f"cl-hive: MEMBER_LEFT signature invalid for {leaving_peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: MEMBER_LEFT signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Remove the member
+    tier = member.get("tier")
+    database.remove_member(leaving_peer_id)
+    plugin.log(f"cl-hive: Member {leaving_peer_id[:16]}... ({tier}) left the hive: {reason}")
+
+    # Revert their fee policy to dynamic if bridge is available
+    if bridge and bridge.status == BridgeStatus.ENABLED:
+        try:
+            bridge.set_hive_policy(leaving_peer_id, is_member=False)
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to revert policy for {leaving_peer_id[:16]}...: {e}", level='debug')
+
+    # Check if hive is now headless (no admins)
+    all_members = database.get_all_members()
+    admin_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.ADMIN.value)
+    if admin_count == 0 and len(all_members) > 0:
+        plugin.log("cl-hive: WARNING - Hive is now headless (no admins). Members can elect a new admin.", level='warn')
+
+    return {"result": "continue"}
+
+
+# =============================================================================
+# BAN VOTING CONSTANTS
+# =============================================================================
+
+# Ban proposal voting period (7 days)
+BAN_PROPOSAL_TTL_SECONDS = 7 * 24 * 3600
+
+# Quorum threshold for ban approval (51%)
+BAN_QUORUM_THRESHOLD = 0.51
+
+# Cooldown before re-proposing ban for same peer (7 days)
+BAN_COOLDOWN_SECONDS = 7 * 24 * 3600
+
+
+def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle BAN_PROPOSAL message - a member proposing to ban another member.
+
+    Validates the proposal and stores it for voting.
+    """
+    if not config or not database or not safe_plugin:
+        return {"result": "continue"}
+
+    if not validate_ban_proposal(payload):
+        plugin.log(f"cl-hive: BAN_PROPOSAL from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    target_peer_id = payload["target_peer_id"]
+    proposer_peer_id = payload["proposer_peer_id"]
+    proposal_id = payload["proposal_id"]
+    reason = payload["reason"]
+    timestamp = payload["timestamp"]
+    signature = payload["signature"]
+
+    # Verify sender is the proposer
+    if peer_id != proposer_peer_id:
+        plugin.log(f"cl-hive: BAN_PROPOSAL sender mismatch", level='warn')
+        return {"result": "continue"}
+
+    # Verify proposer is a member or admin
+    proposer = database.get_member(proposer_peer_id)
+    if not proposer or proposer.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+        plugin.log(f"cl-hive: BAN_PROPOSAL from non-member", level='warn')
+        return {"result": "continue"}
+
+    # Verify target is a member
+    target = database.get_member(target_peer_id)
+    if not target:
+        plugin.log(f"cl-hive: BAN_PROPOSAL for non-member {target_peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Cannot ban yourself
+    if target_peer_id == proposer_peer_id:
+        return {"result": "continue"}
+
+    # Verify signature
+    canonical = f"hive:ban_proposal:{proposal_id}:{target_peer_id}:{timestamp}:{reason}"
+    try:
+        result = safe_plugin.rpc.checkmessage(canonical, signature)
+        if not result.get("verified") or result.get("pubkey") != proposer_peer_id:
+            plugin.log(f"cl-hive: BAN_PROPOSAL signature invalid", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: BAN_PROPOSAL signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Check if proposal already exists
+    existing = database.get_ban_proposal(proposal_id)
+    if existing:
+        return {"result": "continue"}
+
+    # Store proposal
+    expires_at = timestamp + BAN_PROPOSAL_TTL_SECONDS
+    database.create_ban_proposal(proposal_id, target_peer_id, proposer_peer_id,
+                                 reason, timestamp, expires_at)
+    plugin.log(f"cl-hive: Ban proposal {proposal_id[:16]}... for {target_peer_id[:16]}... by {proposer_peer_id[:16]}...")
+
+    return {"result": "continue"}
+
+
+def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle BAN_VOTE message - a member voting on a ban proposal.
+
+    Validates the vote, stores it, and checks if quorum is reached.
+    """
+    if not config or not database or not safe_plugin or not membership_mgr:
+        return {"result": "continue"}
+
+    if not validate_ban_vote(payload):
+        plugin.log(f"cl-hive: BAN_VOTE from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    proposal_id = payload["proposal_id"]
+    voter_peer_id = payload["voter_peer_id"]
+    vote = payload["vote"]  # "approve" or "reject"
+    timestamp = payload["timestamp"]
+    signature = payload["signature"]
+
+    # Verify sender is the voter
+    if peer_id != voter_peer_id:
+        plugin.log(f"cl-hive: BAN_VOTE sender mismatch", level='warn')
+        return {"result": "continue"}
+
+    # Verify voter is a member or admin
+    voter = database.get_member(voter_peer_id)
+    if not voter or voter.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+        return {"result": "continue"}
+
+    # Get the proposal
+    proposal = database.get_ban_proposal(proposal_id)
+    if not proposal or proposal.get("status") != "pending":
+        return {"result": "continue"}
+
+    # Verify signature
+    canonical = f"hive:ban_vote:{proposal_id}:{vote}:{timestamp}"
+    try:
+        result = safe_plugin.rpc.checkmessage(canonical, signature)
+        if not result.get("verified") or result.get("pubkey") != voter_peer_id:
+            plugin.log(f"cl-hive: BAN_VOTE signature invalid", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: BAN_VOTE signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Store vote
+    database.add_ban_vote(proposal_id, voter_peer_id, vote, timestamp, signature)
+    plugin.log(f"cl-hive: Ban vote from {voter_peer_id[:16]}... on {proposal_id[:16]}...: {vote}")
+
+    # Check if quorum reached
+    _check_ban_quorum(proposal_id, proposal, plugin)
+
+    return {"result": "continue"}
+
+
+def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
+    """
+    Check if a ban proposal has reached quorum and execute if so.
+
+    Returns True if ban was executed.
+    """
+    if not database or not membership_mgr or not bridge:
+        return False
+
+    target_peer_id = proposal["target_peer_id"]
+
+    # Get all votes
+    votes = database.get_ban_votes(proposal_id)
+
+    # Get eligible voters (members and admins, excluding target)
+    all_members = database.get_all_members()
+    eligible_voters = [
+        m for m in all_members
+        if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+        and m["peer_id"] != target_peer_id
+    ]
+    eligible_count = len(eligible_voters)
+
+    if eligible_count == 0:
+        return False
+
+    # Count approve votes from eligible voters
+    eligible_voter_ids = set(m["peer_id"] for m in eligible_voters)
+    approve_count = sum(
+        1 for v in votes
+        if v["vote"] == "approve" and v["voter_peer_id"] in eligible_voter_ids
+    )
+
+    # Check quorum (51% of eligible voters)
+    quorum_needed = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
+    if approve_count >= quorum_needed:
+        # Execute ban
+        database.update_ban_proposal_status(proposal_id, "approved")
+        proposer_id = proposal.get("proposer_peer_id", "quorum_vote")
+        database.add_ban(target_peer_id, proposal.get("reason", "quorum_ban"), proposer_id)
+        database.remove_member(target_peer_id)
+
+        # Revert fee policy
+        if bridge and bridge.status == BridgeStatus.ENABLED:
+            try:
+                bridge.set_hive_policy(target_peer_id, is_member=False)
+            except Exception:
+                pass
+
+        plugin.log(f"cl-hive: Ban executed for {target_peer_id[:16]}... ({approve_count}/{eligible_count} votes)")
+
+        # Broadcast BAN message
+        ban_payload = {
+            "peer_id": target_peer_id,
+            "reason": proposal.get("reason", "quorum_ban"),
+            "proposal_id": proposal_id
+        }
+        ban_msg = serialize(HiveMessageType.BAN, ban_payload)
+        _broadcast_to_members(ban_msg)
+
+        return True
+
+    return False
+
+
 # =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
@@ -2245,6 +2528,81 @@ def hive_vouch(plugin: Plugin, peer_id: str):
     }
 
 
+@plugin.method("hive-force-promote")
+def hive_force_promote(plugin: Plugin, peer_id: str):
+    """
+    Admin command to force-promote a neophyte to member during bootstrap.
+
+    This bypasses the normal quorum requirement when the hive is too small
+    to reach quorum naturally. Only works when total member count < min_vouch_count.
+
+    Args:
+        peer_id: Public key of the neophyte to promote
+
+    Returns:
+        Dict with promotion status.
+
+    Permission: Admin only, bootstrap phase only
+    """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not database or not our_pubkey or not membership_mgr:
+        return {"error": "Database not initialized"}
+
+    # Check we're in bootstrap phase (member count < min_vouch_count)
+    members = database.get_all_members()
+    member_count = len(members)
+    min_vouch = config.min_vouch_count if config else 3
+
+    if member_count >= min_vouch:
+        return {
+            "error": "bootstrap_complete",
+            "message": f"Hive has {member_count} members, use normal vouch process",
+            "member_count": member_count,
+            "min_vouch_count": min_vouch
+        }
+
+    # Check target is a neophyte
+    target = database.get_member(peer_id)
+    if not target:
+        return {"error": "peer_not_found", "peer_id": peer_id}
+    if target.get("tier") != MembershipTier.NEOPHYTE.value:
+        return {"error": "peer_not_neophyte", "current_tier": target.get("tier")}
+
+    # Force promote via membership manager (triggers set_hive_policy)
+    success = membership_mgr.set_tier(peer_id, MembershipTier.MEMBER.value)
+    if not success:
+        return {"error": "promotion_failed", "peer_id": peer_id}
+
+    plugin.log(f"cl-hive: Force-promoted {peer_id[:16]}... to member (bootstrap)")
+
+    # Broadcast PROMOTION message to sync state
+    promotion_payload = {
+        "target_pubkey": peer_id,
+        "request_id": f"bootstrap_{int(time.time())}",
+        "vouches": [{
+            "target_pubkey": peer_id,
+            "request_id": f"bootstrap_{int(time.time())}",
+            "timestamp": int(time.time()),
+            "voucher_pubkey": our_pubkey,
+            "sig": "admin_bootstrap"
+        }]
+    }
+    promo_msg = serialize(HiveMessageType.PROMOTION, promotion_payload)
+    _broadcast_to_members(promo_msg)
+
+    return {
+        "status": "promoted",
+        "peer_id": peer_id,
+        "new_tier": MembershipTier.MEMBER.value,
+        "method": "admin_bootstrap",
+        "remaining_bootstrap_slots": min_vouch - member_count - 1
+    }
+
+
 @plugin.method("hive-ban")
 def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     """
@@ -2310,6 +2668,577 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
         "reason": reason,
         "reporter": our_pubkey,
         "expires_at": expires_at,
+    }
+
+
+@plugin.method("hive-promote-admin")
+def hive_promote_admin(plugin: Plugin, peer_id: str):
+    """
+    Propose or approve promoting a member to admin.
+
+    Requires 100% admin approval. When an admin calls this:
+    - If no pending proposal exists, creates one and adds their approval
+    - If proposal exists, adds their approval
+    - When all admins have approved, the member is promoted to admin
+
+    Args:
+        peer_id: Public key of the member to promote to admin
+
+    Returns:
+        Dict with promotion status.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not database or not our_pubkey or not membership_mgr:
+        return {"error": "Database not initialized"}
+
+    # Check target exists and is a member (not neophyte, not already admin)
+    target = database.get_member(peer_id)
+    if not target:
+        return {"error": "peer_not_found", "peer_id": peer_id}
+
+    target_tier = target.get("tier")
+    if target_tier == MembershipTier.ADMIN.value:
+        return {"error": "already_admin", "peer_id": peer_id}
+    if target_tier == MembershipTier.NEOPHYTE.value:
+        return {"error": "must_be_member_first", "peer_id": peer_id,
+                "message": "Neophytes must be promoted to member before admin"}
+
+    # Get all current admins
+    all_members = database.get_all_members()
+    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
+    admin_count = len(admins)
+    admin_pubkeys = set(m["peer_id"] for m in admins)
+
+    # Create or get existing proposal
+    existing = database.get_admin_promotion(peer_id)
+    if not existing:
+        database.create_admin_promotion(peer_id, our_pubkey)
+        plugin.log(f"cl-hive: Admin promotion proposed for {peer_id[:16]}...")
+
+    # Add our approval
+    database.add_admin_promotion_approval(peer_id, our_pubkey)
+
+    # Check approvals
+    approvals = database.get_admin_promotion_approvals(peer_id)
+    approval_pubkeys = set(a["approver_peer_id"] for a in approvals)
+
+    # Only count approvals from current admins
+    valid_approvals = approval_pubkeys & admin_pubkeys
+    approvals_needed = admin_count
+    approvals_received = len(valid_approvals)
+
+    # Check if 100% approval reached
+    if valid_approvals == admin_pubkeys:
+        # Promote to admin
+        success = membership_mgr.set_tier(peer_id, MembershipTier.ADMIN.value)
+        if success:
+            database.complete_admin_promotion(peer_id)
+            plugin.log(f"cl-hive: Promoted {peer_id[:16]}... to ADMIN (100% approval)")
+
+            # Broadcast promotion
+            promotion_payload = {
+                "target_pubkey": peer_id,
+                "request_id": f"admin_promo_{int(time.time())}",
+                "new_tier": "admin",
+                "vouches": [{"approver": pk} for pk in valid_approvals]
+            }
+            promo_msg = serialize(HiveMessageType.PROMOTION, promotion_payload)
+            _broadcast_to_members(promo_msg)
+
+            return {
+                "status": "promoted",
+                "peer_id": peer_id,
+                "new_tier": "admin",
+                "approvals": list(valid_approvals),
+                "message": f"Promoted to admin with {approvals_received}/{approvals_needed} approvals"
+            }
+        else:
+            return {"error": "promotion_failed", "peer_id": peer_id}
+    else:
+        # Still waiting for more approvals
+        missing = admin_pubkeys - valid_approvals
+        return {
+            "status": "pending",
+            "peer_id": peer_id,
+            "approvals_received": approvals_received,
+            "approvals_needed": approvals_needed,
+            "approved_by": list(valid_approvals),
+            "waiting_for": [pk[:16] + "..." for pk in missing],
+            "message": f"Need {approvals_needed - approvals_received} more admin approval(s)"
+        }
+
+
+@plugin.method("hive-pending-admin-promotions")
+def hive_pending_admin_promotions(plugin: Plugin):
+    """
+    View pending admin promotion proposals.
+
+    Returns:
+        Dict with pending admin promotions and their approval status.
+
+    Permission: Admin only
+    """
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Get all current admins
+    all_members = database.get_all_members()
+    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
+    admin_pubkeys = set(m["peer_id"] for m in admins)
+
+    pending = database.get_pending_admin_promotions()
+    result = []
+
+    for p in pending:
+        target = p["target_peer_id"]
+        approvals = database.get_admin_promotion_approvals(target)
+        approval_pubkeys = set(a["approver_peer_id"] for a in approvals)
+        valid_approvals = approval_pubkeys & admin_pubkeys
+
+        result.append({
+            "peer_id": target,
+            "proposed_by": p["proposed_by"],
+            "proposed_at": p["proposed_at"],
+            "approvals_received": len(valid_approvals),
+            "approvals_needed": len(admins),
+            "approved_by": [pk[:16] + "..." for pk in valid_approvals],
+            "waiting_for": [pk[:16] + "..." for pk in (admin_pubkeys - valid_approvals)]
+        })
+
+    return {
+        "count": len(result),
+        "admin_count": len(admins),
+        "pending_promotions": result
+    }
+
+
+@plugin.method("hive-resign-admin")
+def hive_resign_admin(plugin: Plugin):
+    """
+    Resign from admin status, becoming a regular member.
+
+    The last admin cannot resign - there must always be at least one admin.
+
+    Returns:
+        Dict with resignation status.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not database or not our_pubkey or not membership_mgr:
+        return {"error": "Database not initialized"}
+
+    # Get all current admins
+    all_members = database.get_all_members()
+    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
+    admin_count = len(admins)
+
+    # Cannot resign if we're the last admin
+    if admin_count <= 1:
+        return {
+            "error": "cannot_resign",
+            "message": "Cannot resign: you are the only admin. Promote another member to admin first."
+        }
+
+    # Demote self to member
+    success = membership_mgr.set_tier(our_pubkey, MembershipTier.MEMBER.value)
+    if success:
+        plugin.log(f"cl-hive: Admin {our_pubkey[:16]}... resigned to member")
+
+        # Broadcast tier change
+        tier_payload = {
+            "peer_id": our_pubkey,
+            "new_tier": "member",
+            "reason": "admin_resignation"
+        }
+        tier_msg = serialize(HiveMessageType.PROMOTION, tier_payload)
+        _broadcast_to_members(tier_msg)
+
+        return {
+            "status": "resigned",
+            "peer_id": our_pubkey,
+            "new_tier": "member",
+            "remaining_admins": admin_count - 1,
+            "message": "Successfully resigned from admin. You are now a member."
+        }
+    else:
+        return {"error": "resignation_failed", "message": "Failed to update tier"}
+
+
+@plugin.method("hive-leave")
+def hive_leave(plugin: Plugin, reason: str = "voluntary"):
+    """
+    Voluntarily leave the hive.
+
+    This removes you from the hive member list and notifies other members.
+    Your fee policies will be reverted to dynamic.
+
+    Restrictions:
+    - The last admin cannot leave (would make hive headless)
+    - Admins should resign first or promote another admin before leaving
+
+    Args:
+        reason: Optional reason for leaving (default: "voluntary")
+
+    Returns:
+        Dict with leave status.
+
+    Permission: Any member
+    """
+    if not database or not our_pubkey or not safe_plugin:
+        return {"error": "Hive not initialized"}
+
+    # Check we're a member of the hive
+    member = database.get_member(our_pubkey)
+    if not member:
+        return {"error": "not_a_member", "message": "You are not a member of any hive"}
+
+    our_tier = member.get("tier")
+
+    # Check if we're the last admin
+    if our_tier == MembershipTier.ADMIN.value:
+        all_members = database.get_all_members()
+        admin_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.ADMIN.value)
+        if admin_count <= 1:
+            return {
+                "error": "cannot_leave",
+                "message": "Cannot leave: you are the only admin. Promote another member to admin first, or the hive will become headless."
+            }
+
+    # Create signed leave message
+    timestamp = int(time.time())
+    canonical = f"hive:leave:{our_pubkey}:{timestamp}:{reason}"
+
+    try:
+        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+    except Exception as e:
+        return {"error": f"Failed to sign leave message: {e}"}
+
+    # Broadcast to members before removing ourselves
+    leave_payload = {
+        "peer_id": our_pubkey,
+        "timestamp": timestamp,
+        "reason": reason,
+        "signature": sig
+    }
+    leave_msg = serialize(HiveMessageType.MEMBER_LEFT, leave_payload)
+    _broadcast_to_members(leave_msg)
+
+    # Revert our fee policy to dynamic
+    if bridge and bridge.status == BridgeStatus.ENABLED:
+        try:
+            bridge.set_hive_policy(our_pubkey, is_member=False)
+        except Exception:
+            pass  # Best effort
+
+    # Remove ourselves from the member list
+    database.remove_member(our_pubkey)
+    plugin.log(f"cl-hive: Left the hive ({our_tier}): {reason}")
+
+    return {
+        "status": "left",
+        "peer_id": our_pubkey,
+        "former_tier": our_tier,
+        "reason": reason,
+        "message": "You have left the hive. Fee policies reverted to dynamic."
+    }
+
+
+@plugin.method("hive-propose-ban")
+def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason given"):
+    """
+    Propose banning a member from the hive.
+
+    Requires quorum vote (51% of members/admins) to execute.
+    The proposal is valid for 7 days.
+
+    Args:
+        peer_id: Public key of the member to ban
+        reason: Reason for the ban proposal (max 500 chars)
+
+    Returns:
+        Dict with proposal status.
+
+    Permission: Member or Admin
+    """
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database or not our_pubkey or not safe_plugin:
+        return {"error": "Hive not initialized"}
+
+    # Validate reason length
+    if len(reason) > 500:
+        return {"error": "reason_too_long", "max_length": 500}
+
+    # Check target exists and is a member
+    target = database.get_member(peer_id)
+    if not target:
+        return {"error": "peer_not_found", "peer_id": peer_id}
+
+    # Cannot ban yourself
+    if peer_id == our_pubkey:
+        return {"error": "cannot_ban_self"}
+
+    # Check for existing pending proposal
+    existing = database.get_ban_proposal_for_target(peer_id)
+    if existing and existing.get("status") == "pending":
+        return {
+            "error": "proposal_exists",
+            "proposal_id": existing["proposal_id"],
+            "message": "A ban proposal already exists for this peer"
+        }
+
+    # Generate proposal ID
+    proposal_id = secrets.token_hex(16)
+    timestamp = int(time.time())
+
+    # Sign the proposal
+    canonical = f"hive:ban_proposal:{proposal_id}:{peer_id}:{timestamp}:{reason}"
+    try:
+        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+    except Exception as e:
+        return {"error": f"Failed to sign proposal: {e}"}
+
+    # Store locally
+    expires_at = timestamp + BAN_PROPOSAL_TTL_SECONDS
+    database.create_ban_proposal(proposal_id, peer_id, our_pubkey,
+                                 reason, timestamp, expires_at)
+
+    # Add our vote (proposer auto-votes approve)
+    vote_canonical = f"hive:ban_vote:{proposal_id}:approve:{timestamp}"
+    vote_sig = safe_plugin.rpc.signmessage(vote_canonical)["zbase"]
+    database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
+
+    # Broadcast proposal
+    proposal_payload = {
+        "proposal_id": proposal_id,
+        "target_peer_id": peer_id,
+        "proposer_peer_id": our_pubkey,
+        "reason": reason,
+        "timestamp": timestamp,
+        "signature": sig
+    }
+    proposal_msg = serialize(HiveMessageType.BAN_PROPOSAL, proposal_payload)
+    _broadcast_to_members(proposal_msg)
+
+    # Also broadcast our vote
+    vote_payload = {
+        "proposal_id": proposal_id,
+        "voter_peer_id": our_pubkey,
+        "vote": "approve",
+        "timestamp": timestamp,
+        "signature": vote_sig
+    }
+    vote_msg = serialize(HiveMessageType.BAN_VOTE, vote_payload)
+    _broadcast_to_members(vote_msg)
+
+    # Calculate quorum info
+    all_members = database.get_all_members()
+    eligible = [m for m in all_members
+                if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+                and m["peer_id"] != peer_id]
+    quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
+
+    plugin.log(f"cl-hive: Ban proposal created for {peer_id[:16]}...: {reason}")
+
+    return {
+        "status": "proposed",
+        "proposal_id": proposal_id,
+        "target_peer_id": peer_id,
+        "reason": reason,
+        "expires_at": expires_at,
+        "votes_needed": quorum_needed,
+        "votes_received": 1,
+        "message": f"Ban proposal created. Need {quorum_needed} votes to execute."
+    }
+
+
+@plugin.method("hive-vote-ban")
+def hive_vote_ban(plugin: Plugin, proposal_id: str, vote: str):
+    """
+    Vote on a pending ban proposal.
+
+    Args:
+        proposal_id: ID of the ban proposal
+        vote: "approve" or "reject"
+
+    Returns:
+        Dict with vote status.
+
+    Permission: Member or Admin
+    """
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database or not our_pubkey or not safe_plugin:
+        return {"error": "Hive not initialized"}
+
+    # Validate vote
+    if vote not in ("approve", "reject"):
+        return {"error": "invalid_vote", "valid_options": ["approve", "reject"]}
+
+    # Get proposal
+    proposal = database.get_ban_proposal(proposal_id)
+    if not proposal:
+        return {"error": "proposal_not_found", "proposal_id": proposal_id}
+
+    if proposal.get("status") != "pending":
+        return {
+            "error": "proposal_not_pending",
+            "status": proposal.get("status"),
+            "message": f"Proposal is {proposal.get('status')}, cannot vote"
+        }
+
+    # Check if expired
+    now = int(time.time())
+    if now > proposal.get("expires_at", 0):
+        database.update_ban_proposal_status(proposal_id, "expired")
+        return {"error": "proposal_expired"}
+
+    # Cannot vote on proposal targeting self
+    if proposal["target_peer_id"] == our_pubkey:
+        return {"error": "cannot_vote_on_own_ban"}
+
+    # Check if already voted
+    existing_vote = database.get_ban_vote(proposal_id, our_pubkey)
+    if existing_vote:
+        if existing_vote["vote"] == vote:
+            return {"error": "already_voted", "vote": vote}
+        # Allow changing vote
+
+    # Sign vote
+    timestamp = int(time.time())
+    canonical = f"hive:ban_vote:{proposal_id}:{vote}:{timestamp}"
+    try:
+        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+    except Exception as e:
+        return {"error": f"Failed to sign vote: {e}"}
+
+    # Store vote
+    database.add_ban_vote(proposal_id, our_pubkey, vote, timestamp, sig)
+
+    # Broadcast vote
+    vote_payload = {
+        "proposal_id": proposal_id,
+        "voter_peer_id": our_pubkey,
+        "vote": vote,
+        "timestamp": timestamp,
+        "signature": sig
+    }
+    vote_msg = serialize(HiveMessageType.BAN_VOTE, vote_payload)
+    _broadcast_to_members(vote_msg)
+
+    # Check if quorum reached
+    was_executed = _check_ban_quorum(proposal_id, proposal, plugin)
+
+    # Get current vote counts
+    all_votes = database.get_ban_votes(proposal_id)
+    all_members = database.get_all_members()
+    eligible = [m for m in all_members
+                if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+                and m["peer_id"] != proposal["target_peer_id"]]
+    eligible_ids = set(m["peer_id"] for m in eligible)
+
+    approve_count = sum(1 for v in all_votes if v["vote"] == "approve" and v["voter_peer_id"] in eligible_ids)
+    reject_count = sum(1 for v in all_votes if v["vote"] == "reject" and v["voter_peer_id"] in eligible_ids)
+    quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
+
+    result = {
+        "status": "voted",
+        "proposal_id": proposal_id,
+        "vote": vote,
+        "approve_count": approve_count,
+        "reject_count": reject_count,
+        "quorum_needed": quorum_needed,
+    }
+
+    if was_executed:
+        result["status"] = "ban_executed"
+        result["message"] = f"Ban executed! Target {proposal['target_peer_id'][:16]}... removed from hive."
+    else:
+        result["message"] = f"Vote recorded. {approve_count}/{quorum_needed} approvals."
+
+    return result
+
+
+@plugin.method("hive-pending-bans")
+def hive_pending_bans(plugin: Plugin):
+    """
+    View pending ban proposals.
+
+    Returns:
+        Dict with pending ban proposals and their vote counts.
+
+    Permission: Any member
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Clean up expired proposals
+    now = int(time.time())
+    database.cleanup_expired_ban_proposals(now)
+
+    # Get pending proposals
+    proposals = database.get_pending_ban_proposals()
+
+    # Get eligible voters info
+    all_members = database.get_all_members()
+
+    result = []
+    for p in proposals:
+        target_id = p["target_peer_id"]
+        eligible = [m for m in all_members
+                    if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+                    and m["peer_id"] != target_id]
+        eligible_ids = set(m["peer_id"] for m in eligible)
+        quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
+
+        votes = database.get_ban_votes(p["proposal_id"])
+        approve_count = sum(1 for v in votes if v["vote"] == "approve" and v["voter_peer_id"] in eligible_ids)
+        reject_count = sum(1 for v in votes if v["vote"] == "reject" and v["voter_peer_id"] in eligible_ids)
+
+        # Check if we've voted
+        my_vote = None
+        if our_pubkey:
+            for v in votes:
+                if v["voter_peer_id"] == our_pubkey:
+                    my_vote = v["vote"]
+                    break
+
+        result.append({
+            "proposal_id": p["proposal_id"],
+            "target_peer_id": target_id,
+            "target_tier": database.get_member(target_id).get("tier") if database.get_member(target_id) else "unknown",
+            "proposer": p["proposer_peer_id"][:16] + "...",
+            "reason": p["reason"],
+            "proposed_at": p["proposed_at"],
+            "expires_at": p["expires_at"],
+            "approve_count": approve_count,
+            "reject_count": reject_count,
+            "quorum_needed": quorum_needed,
+            "my_vote": my_vote
+        })
+
+    return {
+        "count": len(result),
+        "proposals": result
     }
 
 
@@ -2417,15 +3346,19 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
 
 
 @plugin.method("hive-invite")
-def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0):
+def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0,
+                tier: str = 'neophyte'):
     """
     Generate an invitation ticket for a new member.
 
-    Only Admins can generate invite tickets.
+    Only Admins can generate invite tickets. Bootstrap invites (tier='admin')
+    can only be generated once (to create the second admin). After 2 admins
+    exist, all new members join as neophytes and need vouches for promotion.
 
     Args:
         valid_hours: Hours until ticket expires (default: 24)
         requirements: Bitmask of required features (default: 0 = none)
+        tier: Starting tier - 'neophyte' (default) or 'admin' (bootstrap only)
 
     Returns:
         Dict with base64-encoded ticket
@@ -2439,16 +3372,24 @@ def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0):
 
     if not handshake_mgr:
         return {"error": "Hive not initialized"}
-    
+
+    # Validate tier
+    if tier not in ('neophyte', 'admin'):
+        return {"error": f"Invalid tier: {tier}. Use 'neophyte' or 'admin' (bootstrap)"}
+
     try:
-        ticket = handshake_mgr.generate_invite_ticket(valid_hours, requirements)
+        ticket = handshake_mgr.generate_invite_ticket(valid_hours, requirements, tier)
+        bootstrap_note = " (BOOTSTRAP - grants admin tier)" if tier == 'admin' else ""
         return {
             "status": "ticket_generated",
             "ticket": ticket,
             "valid_hours": valid_hours,
-            "instructions": "Share this ticket with the candidate. They should use 'hive-join <ticket>' to request membership."
+            "initial_tier": tier,
+            "instructions": f"Share this ticket with the candidate.{bootstrap_note} They should use 'hive-join <ticket>' to request membership."
         }
     except PermissionError as e:
+        return {"error": str(e)}
+    except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
         return {"error": f"Failed to generate ticket: {e}"}
