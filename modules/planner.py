@@ -3,12 +3,17 @@ Planner Module for cl-hive (Phase 6: Topology Optimization)
 
 Implements the "Gardner" algorithm for automated topology management:
 - Saturation Analysis: Calculate Hive market share per target
-- Guard Mechanism: Issue clboss-ignore for saturated targets
+- Guard Mechanism: Issue clboss-unmanage for saturated targets (ksedgwic/clboss)
 - Expansion Proposals: (Future tickets - not implemented here)
+
+CLBoss Integration (ksedgwic/clboss fork):
+- Uses clboss-unmanage with 'open' tag to prevent channel opens to saturated targets
+- Uses clboss-manage to re-enable opens when saturation drops
+- Fee/balance tags are managed by cl-revenue-ops (not this module)
 
 Security Constraints (Red Team - PHASE6_THREAT_MODEL):
 - Gossip capacity is CLAMPED to public listchannels data
-- Max 5 new ignores per cycle (abort if exceeded)
+- Max 5 new unmanages per cycle (abort if exceeded)
 - All decisions logged to hive_planner_log table
 
 This ticket (6-01) implements ONLY saturation detection and guard mechanism.
@@ -510,8 +515,8 @@ class Planner:
                 })
                 continue
 
-            # Issue ignore
-            success = self.clboss.ignore_peer(result.target)
+            # Issue clboss-unmanage for 'open' tag (prevent channel opens)
+            success = self.clboss.unmanage_open(result.target)
             if success:
                 self._ignored_peers.add(result.target)
                 ignores_issued += 1
@@ -594,7 +599,7 @@ class Planner:
             if not self.clboss or not self.clboss._available:
                 continue
 
-            success = self.clboss.unignore_peer(peer)
+            success = self.clboss.manage_open(peer)
             if success:
                 self._ignored_peers.discard(peer)
 

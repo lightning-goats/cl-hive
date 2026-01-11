@@ -1,46 +1,56 @@
 """
 CLBoss Bridge Module for cl-hive.
 
-Provides a small gateway wrapper for CLBoss integration:
-- Detect availability from plugin list.
-- Attempt to ignore/unignore peers (but command may not exist).
+Provides a gateway wrapper for CLBoss integration using the ksedgwic/clboss fork:
+- Detect availability from plugin list
+- Unmanage peers to prevent channel opens to saturated targets
+- Coordinate with cl-revenue-ops for fee/rebalance management
 
-IMPORTANT: CLBoss v0.15.1 does NOT have clboss-ignore or clboss-unignore.
-These would be for peer-level channel open coordination but don't exist.
-CLBoss only has:
-- clboss-ignore-onchain: Ignore addresses for on-chain sweeps (different purpose)
-- clboss-unmanage: Stop managing fees for a peer (used by cl-revenue-ops)
-- clboss-manage: Resume managing fees for a peer
+CLBoss Management Tags (ksedgwic/clboss fork):
+- open: Channel opening
+- close: Channel closing
+- lnfee: Fee management (delegated to cl-revenue-ops)
+- balance: Rebalancing (delegated to cl-revenue-ops)
 
-The Hive uses the Intent Lock Protocol for channel open coordination instead.
-This protocol uses gossip messages to announce intent and deterministic tie-breakers
-(lowest pubkey wins) to prevent thundering herd problems.
+The Hive uses clboss-unmanage with 'open' tag to prevent CLBoss from
+opening channels to saturated targets, complementing the Intent Lock Protocol.
 
-Explicitly avoids clboss-manage/unmanage; fee control belongs to cl-revenue-ops.
+Fee and rebalance management is delegated to cl-revenue-ops, which handles
+the 'lnfee' and 'balance' tags via its own ClbossManager.
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from pyln.client import RpcError
+
+
+# CLBoss management tags (ksedgwic/clboss fork)
+class ClbossTags:
+    """CLBoss management tags for clboss-unmanage/clboss-manage commands."""
+    OPEN = "open"      # Channel opening
+    CLOSE = "close"    # Channel closing
+    FEE = "lnfee"      # Fee management (handled by cl-revenue-ops)
+    BALANCE = "balance"  # Rebalancing (handled by cl-revenue-ops)
 
 
 class CLBossBridge:
     """Gateway wrapper around CLBoss RPC calls.
 
-    NOTE: CLBoss v0.15.1 does NOT have clboss-ignore or clboss-unignore commands.
-    These are for peer-level channel open coordination. CLBoss only has:
-    - clboss-ignore-onchain: Ignore addresses for on-chain sweeps (different purpose)
-    - clboss-unmanage: Stop managing fees for a peer (used by cl-revenue-ops)
+    Uses the ksedgwic/clboss fork which provides:
+    - clboss-unmanage <nodeid> <tags>: Stop managing peer for specified tags
+    - clboss-manage <nodeid> <tags>: Resume managing peer for specified tags
+    - clboss-status: Get CLBoss status
+    - clboss-unmanaged-list: List unmanaged peers
 
-    The Hive uses the Intent Lock Protocol instead for channel coordination.
+    The Hive primarily uses the 'open' tag to prevent CLBoss from opening
+    channels to saturated targets. Fee/balance tags are managed by cl-revenue-ops.
     """
 
     def __init__(self, rpc, plugin=None):
         self.rpc = rpc
         self.plugin = plugin
         self._available = False
-        self._supports_ignore = True  # Assume true until we get "Unknown command"
-        self._supports_unignore = True
+        self._supports_unmanage = True  # Assume true until proven otherwise
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -53,6 +63,8 @@ class CLBossBridge:
             for entry in plugins.get("plugins", []):
                 if "clboss" in entry.get("name", "").lower():
                     self._available = entry.get("active", False)
+                    if self._available:
+                        self._log("CLBoss detected and available")
                     return self._available
             self._available = False
             return False
@@ -61,64 +73,143 @@ class CLBossBridge:
             self._log(f"CLBoss detection failed: {exc}", level="warn")
             return False
 
-    def ignore_peer(self, peer_id: str) -> bool:
-        """Tell CLBoss to ignore a peer for channel management.
+    def unmanage_open(self, peer_id: str) -> bool:
+        """Tell CLBoss to stop opening channels to this peer.
 
-        NOTE: This command does not exist in CLBoss v0.15.1.
-        The Hive uses Intent Lock Protocol for coordination instead.
+        This is used to prevent CLBoss from opening channels to saturated
+        targets where the Hive already has sufficient capacity.
+
+        Args:
+            peer_id: The node ID to unmanage
+
+        Returns:
+            True if successful, False otherwise
+        """
+        return self._unmanage(peer_id, ClbossTags.OPEN)
+
+    def manage_open(self, peer_id: str) -> bool:
+        """Tell CLBoss to resume opening channels to this peer.
+
+        Called when a target is no longer saturated.
+        Uses clboss-unmanage with empty string to restore full management,
+        as clboss-manage may not exist in all versions.
+
+        Args:
+            peer_id: The node ID to re-manage
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Per CLBoss docs, empty string restores full management
+        # This is more compatible than clboss-manage which may not exist
+        return self._unmanage(peer_id, "")
+
+    def _unmanage(self, peer_id: str, tags: str) -> bool:
+        """Tell CLBoss to stop managing a peer for specified tags.
+
+        Args:
+            peer_id: The node ID
+            tags: Comma-separated tags (open, close, lnfee, balance)
+
+        Returns:
+            True if successful or already unmanaged
         """
         if not self._available:
-            self._log(f"CLBoss not available, cannot ignore {peer_id[:16]}...")
+            self._log(f"CLBoss not available, cannot unmanage {peer_id[:16]}...")
             return False
-        if not self._supports_ignore:
-            # Already know this command doesn't exist
+
+        if not self._supports_unmanage:
             return False
+
         try:
-            self.rpc.call("clboss-ignore", {"nodeid": peer_id})
-            self._log(f"CLBoss ignoring {peer_id[:16]}...")
+            # Use positional args: nodeid, tags
+            self.rpc.call("clboss-unmanage", [peer_id, tags])
+            self._log(f"CLBoss unmanage {peer_id[:16]}... for '{tags}'")
             return True
         except RpcError as exc:
             msg = str(exc).lower()
             if "unknown command" in msg or "method not found" in msg:
-                self._supports_ignore = False
-                self._log("CLBoss does not support clboss-ignore (using Intent Lock Protocol)", level="info")
+                self._supports_unmanage = False
+                self._log("CLBoss does not support clboss-unmanage", level="warn")
+            elif "not managed" in msg or "already unmanaged" in msg:
+                # Already unmanaged - that's fine
+                return True
             else:
-                self._log(f"CLBoss ignore failed: {exc}", level="warn")
+                self._log(f"CLBoss unmanage failed: {exc}", level="warn")
             return False
 
-    def unignore_peer(self, peer_id: str) -> bool:
-        """Tell CLBoss to stop ignoring a peer, if supported.
+    def _manage(self, peer_id: str, tags: str) -> bool:
+        """Tell CLBoss to resume managing a peer for specified tags.
 
-        NOTE: This command does not exist in CLBoss v0.15.1.
+        Args:
+            peer_id: The node ID
+            tags: Comma-separated tags (open, close, lnfee, balance)
+
+        Returns:
+            True if successful or already managed
         """
-        if not self._available or not self._supports_unignore:
+        if not self._available or not self._supports_unmanage:
             return False
+
         try:
-            self.rpc.call("clboss-unignore", {"nodeid": peer_id})
-            self._log(f"CLBoss unignoring {peer_id[:16]}...")
+            # Use positional args: nodeid, tags
+            self.rpc.call("clboss-manage", [peer_id, tags])
+            self._log(f"CLBoss manage {peer_id[:16]}... for '{tags}'")
             return True
         except RpcError as exc:
             msg = str(exc).lower()
-            if "unknown command" in msg or "method not found" in msg:
-                self._supports_unignore = False
-                self._log("CLBoss does not support clboss-unignore", level="info")
-            else:
-                self._log(f"CLBoss unignore failed: {exc}", level="warn")
+            if "already managed" in msg:
+                return True
+            self._log(f"CLBoss manage failed: {exc}", level="warn")
             return False
 
-    def supports_peer_ignore(self) -> bool:
-        """Check if CLBoss supports peer-level ignore commands.
+    def get_unmanaged_list(self) -> List[Dict[str, Any]]:
+        """Get list of peers currently unmanaged by CLBoss.
 
-        Returns False for CLBoss v0.15.1 which lacks clboss-ignore.
-        The Hive falls back to Intent Lock Protocol for coordination.
+        Returns:
+            List of unmanaged peer entries, or empty list if unavailable
         """
-        return self._available and self._supports_ignore
+        if not self._available:
+            return []
+
+        try:
+            result = self.rpc.call("clboss-unmanaged-list")
+            return result.get("unmanaged", [])
+        except RpcError:
+            return []
+
+    def supports_unmanage(self) -> bool:
+        """Check if CLBoss supports the unmanage commands.
+
+        Returns:
+            True if clboss-unmanage is available
+        """
+        return self._available and self._supports_unmanage
 
     def get_status(self) -> Dict[str, Any]:
         """Get CLBoss bridge status for diagnostics."""
-        return {
+        status = {
             "clboss_available": self._available,
-            "supports_ignore": self._supports_ignore,
-            "supports_unignore": self._supports_unignore,
-            "coordination_method": "clboss-ignore" if self._supports_ignore else "intent_lock_protocol"
+            "supports_unmanage": self._supports_unmanage,
+            "coordination_method": "clboss-unmanage" if self._supports_unmanage else "intent_lock_only"
         }
+
+        if self._available:
+            try:
+                clboss_status = self.rpc.call("clboss-status")
+                status["clboss_version"] = clboss_status.get("info", {}).get("version", "unknown")
+            except RpcError:
+                status["clboss_version"] = "unknown"
+
+        return status
+
+
+# Legacy compatibility aliases
+def ignore_peer(bridge: CLBossBridge, peer_id: str) -> bool:
+    """Legacy alias for unmanage_open. Deprecated."""
+    return bridge.unmanage_open(peer_id)
+
+
+def unignore_peer(bridge: CLBossBridge, peer_id: str) -> bool:
+    """Legacy alias for manage_open. Deprecated."""
+    return bridge.manage_open(peer_id)
