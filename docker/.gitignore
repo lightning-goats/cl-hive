@@ -1,0 +1,13 @@
+# Environment files (contain secrets)
+.env
+!.env.example
+
+# WireGuard configs (contain private keys)
+wireguard/
+
+# Custom configs
+config/
+
+# Build artifacts
+*.tar
+*.gz

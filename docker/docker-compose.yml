@@ -1,0 +1,106 @@
+# cl-hive Production Node - Docker Compose
+#
+# Usage:
+#   1. Copy .env.example to .env and configure
+#   2. docker-compose up -d
+#   3. docker-compose logs -f
+#
+# Access lightning-cli:
+#   docker-compose exec cln lightning-cli getinfo
+
+version: '3.8'
+
+services:
+  cln:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: cl-hive-node:0.1.0-dev
+    container_name: cl-hive-node
+    restart: unless-stopped
+
+    # Required for WireGuard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv6.conf.all.disable_ipv6=0
+
+    environment:
+      # Bitcoin RPC (required)
+      - BITCOIN_RPCHOST=${BITCOIN_RPCHOST:-host.docker.internal}
+      - BITCOIN_RPCPORT=${BITCOIN_RPCPORT:-8332}
+      - BITCOIN_RPCUSER=${BITCOIN_RPCUSER}
+      - BITCOIN_RPCPASSWORD=${BITCOIN_RPCPASSWORD}
+
+      # Network
+      - NETWORK=${NETWORK:-bitcoin}
+
+      # Node Identity
+      - ALIAS=${ALIAS:-cl-hive-node}
+      - RGB=${RGB:-FF9900}
+      - ANNOUNCE_ADDR=${ANNOUNCE_ADDR:-}
+
+      # Tor
+      - TOR_ENABLED=${TOR_ENABLED:-true}
+
+      # WireGuard
+      - WIREGUARD_ENABLED=${WIREGUARD_ENABLED:-false}
+      - WIREGUARD_CONFIG=/etc/wireguard/wg0.conf
+
+      # CLBOSS
+      - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}
+
+      # cl-hive
+      - HIVE_GOVERNANCE_MODE=${HIVE_GOVERNANCE_MODE:-advisor}
+
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+
+      # Lightning directory (used by supervisord)
+      - LIGHTNING_DIR=/data/lightning/${NETWORK:-bitcoin}
+
+    volumes:
+      # Persistent data
+      - lightning-data:/data/lightning
+
+      # WireGuard config (optional)
+      - ${WIREGUARD_CONFIG_PATH:-./wireguard}:/etc/wireguard:ro
+
+      # Custom configs (optional)
+      - ${CUSTOM_CONFIG_PATH:-./config}:/etc/lightning/custom:ro
+
+    ports:
+      # Lightning P2P (only if not using Tor exclusively)
+      - "${LIGHTNING_PORT:-9735}:9735"
+
+      # REST API (optional, uncomment if needed)
+      # - "8080:8080"
+
+      # WireGuard (only if enabled)
+      - "${WIREGUARD_PORT:-51820}:51820/udp"
+
+    networks:
+      - lightning-network
+
+    healthcheck:
+      test: ["CMD", "lightning-cli", "--lightning-dir=/data/lightning/${NETWORK:-bitcoin}", "getinfo"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+volumes:
+  lightning-data:
+    driver: local
+
+networks:
+  lightning-network:
+    driver: bridge
