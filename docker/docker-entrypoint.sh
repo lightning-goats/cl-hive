@@ -163,19 +163,65 @@ fi
 if [ "$WIREGUARD_ENABLED" = "true" ]; then
     echo "Configuring WireGuard..."
 
-    WIREGUARD_CONFIG="${WIREGUARD_CONFIG:-/etc/wireguard/wg0.conf}"
+    WG_CONFIG_FILE="/etc/wireguard/wg0.conf"
+    WG_CONFIG_GENERATED=false
 
-    if [ -f "$WIREGUARD_CONFIG" ]; then
+    # Option 1: Generate config from environment variables
+    if [ -n "$WG_PRIVATE_KEY" ] && [ -n "$WG_PEER_PUBLIC_KEY" ]; then
+        echo "Generating WireGuard config from environment variables..."
+
+        mkdir -p /etc/wireguard
+        cat > "$WG_CONFIG_FILE" << EOF
+[Interface]
+PrivateKey = $WG_PRIVATE_KEY
+Address = ${WG_ADDRESS:-10.0.0.2/24}
+EOF
+
+        # Add DNS if specified
+        if [ -n "$WG_DNS" ]; then
+            echo "DNS = $WG_DNS" >> "$WG_CONFIG_FILE"
+        fi
+
+        # Add peer configuration
+        cat >> "$WG_CONFIG_FILE" << EOF
+
+[Peer]
+PublicKey = $WG_PEER_PUBLIC_KEY
+Endpoint = ${WG_PEER_ENDPOINT:-vpn.example.com:51820}
+AllowedIPs = ${WG_PEER_ALLOWED_IPS:-0.0.0.0/0}
+EOF
+
+        # Add keepalive if specified and non-zero
+        if [ -n "$WG_PEER_KEEPALIVE" ] && [ "$WG_PEER_KEEPALIVE" != "0" ]; then
+            echo "PersistentKeepalive = $WG_PEER_KEEPALIVE" >> "$WG_CONFIG_FILE"
+        fi
+
+        chmod 600 "$WG_CONFIG_FILE"
+        WG_CONFIG_GENERATED=true
+        echo "WireGuard config generated"
+
+    # Option 2: Use mounted config file
+    elif [ -f "$WG_CONFIG_FILE" ]; then
+        echo "Using mounted WireGuard config"
+        WG_CONFIG_GENERATED=true
+    else
+        echo "WARNING: WireGuard enabled but no config provided"
+        echo "Set WG_PRIVATE_KEY and WG_PEER_PUBLIC_KEY, or mount config to /etc/wireguard/wg0.conf"
+    fi
+
+    # Bring up WireGuard if config exists
+    if [ "$WG_CONFIG_GENERATED" = "true" ]; then
         # Load WireGuard kernel module
         modprobe wireguard 2>/dev/null || echo "WireGuard module may already be loaded"
 
         # Bring up interface
         wg-quick up wg0 || echo "WireGuard interface may already be up"
 
-        echo "WireGuard configured"
-    else
-        echo "WARNING: WireGuard config not found at $WIREGUARD_CONFIG"
-        echo "WireGuard disabled"
+        # Show connection status
+        echo "WireGuard interface status:"
+        wg show wg0 2>/dev/null || echo "Could not show WireGuard status"
+
+        echo "WireGuard configured successfully"
     fi
 else
     echo "WireGuard disabled"
