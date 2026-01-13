@@ -52,6 +52,7 @@ from modules.protocol import (
     validate_peer_available, create_peer_available,
     validate_expansion_nominate, validate_expansion_elect,
     create_expansion_nominate, create_expansion_elect,
+    get_expansion_nominate_signing_payload, get_expansion_elect_signing_payload,
     VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
     create_challenge, create_welcome
 )
@@ -202,6 +203,113 @@ decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
 our_pubkey: Optional[str] = None
+
+
+# =============================================================================
+# RATE LIMITER (Security Enhancement)
+# =============================================================================
+
+class RateLimiter:
+    """
+    Token bucket rate limiter for gossip message flooding prevention.
+
+    Tracks message rates per sender and rejects messages that exceed
+    the configured rate. Uses a sliding window approach.
+    """
+
+    def __init__(self, max_per_minute: int = 10, window_seconds: int = 60):
+        """
+        Initialize the rate limiter.
+
+        Args:
+            max_per_minute: Maximum messages allowed per window
+            window_seconds: Size of the sliding window in seconds
+        """
+        self._max_messages = max_per_minute
+        self._window = window_seconds
+        self._timestamps: Dict[str, list] = {}  # peer_id -> list of timestamps
+        self._lock = threading.Lock()
+
+    def is_allowed(self, peer_id: str) -> bool:
+        """
+        Check if a message from this peer is allowed.
+
+        Args:
+            peer_id: The sender's pubkey
+
+        Returns:
+            True if allowed, False if rate limited
+        """
+        now = time.time()
+        cutoff = now - self._window
+
+        with self._lock:
+            # Get or create timestamp list for this peer
+            if peer_id not in self._timestamps:
+                self._timestamps[peer_id] = []
+
+            # Remove old timestamps outside the window
+            self._timestamps[peer_id] = [
+                ts for ts in self._timestamps[peer_id] if ts > cutoff
+            ]
+
+            # Check if under limit
+            if len(self._timestamps[peer_id]) >= self._max_messages:
+                return False
+
+            # Record this message
+            self._timestamps[peer_id].append(now)
+            return True
+
+    def get_stats(self, peer_id: str = None) -> Dict[str, Any]:
+        """Get rate limiter statistics."""
+        now = time.time()
+        cutoff = now - self._window
+
+        with self._lock:
+            if peer_id:
+                timestamps = self._timestamps.get(peer_id, [])
+                recent = [ts for ts in timestamps if ts > cutoff]
+                return {
+                    "peer_id": peer_id,
+                    "messages_in_window": len(recent),
+                    "max_per_window": self._max_messages,
+                    "window_seconds": self._window,
+                }
+
+            # Overall stats
+            total_peers = len(self._timestamps)
+            total_messages = sum(
+                len([ts for ts in timestamps if ts > cutoff])
+                for timestamps in self._timestamps.values()
+            )
+            return {
+                "tracked_peers": total_peers,
+                "total_messages_in_window": total_messages,
+                "max_per_peer": self._max_messages,
+                "window_seconds": self._window,
+            }
+
+    def cleanup(self) -> int:
+        """Remove stale entries. Returns number of peers cleaned."""
+        now = time.time()
+        cutoff = now - self._window
+        cleaned = 0
+
+        with self._lock:
+            stale_peers = [
+                peer_id for peer_id, timestamps in self._timestamps.items()
+                if not any(ts > cutoff for ts in timestamps)
+            ]
+            for peer_id in stale_peers:
+                del self._timestamps[peer_id]
+                cleaned += 1
+
+        return cleaned
+
+
+# Global rate limiter for PEER_AVAILABLE messages
+peer_available_limiter: Optional[RateLimiter] = None
 
 
 def _parse_bool(value: Any, default: bool = False) -> bool:
@@ -807,6 +915,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         config_getter=lambda: config  # Provides access to budget settings
     )
     plugin.log("cl-hive: Cooperative expansion manager initialized")
+
+    # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
+    global peer_available_limiter
+    peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
+    plugin.log("cl-hive: Rate limiter initialized (10 msg/min per peer)")
 
     # Sync fee policies for existing members (Phase 4 integration)
     if bridge and bridge.status == BridgeStatus.ENABLED:
@@ -2253,6 +2366,14 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: PEER_AVAILABLE from non-member {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
+    # Apply rate limiting to prevent gossip flooding (Security Enhancement)
+    if peer_available_limiter and not peer_available_limiter.is_allowed(peer_id):
+        plugin.log(
+            f"cl-hive: PEER_AVAILABLE from {peer_id[:16]}... rate limited (>10/min)",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     # Extract all fields from payload
     target_peer_id = payload["target_peer_id"]
     reporter_peer_id = payload["reporter_peer_id"]
@@ -2586,11 +2707,35 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
             pass
 
     import time
+    timestamp = int(time.time())
+
+    # Build payload for signing (SECURITY: sign before sending)
+    signing_payload = {
+        "round_id": round_id,
+        "target_peer_id": target_peer_id,
+        "nominator_id": our_id,
+        "timestamp": timestamp,
+        "available_liquidity_sats": available_liquidity,
+        "quality_score": quality_score,
+        "has_existing_channel": has_existing,
+        "channel_count": channel_count,
+    }
+    signing_message = get_expansion_nominate_signing_payload(signing_payload)
+
+    # Sign the message with our node key
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_message)
+        signature = sig_result['zbase']
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to sign nomination: {e}", level='error')
+        return 0
+
     msg = create_expansion_nominate(
         round_id=round_id,
         target_peer_id=target_peer_id,
         nominator_id=our_id,
-        timestamp=int(time.time()),
+        timestamp=timestamp,
+        signature=signature,
         available_liquidity_sats=available_liquidity,
         quality_score=quality_score,
         has_existing_channel=has_existing,
@@ -2600,7 +2745,7 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
 
     sent = _broadcast_to_members(msg)
     safe_plugin.log(
-        f"cl-hive: [BROADCAST] Sent nomination for round {round_id[:8]}... "
+        f"cl-hive: [BROADCAST] Sent signed nomination for round {round_id[:8]}... "
         f"target={target_peer_id[:16]}... to {sent} members",
         level='info'
     )
@@ -2613,6 +2758,9 @@ def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: s
                                 nomination_count: int = 0) -> int:
     """
     Broadcast an EXPANSION_ELECT message to all hive members.
+
+    SECURITY: The message is signed by the coordinator (us) to prevent
+    election spoofing by malicious hive members.
 
     Args:
         round_id: The cooperative expansion round ID
@@ -2628,12 +2776,42 @@ def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: s
     if not safe_plugin or not database:
         return 0
 
+    try:
+        coordinator_id = safe_plugin.rpc.getinfo().get("id")
+    except Exception:
+        return 0
+
     import time
+    timestamp = int(time.time())
+
+    # Build payload for signing (SECURITY: sign before sending)
+    signing_payload = {
+        "round_id": round_id,
+        "target_peer_id": target_peer_id,
+        "elected_id": elected_id,
+        "coordinator_id": coordinator_id,
+        "timestamp": timestamp,
+        "channel_size_sats": channel_size_sats,
+        "quality_score": quality_score,
+        "nomination_count": nomination_count,
+    }
+    signing_message = get_expansion_elect_signing_payload(signing_payload)
+
+    # Sign the message with our node key
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_message)
+        signature = sig_result['zbase']
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to sign election: {e}", level='error')
+        return 0
+
     msg = create_expansion_elect(
         round_id=round_id,
         target_peer_id=target_peer_id,
         elected_id=elected_id,
-        timestamp=int(time.time()),
+        coordinator_id=coordinator_id,
+        timestamp=timestamp,
+        signature=signature,
         channel_size_sats=channel_size_sats,
         quality_score=quality_score,
         nomination_count=nomination_count,
@@ -2643,7 +2821,7 @@ def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: s
     sent = _broadcast_to_members(msg)
     if sent > 0:
         safe_plugin.log(
-            f"cl-hive: Broadcast expansion election for round {round_id[:8]}... "
+            f"cl-hive: Broadcast signed expansion election for round {round_id[:8]}... "
             f"elected={elected_id[:16]}... to {sent} members",
             level='info'
         )
@@ -2657,6 +2835,8 @@ def handle_expansion_nominate(peer_id: str, payload: Dict, plugin: Plugin) -> Di
 
     This message indicates a member is interested in opening a channel
     to a target peer during a cooperative expansion round.
+
+    SECURITY: Verifies cryptographic signature from the nominator.
     """
     plugin.log(
         f"cl-hive: [NOMINATE] Received from {peer_id[:16]}... "
@@ -2677,6 +2857,32 @@ def handle_expansion_nominate(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     sender = database.get_member(peer_id)
     if not sender or database.is_banned(peer_id):
         plugin.log(f"cl-hive: [NOMINATE] Rejected - {peer_id[:16]}... not a member or banned", level='info')
+        return {"result": "continue"}
+
+    # SECURITY: Verify the cryptographic signature
+    nominator_id = payload.get("nominator_id", "")
+    signature = payload.get("signature", "")
+    signing_message = get_expansion_nominate_signing_payload(payload)
+
+    try:
+        verify_result = plugin.rpc.checkmessage(signing_message, signature)
+        if not verify_result.get("verified", False):
+            plugin.log(
+                f"cl-hive: [NOMINATE] Signature verification failed for {nominator_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+        # Verify the signature is from the claimed nominator
+        recovered_pubkey = verify_result.get("pubkey", "")
+        if recovered_pubkey != nominator_id:
+            plugin.log(
+                f"cl-hive: [NOMINATE] Signature mismatch: claimed={nominator_id[:16]}... "
+                f"actual={recovered_pubkey[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: [NOMINATE] Signature verification error: {e}", level='warn')
         return {"result": "continue"}
 
     # Process the nomination
@@ -2708,6 +2914,8 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Handle EXPANSION_ELECT message announcing the winner of an expansion round.
 
     If we are the elected member, we should proceed to open the channel.
+
+    SECURITY: Verifies cryptographic signature from the coordinator.
     """
     if not coop_expansion or not database:
         return {"result": "continue"}
@@ -2721,6 +2929,45 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not sender or database.is_banned(peer_id):
         plugin.log(f"cl-hive: EXPANSION_ELECT from non-member {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
+
+    # SECURITY: Verify the cryptographic signature from coordinator
+    coordinator_id = payload.get("coordinator_id", "")
+    signature = payload.get("signature", "")
+    signing_message = get_expansion_elect_signing_payload(payload)
+
+    try:
+        verify_result = plugin.rpc.checkmessage(signing_message, signature)
+        if not verify_result.get("verified", False):
+            plugin.log(
+                f"cl-hive: [ELECT] Signature verification failed for coordinator {coordinator_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+        # Verify the signature is from the claimed coordinator
+        recovered_pubkey = verify_result.get("pubkey", "")
+        if recovered_pubkey != coordinator_id:
+            plugin.log(
+                f"cl-hive: [ELECT] Signature mismatch: claimed={coordinator_id[:16]}... "
+                f"actual={recovered_pubkey[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+        # Verify the coordinator is a hive member
+        coordinator_member = database.get_member(coordinator_id)
+        if not coordinator_member or database.is_banned(coordinator_id):
+            plugin.log(
+                f"cl-hive: [ELECT] Coordinator {coordinator_id[:16]}... not a member or banned",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: [ELECT] Signature verification error: {e}", level='warn')
+        return {"result": "continue"}
+
+    plugin.log(
+        f"cl-hive: [ELECT] Verified election from coordinator {coordinator_id[:16]}...",
+        level='debug'
+    )
 
     # Process the election
     result = coop_expansion.handle_elect(peer_id, payload)

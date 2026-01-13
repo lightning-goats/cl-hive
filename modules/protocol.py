@@ -625,12 +625,33 @@ def create_peer_available(target_peer_id: str, reporter_peer_id: str,
 # PHASE 6.4: COOPERATIVE EXPANSION PROTOCOL
 # =============================================================================
 
+def get_expansion_nominate_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing EXPANSION_NOMINATE messages.
+
+    The signature covers all fields except the signature itself, in sorted order.
+    """
+    signing_fields = {
+        "round_id": payload.get("round_id", ""),
+        "target_peer_id": payload.get("target_peer_id", ""),
+        "nominator_id": payload.get("nominator_id", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "available_liquidity_sats": payload.get("available_liquidity_sats", 0),
+        "quality_score": payload.get("quality_score", 0.5),
+        "has_existing_channel": payload.get("has_existing_channel", False),
+        "channel_count": payload.get("channel_count", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
 def validate_expansion_nominate(payload: Dict[str, Any]) -> bool:
     """
     Validate EXPANSION_NOMINATE payload schema.
 
     This message is sent by hive members to express interest in opening
     a channel to a target peer during a cooperative expansion round.
+
+    SECURITY: Requires a valid cryptographic signature from the nominator.
     """
     if not isinstance(payload, dict):
         return False
@@ -640,6 +661,7 @@ def validate_expansion_nominate(payload: Dict[str, Any]) -> bool:
     target_peer_id = payload.get("target_peer_id")
     nominator_id = payload.get("nominator_id")
     timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
 
     # round_id must be a non-empty string
     if not isinstance(round_id, str) or len(round_id) < 8:
@@ -655,6 +677,10 @@ def validate_expansion_nominate(payload: Dict[str, Any]) -> bool:
     if not isinstance(timestamp, int) or timestamp < 0:
         return False
 
+    # Signature must be present (zbase encoded string)
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
     # Optional: Check numeric fields
     available_liquidity = payload.get("available_liquidity_sats", 0)
     if not isinstance(available_liquidity, int) or available_liquidity < 0:
@@ -667,12 +693,34 @@ def validate_expansion_nominate(payload: Dict[str, Any]) -> bool:
     return True
 
 
+def get_expansion_elect_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing EXPANSION_ELECT messages.
+
+    The signature covers all fields except the signature itself, in sorted order.
+    """
+    signing_fields = {
+        "round_id": payload.get("round_id", ""),
+        "target_peer_id": payload.get("target_peer_id", ""),
+        "elected_id": payload.get("elected_id", ""),
+        "coordinator_id": payload.get("coordinator_id", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "channel_size_sats": payload.get("channel_size_sats", 0),
+        "quality_score": payload.get("quality_score", 0.5),
+        "nomination_count": payload.get("nomination_count", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
 def validate_expansion_elect(payload: Dict[str, Any]) -> bool:
     """
     Validate EXPANSION_ELECT payload schema.
 
     This message announces which hive member has been elected to open
     a channel to the target peer.
+
+    SECURITY: Requires a valid cryptographic signature from the coordinator
+    who ran the election.
     """
     if not isinstance(payload, dict):
         return False
@@ -681,7 +729,9 @@ def validate_expansion_elect(payload: Dict[str, Any]) -> bool:
     round_id = payload.get("round_id")
     target_peer_id = payload.get("target_peer_id")
     elected_id = payload.get("elected_id")
+    coordinator_id = payload.get("coordinator_id")
     timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
 
     # round_id must be a non-empty string
     if not isinstance(round_id, str) or len(round_id) < 8:
@@ -692,9 +742,15 @@ def validate_expansion_elect(payload: Dict[str, Any]) -> bool:
         return False
     if not _valid_pubkey(elected_id):
         return False
+    if not _valid_pubkey(coordinator_id):
+        return False
 
     # Timestamp must be valid
     if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # Signature must be present (zbase encoded string)
+    if not isinstance(signature, str) or len(signature) < 10:
         return False
 
     # channel_size_sats must be positive if present
@@ -710,6 +766,7 @@ def create_expansion_nominate(
     target_peer_id: str,
     nominator_id: str,
     timestamp: int,
+    signature: str,
     available_liquidity_sats: int = 0,
     quality_score: float = 0.5,
     has_existing_channel: bool = False,
@@ -722,11 +779,15 @@ def create_expansion_nominate(
     Sent by hive members to express interest in opening a channel to a target
     during a cooperative expansion round.
 
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_expansion_nominate_signing_payload().
+
     Args:
         round_id: Unique identifier for this expansion round
         target_peer_id: The external peer to potentially open a channel to
         nominator_id: The hive member nominating themselves
         timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
         available_liquidity_sats: Nominator's available onchain balance
         quality_score: Nominator's calculated quality score for the target
         has_existing_channel: Whether nominator already has a channel to target
@@ -741,6 +802,7 @@ def create_expansion_nominate(
         "target_peer_id": target_peer_id,
         "nominator_id": nominator_id,
         "timestamp": timestamp,
+        "signature": signature,
         "available_liquidity_sats": available_liquidity_sats,
         "quality_score": quality_score,
         "has_existing_channel": has_existing_channel,
@@ -757,7 +819,9 @@ def create_expansion_elect(
     round_id: str,
     target_peer_id: str,
     elected_id: str,
+    coordinator_id: str,
     timestamp: int,
+    signature: str,
     channel_size_sats: int = 0,
     quality_score: float = 0.5,
     nomination_count: int = 0,
@@ -769,11 +833,17 @@ def create_expansion_elect(
     Broadcast to announce which hive member has been elected to open
     a channel to the target peer.
 
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_expansion_elect_signing_payload().
+    The coordinator_id identifies who ran the election and signed the message.
+
     Args:
         round_id: Unique identifier for this expansion round
         target_peer_id: The external peer to open a channel to
         elected_id: The hive member elected to open the channel
+        coordinator_id: The hive member who ran the election and signed
         timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
         channel_size_sats: Recommended channel size
         quality_score: Target's quality score
         nomination_count: Number of nominations received
@@ -786,7 +856,9 @@ def create_expansion_elect(
         "round_id": round_id,
         "target_peer_id": target_peer_id,
         "elected_id": elected_id,
+        "coordinator_id": coordinator_id,
         "timestamp": timestamp,
+        "signature": signature,
         "channel_size_sats": channel_size_sats,
         "quality_score": quality_score,
         "nomination_count": nomination_count,
