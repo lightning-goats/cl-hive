@@ -96,6 +96,7 @@ from modules.rpc_commands import (
     planner_log as rpc_planner_log,
     intent_status as rpc_intent_status,
     contribution as rpc_contribution,
+    expansion_status as rpc_expansion_status,
 )
 
 # Initialize the plugin
@@ -4219,10 +4220,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
 def hive_expansion_status(plugin: Plugin, round_id: str = None,
                           target_peer_id: str = None):
     """
-    Get status of cooperative expansion rounds (Phase 6.4).
-
-    The cooperative expansion system coordinates channel opening decisions
-    across hive members to avoid redundant connections and optimize topology.
+    Get status of cooperative expansion rounds.
 
     Args:
         round_id: Get status of a specific round (optional)
@@ -4230,51 +4228,9 @@ def hive_expansion_status(plugin: Plugin, round_id: str = None,
 
     Returns:
         Dict with expansion round status and statistics.
-
-    Examples:
-        # Get overall status
-        hive-expansion-status
-
-        # Get specific round
-        hive-expansion-status round_id=abc12345
-
-        # Get rounds for a target
-        hive-expansion-status target_peer_id=02abc123...
     """
-    if not coop_expansion:
-        return {"error": "Cooperative expansion not initialized"}
-
-    if round_id:
-        # Get specific round
-        round_obj = coop_expansion.get_round(round_id)
-        if not round_obj:
-            return {"error": f"Round {round_id} not found"}
-        return {
-            "round_id": round_id,
-            "round": round_obj.to_dict(),
-            "nominations": [
-                {
-                    "nominator": n.nominator_id[:16] + "...",
-                    "liquidity": n.available_liquidity_sats,
-                    "quality_score": round(n.quality_score, 3),
-                    "channel_count": n.channel_count,
-                    "has_existing": n.has_existing_channel,
-                }
-                for n in round_obj.nominations.values()
-            ]
-        }
-
-    if target_peer_id:
-        # Get rounds for target
-        rounds = coop_expansion.get_rounds_for_target(target_peer_id)
-        return {
-            "target_peer_id": target_peer_id,
-            "count": len(rounds),
-            "rounds": [r.to_dict() for r in rounds],
-        }
-
-    # Get overall status
-    return coop_expansion.get_status()
+    return rpc_expansion_status(_get_hive_context(), round_id=round_id,
+                                target_peer_id=target_peer_id)
 
 
 @plugin.method("hive-expansion-nominate")

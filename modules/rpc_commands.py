@@ -1105,3 +1105,51 @@ def contribution(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
         result["uptime_pct"] = member.get("uptime_pct")
 
     return result
+
+
+def expansion_status(ctx: HiveContext, round_id: str = None,
+                     target_peer_id: str = None) -> Dict[str, Any]:
+    """
+    Get status of cooperative expansion rounds.
+
+    Args:
+        round_id: Get status of a specific round (optional)
+        target_peer_id: Get rounds for a specific target peer (optional)
+
+    Returns:
+        Dict with expansion round status and statistics.
+    """
+    if not ctx.coop_expansion_mgr:
+        return {"error": "Cooperative expansion not initialized"}
+
+    if round_id:
+        # Get specific round
+        round_obj = ctx.coop_expansion_mgr.get_round(round_id)
+        if not round_obj:
+            return {"error": f"Round {round_id} not found"}
+        return {
+            "round_id": round_id,
+            "round": round_obj.to_dict(),
+            "nominations": [
+                {
+                    "nominator": n.nominator_id[:16] + "...",
+                    "liquidity": n.available_liquidity_sats,
+                    "quality_score": round(n.quality_score, 3),
+                    "channel_count": n.channel_count,
+                    "has_existing": n.has_existing_channel,
+                }
+                for n in round_obj.nominations.values()
+            ]
+        }
+
+    if target_peer_id:
+        # Get rounds for target
+        rounds = ctx.coop_expansion_mgr.get_rounds_for_target(target_peer_id)
+        return {
+            "target_peer_id": target_peer_id,
+            "count": len(rounds),
+            "rounds": [r.to_dict() for r in rounds],
+        }
+
+    # Get overall status
+    return ctx.coop_expansion_mgr.get_status()
