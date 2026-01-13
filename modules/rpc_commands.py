@@ -718,3 +718,211 @@ def _execute_channel_open(
             "error": error_msg,
             "broadcast_count": broadcast_count,
         }
+
+
+# =============================================================================
+# GOVERNANCE COMMANDS
+# =============================================================================
+
+def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
+    """
+    Change the governance mode at runtime.
+
+    Args:
+        ctx: HiveContext
+        mode: New governance mode ('advisor', 'autonomous', or 'oracle')
+
+    Returns:
+        Dict with new mode and previous mode.
+
+    Permission: Admin only
+    """
+    from modules.config import VALID_GOVERNANCE_MODES
+
+    # Permission check: Admin only
+    perm_error = check_permission(ctx, 'admin')
+    if perm_error:
+        return perm_error
+
+    if not ctx.config:
+        return {"error": "Config not initialized"}
+
+    # Validate mode
+    mode_lower = mode.lower()
+    if mode_lower not in VALID_GOVERNANCE_MODES:
+        return {
+            "error": f"Invalid mode: {mode}",
+            "valid_modes": list(VALID_GOVERNANCE_MODES)
+        }
+
+    # Check for oracle URL if switching to oracle mode
+    if mode_lower == 'oracle' and not ctx.config.oracle_url:
+        return {
+            "error": "Cannot switch to oracle mode: oracle_url not configured",
+            "hint": "Set hive-oracle-url option or configure oracle_url"
+        }
+
+    # Store previous mode
+    previous_mode = ctx.config.governance_mode
+
+    # Update config
+    ctx.config.governance_mode = mode_lower
+    ctx.config._version += 1
+
+    if ctx.log:
+        ctx.log(f"cl-hive: Governance mode changed from {previous_mode} to {mode_lower}", 'info')
+
+    return {
+        "status": "ok",
+        "previous_mode": previous_mode,
+        "current_mode": mode_lower,
+    }
+
+
+def enable_expansions(ctx: HiveContext, enabled: bool = True) -> Dict[str, Any]:
+    """
+    Enable or disable expansion proposals at runtime.
+
+    Args:
+        ctx: HiveContext
+        enabled: True to enable expansions, False to disable (default: True)
+
+    Returns:
+        Dict with new setting.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = check_permission(ctx, 'admin')
+    if perm_error:
+        return perm_error
+
+    if not ctx.config:
+        return {"error": "Config not initialized"}
+
+    previous = ctx.config.planner_enable_expansions
+    ctx.config.planner_enable_expansions = enabled
+    ctx.config._version += 1
+
+    if ctx.log:
+        ctx.log(f"cl-hive: Expansion proposals {'enabled' if enabled else 'disabled'}", 'info')
+
+    return {
+        "status": "ok",
+        "previous_setting": previous,
+        "expansions_enabled": enabled,
+    }
+
+
+def pending_admin_promotions(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    View pending admin promotion proposals.
+
+    Returns:
+        Dict with pending admin promotions and their approval status.
+
+    Permission: Admin only
+    """
+    from modules.membership import MembershipTier
+
+    perm_error = check_permission(ctx, 'admin')
+    if perm_error:
+        return perm_error
+
+    if not ctx.database:
+        return {"error": "Database not initialized"}
+
+    # Get all current admins
+    all_members = ctx.database.get_all_members()
+    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
+    admin_pubkeys = set(m["peer_id"] for m in admins)
+
+    pending = ctx.database.get_pending_admin_promotions()
+    result = []
+
+    for p in pending:
+        target = p["target_peer_id"]
+        approvals = ctx.database.get_admin_promotion_approvals(target)
+        approval_pubkeys = set(a["approver_peer_id"] for a in approvals)
+        valid_approvals = approval_pubkeys & admin_pubkeys
+
+        result.append({
+            "peer_id": target,
+            "proposed_by": p["proposed_by"],
+            "proposed_at": p["proposed_at"],
+            "approvals_received": len(valid_approvals),
+            "approvals_needed": len(admins),
+            "approved_by": [pk[:16] + "..." for pk in valid_approvals],
+            "waiting_for": [pk[:16] + "..." for pk in (admin_pubkeys - valid_approvals)]
+        })
+
+    return {
+        "count": len(result),
+        "admin_count": len(admins),
+        "pending_promotions": result
+    }
+
+
+def pending_bans(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    View pending ban proposals.
+
+    Returns:
+        Dict with pending ban proposals and their vote counts.
+
+    Permission: Any member
+    """
+    from modules.membership import MembershipTier, BAN_QUORUM_THRESHOLD
+
+    if not ctx.database:
+        return {"error": "Database not initialized"}
+
+    # Clean up expired proposals
+    now = int(time.time())
+    ctx.database.cleanup_expired_ban_proposals(now)
+
+    # Get pending proposals
+    proposals = ctx.database.get_pending_ban_proposals()
+
+    # Get eligible voters info
+    all_members = ctx.database.get_all_members()
+
+    result = []
+    for p in proposals:
+        target_id = p["target_peer_id"]
+        eligible = [m for m in all_members
+                    if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+                    and m["peer_id"] != target_id]
+        eligible_ids = set(m["peer_id"] for m in eligible)
+        quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
+
+        votes = ctx.database.get_ban_votes(p["proposal_id"])
+        approve_count = sum(1 for v in votes if v["vote"] == "approve" and v["voter_peer_id"] in eligible_ids)
+        reject_count = sum(1 for v in votes if v["vote"] == "reject" and v["voter_peer_id"] in eligible_ids)
+
+        # Check if we've voted
+        my_vote = None
+        if ctx.our_pubkey:
+            for v in votes:
+                if v["voter_peer_id"] == ctx.our_pubkey:
+                    my_vote = v["vote"]
+                    break
+
+        result.append({
+            "proposal_id": p["proposal_id"],
+            "target_peer_id": target_id,
+            "target_tier": ctx.database.get_member(target_id).get("tier") if ctx.database.get_member(target_id) else "unknown",
+            "proposer": p["proposer_peer_id"][:16] + "...",
+            "reason": p["reason"],
+            "proposed_at": p["proposed_at"],
+            "expires_at": p["expires_at"],
+            "approve_count": approve_count,
+            "reject_count": reject_count,
+            "quorum_needed": quorum_needed,
+            "my_vote": my_vote
+        })
+
+    return {
+        "count": len(result),
+        "proposals": result
+    }

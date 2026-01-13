@@ -86,6 +86,10 @@ from modules.rpc_commands import (
     approve_action as rpc_approve_action,
     reject_action as rpc_reject_action,
     budget_summary as rpc_budget_summary,
+    set_mode as rpc_set_mode,
+    enable_expansions as rpc_enable_expansions,
+    pending_admin_promotions as rpc_pending_admin_promotions,
+    pending_bans as rpc_pending_bans,
 )
 
 # Initialize the plugin
@@ -4769,45 +4773,7 @@ def hive_set_mode(plugin: Plugin, mode: str):
 
     Permission: Admin only
     """
-    from modules.config import VALID_GOVERNANCE_MODES
-
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not config:
-        return {"error": "Config not initialized"}
-
-    # Validate mode
-    mode_lower = mode.lower()
-    if mode_lower not in VALID_GOVERNANCE_MODES:
-        return {
-            "error": f"Invalid mode: {mode}",
-            "valid_modes": list(VALID_GOVERNANCE_MODES)
-        }
-
-    # Check for oracle URL if switching to oracle mode
-    if mode_lower == 'oracle' and not config.oracle_url:
-        return {
-            "error": "Cannot switch to oracle mode: oracle_url not configured",
-            "hint": "Set hive-oracle-url option or configure oracle_url"
-        }
-
-    # Store previous mode
-    previous_mode = config.governance_mode
-
-    # Update config
-    config.governance_mode = mode_lower
-    config._version += 1
-
-    plugin.log(f"cl-hive: Governance mode changed from {previous_mode} to {mode_lower}")
-
-    return {
-        "status": "ok",
-        "previous_mode": previous_mode,
-        "current_mode": mode_lower,
-    }
+    return rpc_set_mode(_get_hive_context(), mode)
 
 
 @plugin.method("hive-enable-expansions")
@@ -4823,25 +4789,7 @@ def hive_enable_expansions(plugin: Plugin, enabled: bool = True):
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not config:
-        return {"error": "Config not initialized"}
-
-    previous = config.planner_enable_expansions
-    config.planner_enable_expansions = enabled
-    config._version += 1
-
-    plugin.log(f"cl-hive: Expansion proposals {'enabled' if enabled else 'disabled'}")
-
-    return {
-        "status": "ok",
-        "previous_setting": previous,
-        "expansions_enabled": enabled,
-    }
+    return rpc_enable_expansions(_get_hive_context(), enabled)
 
 
 @plugin.method("hive-vouch")
@@ -5210,42 +5158,7 @@ def hive_pending_admin_promotions(plugin: Plugin):
 
     Permission: Admin only
     """
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Get all current admins
-    all_members = database.get_all_members()
-    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
-    admin_pubkeys = set(m["peer_id"] for m in admins)
-
-    pending = database.get_pending_admin_promotions()
-    result = []
-
-    for p in pending:
-        target = p["target_peer_id"]
-        approvals = database.get_admin_promotion_approvals(target)
-        approval_pubkeys = set(a["approver_peer_id"] for a in approvals)
-        valid_approvals = approval_pubkeys & admin_pubkeys
-
-        result.append({
-            "peer_id": target,
-            "proposed_by": p["proposed_by"],
-            "proposed_at": p["proposed_at"],
-            "approvals_received": len(valid_approvals),
-            "approvals_needed": len(admins),
-            "approved_by": [pk[:16] + "..." for pk in valid_approvals],
-            "waiting_for": [pk[:16] + "..." for pk in (admin_pubkeys - valid_approvals)]
-        })
-
-    return {
-        "count": len(result),
-        "admin_count": len(admins),
-        "pending_promotions": result
-    }
+    return rpc_pending_admin_promotions(_get_hive_context())
 
 
 @plugin.method("hive-resign-admin")
@@ -5614,58 +5527,7 @@ def hive_pending_bans(plugin: Plugin):
 
     Permission: Any member
     """
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Clean up expired proposals
-    now = int(time.time())
-    database.cleanup_expired_ban_proposals(now)
-
-    # Get pending proposals
-    proposals = database.get_pending_ban_proposals()
-
-    # Get eligible voters info
-    all_members = database.get_all_members()
-
-    result = []
-    for p in proposals:
-        target_id = p["target_peer_id"]
-        eligible = [m for m in all_members
-                    if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
-                    and m["peer_id"] != target_id]
-        eligible_ids = set(m["peer_id"] for m in eligible)
-        quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
-
-        votes = database.get_ban_votes(p["proposal_id"])
-        approve_count = sum(1 for v in votes if v["vote"] == "approve" and v["voter_peer_id"] in eligible_ids)
-        reject_count = sum(1 for v in votes if v["vote"] == "reject" and v["voter_peer_id"] in eligible_ids)
-
-        # Check if we've voted
-        my_vote = None
-        if our_pubkey:
-            for v in votes:
-                if v["voter_peer_id"] == our_pubkey:
-                    my_vote = v["vote"]
-                    break
-
-        result.append({
-            "proposal_id": p["proposal_id"],
-            "target_peer_id": target_id,
-            "target_tier": database.get_member(target_id).get("tier") if database.get_member(target_id) else "unknown",
-            "proposer": p["proposer_peer_id"][:16] + "...",
-            "reason": p["reason"],
-            "proposed_at": p["proposed_at"],
-            "expires_at": p["expires_at"],
-            "approve_count": approve_count,
-            "reject_count": reject_count,
-            "quorum_needed": quorum_needed,
-            "my_vote": my_vote
-        })
-
-    return {
-        "count": len(result),
-        "proposals": result
-    }
+    return rpc_pending_bans(_get_hive_context())
 
 
 @plugin.method("hive-contribution")
