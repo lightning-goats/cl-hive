@@ -72,6 +72,7 @@ from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
 from modules.routing_intelligence import HiveRoutingMap
+from modules.peer_reputation import PeerReputationManager
 
 # Initialize the plugin
 plugin = Plugin()
@@ -960,6 +961,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     routing_map.aggregate_from_database()
     plugin.log("cl-hive: Routing map initialized")
 
+    # Initialize Peer Reputation Manager (Phase 5 - Advanced Cooperation)
+    global peer_reputation_mgr
+    peer_reputation_mgr = PeerReputationManager(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey
+    )
+    # Load existing reputation data from database
+    peer_reputation_mgr.aggregate_from_database()
+    plugin.log("cl-hive: Peer reputation manager initialized")
+
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
     peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
@@ -1094,8 +1106,10 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_liquidity_need(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.ROUTE_PROBE:
             return handle_route_probe(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.PEER_REPUTATION:
+            return handle_peer_reputation(peer_id, msg_payload, plugin)
         else:
-            # Known but unimplemented message type (Phase 4+)
+            # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
             
@@ -3196,6 +3210,38 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
+def handle_peer_reputation(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle PEER_REPUTATION message from a hive member.
+
+    Used for collective peer reputation tracking.
+    """
+    if not peer_reputation_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: PEER_REPUTATION from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to peer reputation manager
+    result = peer_reputation_mgr.handle_peer_reputation(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored peer reputation from {peer_id[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: PEER_REPUTATION rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
 # =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
@@ -3475,6 +3521,26 @@ def fee_intelligence_loop():
                         )
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Route probe cleanup error: {e}", level='warn')
+
+            # Step 9: Cleanup old peer reputation (Phase 5 - Advanced Cooperation)
+            try:
+                if peer_reputation_mgr:
+                    # Clean database
+                    deleted_reps = database.cleanup_old_peer_reputation(max_age_hours=168)
+                    if deleted_reps > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {deleted_reps} old peer reputation records",
+                            level='debug'
+                        )
+                    # Clean in-memory aggregations
+                    cleaned_reps = peer_reputation_mgr.cleanup_stale_data()
+                    if cleaned_reps > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_reps} stale peer reputations",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Peer reputation cleanup error: {e}", level='warn')
 
         except Exception as e:
             if safe_plugin:

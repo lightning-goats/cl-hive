@@ -519,6 +519,40 @@ class HiveDatabase:
             "ON route_probes(timestamp)"
         )
 
+        # =====================================================================
+        # PEER REPUTATION TABLE (Phase 5 - Advanced Cooperation)
+        # =====================================================================
+        # Stores reputation reports about external peers from hive members
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_reputation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                uptime_pct REAL DEFAULT 1.0,
+                response_time_ms INTEGER DEFAULT 0,
+                force_close_count INTEGER DEFAULT 0,
+                fee_stability REAL DEFAULT 1.0,
+                htlc_success_rate REAL DEFAULT 1.0,
+                channel_age_days INTEGER DEFAULT 0,
+                total_routed_sats INTEGER DEFAULT 0,
+                warnings TEXT DEFAULT '[]',
+                observation_days INTEGER DEFAULT 7
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_peer_reputation_peer_id "
+            "ON peer_reputation(peer_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_peer_reputation_timestamp "
+            "ON peer_reputation(timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_peer_reputation_reporter "
+            "ON peer_reputation(reporter_id)"
+        )
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -2677,5 +2711,154 @@ class HiveDatabase:
         cutoff = int(time.time()) - (max_age_hours * 3600)
         cursor = conn.execute("""
             DELETE FROM route_probes WHERE timestamp < ?
+        """, (cutoff,))
+        return cursor.rowcount
+
+    # =========================================================================
+    # PEER REPUTATION OPERATIONS (Phase 5 - Advanced Cooperation)
+    # =========================================================================
+
+    def store_peer_reputation(
+        self,
+        reporter_id: str,
+        peer_id: str,
+        timestamp: int,
+        uptime_pct: float = 1.0,
+        response_time_ms: int = 0,
+        force_close_count: int = 0,
+        fee_stability: float = 1.0,
+        htlc_success_rate: float = 1.0,
+        channel_age_days: int = 0,
+        total_routed_sats: int = 0,
+        warnings: list = None,
+        observation_days: int = 7
+    ):
+        """
+        Store a peer reputation report.
+
+        Args:
+            reporter_id: Hive member reporting
+            peer_id: External peer being reported on
+            timestamp: Report timestamp
+            uptime_pct: Peer uptime (0-1)
+            response_time_ms: Average HTLC response time
+            force_close_count: Force closes by peer
+            fee_stability: Fee stability (0-1)
+            htlc_success_rate: HTLC success rate (0-1)
+            channel_age_days: Channel age
+            total_routed_sats: Total volume routed
+            warnings: List of warning codes
+            observation_days: Days covered by report
+        """
+        conn = self._get_connection()
+        warnings_json = json.dumps(warnings or [])
+
+        conn.execute("""
+            INSERT INTO peer_reputation (
+                reporter_id, peer_id, timestamp, uptime_pct, response_time_ms,
+                force_close_count, fee_stability, htlc_success_rate,
+                channel_age_days, total_routed_sats, warnings, observation_days
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            reporter_id, peer_id, timestamp, uptime_pct, response_time_ms,
+            force_close_count, fee_stability, htlc_success_rate,
+            channel_age_days, total_routed_sats, warnings_json, observation_days
+        ))
+
+    def get_peer_reputation_reports(
+        self,
+        peer_id: str,
+        max_age_hours: int = 168
+    ) -> list:
+        """
+        Get all reputation reports for a specific peer.
+
+        Args:
+            peer_id: External peer pubkey
+            max_age_hours: Maximum age of reports to include
+
+        Returns:
+            List of reputation report dicts
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+
+        rows = conn.execute("""
+            SELECT * FROM peer_reputation
+            WHERE peer_id = ? AND timestamp > ?
+            ORDER BY timestamp DESC
+        """, (peer_id, cutoff)).fetchall()
+
+        reports = []
+        for row in rows:
+            report = dict(row)
+            # Parse warnings JSON
+            report["warnings"] = json.loads(report.get("warnings", "[]"))
+            reports.append(report)
+
+        return reports
+
+    def get_all_peer_reputation_reports(
+        self,
+        max_age_hours: int = 168
+    ) -> list:
+        """
+        Get all reputation reports.
+
+        Args:
+            max_age_hours: Maximum age of reports to include
+
+        Returns:
+            List of all reputation report dicts
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+
+        rows = conn.execute("""
+            SELECT * FROM peer_reputation
+            WHERE timestamp > ?
+            ORDER BY timestamp DESC
+        """, (cutoff,)).fetchall()
+
+        reports = []
+        for row in rows:
+            report = dict(row)
+            report["warnings"] = json.loads(report.get("warnings", "[]"))
+            reports.append(report)
+
+        return reports
+
+    def get_peer_reputation_reporters(self, peer_id: str) -> list:
+        """
+        Get list of reporters who have submitted reports for a peer.
+
+        Args:
+            peer_id: External peer pubkey
+
+        Returns:
+            List of unique reporter pubkeys
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT DISTINCT reporter_id FROM peer_reputation
+            WHERE peer_id = ?
+        """, (peer_id,)).fetchall()
+
+        return [row["reporter_id"] for row in rows]
+
+    def cleanup_old_peer_reputation(self, max_age_hours: int = 168) -> int:
+        """
+        Remove old peer reputation records.
+
+        Args:
+            max_age_hours: Maximum age to keep (default 7 days)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        cursor = conn.execute("""
+            DELETE FROM peer_reputation WHERE timestamp < ?
         """, (cutoff,))
         return cursor.rowcount

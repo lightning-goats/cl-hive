@@ -90,6 +90,7 @@ class HiveMessageType(IntEnum):
     LIQUIDITY_NEED = 32811      # Broadcast rebalancing needs
     HEALTH_REPORT = 32813       # NNLB health status report
     ROUTE_PROBE = 32815         # Share routing observations (Phase 4)
+    PEER_REPUTATION = 32817     # Share peer reputation observations (Phase 5)
 
 
 # =============================================================================
@@ -269,6 +270,41 @@ class RouteProbePayload:
     amount_probed_sats: int = 0
 
 
+@dataclass
+class PeerReputationPayload:
+    """
+    PEER_REPUTATION message payload - External peer reputation sharing.
+
+    Share reputation observations about external (non-hive) peers to
+    build collective intelligence about peer reliability and behavior.
+    """
+    reporter_id: str           # Who observed this
+    timestamp: int
+    signature: str
+
+    # Target peer (external)
+    peer_id: str               # External peer being reported on
+
+    # Reliability metrics
+    uptime_pct: float = 1.0    # How often peer is online (0-1)
+    response_time_ms: int = 0  # Average HTLC response time
+    force_close_count: int = 0 # Number of force closes initiated by peer
+
+    # Behavior metrics
+    fee_stability: float = 1.0 # How stable are their fees (0-1)
+    htlc_success_rate: float = 1.0  # % of HTLCs that succeed (0-1)
+
+    # Channel metrics
+    channel_age_days: int = 0  # How long we've had channel with them
+    total_routed_sats: int = 0 # Total volume routed through this peer
+
+    # Warnings (optional)
+    warnings: List[str] = field(default_factory=list)  # Specific issues
+
+    # Observation period
+    observation_days: int = 7  # How many days this report covers
+
+
 # =============================================================================
 # PHASE 7 VALIDATION CONSTANTS
 # =============================================================================
@@ -294,12 +330,33 @@ FEE_INTELLIGENCE_RATE_LIMIT = (10, 3600)    # 10 per hour per sender
 LIQUIDITY_NEED_RATE_LIMIT = (5, 3600)       # 5 per hour per sender
 HEALTH_REPORT_RATE_LIMIT = (1, 3600)        # 1 per hour per sender
 ROUTE_PROBE_RATE_LIMIT = (20, 3600)         # 20 per hour per sender
+PEER_REPUTATION_RATE_LIMIT = (5, 86400)     # 5 per day per sender
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
 MAX_LATENCY_MS = 60000                      # 60 seconds max latency
 MAX_CAPACITY_SATS = 1_000_000_000           # 1 BTC max capacity per route
 VALID_FAILURE_REASONS = {"", "temporary", "permanent", "capacity", "unknown"}
+
+# Peer reputation constants
+MAX_RESPONSE_TIME_MS = 60000                # 60 seconds max response time
+MAX_FORCE_CLOSE_COUNT = 100                 # Reasonable max for tracking
+MAX_CHANNEL_AGE_DAYS = 3650                 # 10 years max
+MAX_OBSERVATION_DAYS = 365                  # 1 year max observation period
+MAX_WARNINGS_COUNT = 10                     # Max warnings per report
+MAX_WARNING_LENGTH = 200                    # Max length of each warning
+VALID_WARNINGS = {
+    "fee_spike",           # Sudden fee increase
+    "force_close",         # Initiated force close
+    "htlc_timeout",        # HTLC timeouts
+    "offline_frequent",    # Frequently offline
+    "channel_reject",      # Rejected channel opens
+    "routing_failure",     # High routing failure rate
+    "slow_response",       # Slow HTLC processing
+    "fee_manipulation",    # Suspected fee manipulation
+    "capacity_drain",      # Draining liquidity
+    "other",               # Other issues
+}
 
 
 # =============================================================================
@@ -1448,6 +1505,176 @@ def create_route_probe(
         return None
 
     return serialize(HiveMessageType.ROUTE_PROBE, payload)
+
+
+def get_peer_reputation_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Generate signing payload for PEER_REPUTATION message.
+
+    Creates a deterministic string for signature verification.
+
+    Args:
+        payload: PEER_REPUTATION payload dict
+
+    Returns:
+        Canonical string for signing
+    """
+    return (
+        f"HIVE_PEER_REPUTATION:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('peer_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('uptime_pct', 1.0):.2f}:"
+        f"{payload.get('htlc_success_rate', 1.0):.2f}:"
+        f"{payload.get('force_close_count', 0)}"
+    )
+
+
+def validate_peer_reputation_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a PEER_REPUTATION payload.
+
+    Args:
+        payload: PEER_REPUTATION message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    # Required string fields
+    reporter_id = payload.get("reporter_id")
+    peer_id = payload.get("peer_id")
+    signature = payload.get("signature")
+
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+    if not isinstance(peer_id, str) or not peer_id:
+        return False
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # Timestamp
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # Uptime percentage bounds (0-1)
+    uptime_pct = payload.get("uptime_pct", 1.0)
+    if not isinstance(uptime_pct, (int, float)) or not (0 <= uptime_pct <= 1):
+        return False
+
+    # Response time bounds
+    response_time_ms = payload.get("response_time_ms", 0)
+    if not isinstance(response_time_ms, int) or not (0 <= response_time_ms <= MAX_RESPONSE_TIME_MS):
+        return False
+
+    # Force close count bounds
+    force_close_count = payload.get("force_close_count", 0)
+    if not isinstance(force_close_count, int) or not (0 <= force_close_count <= MAX_FORCE_CLOSE_COUNT):
+        return False
+
+    # Fee stability bounds (0-1)
+    fee_stability = payload.get("fee_stability", 1.0)
+    if not isinstance(fee_stability, (int, float)) or not (0 <= fee_stability <= 1):
+        return False
+
+    # HTLC success rate bounds (0-1)
+    htlc_success_rate = payload.get("htlc_success_rate", 1.0)
+    if not isinstance(htlc_success_rate, (int, float)) or not (0 <= htlc_success_rate <= 1):
+        return False
+
+    # Channel age bounds
+    channel_age_days = payload.get("channel_age_days", 0)
+    if not isinstance(channel_age_days, int) or not (0 <= channel_age_days <= MAX_CHANNEL_AGE_DAYS):
+        return False
+
+    # Total routed bounds
+    total_routed_sats = payload.get("total_routed_sats", 0)
+    if not isinstance(total_routed_sats, int) or total_routed_sats < 0:
+        return False
+
+    # Observation days bounds
+    observation_days = payload.get("observation_days", 7)
+    if not isinstance(observation_days, int) or not (1 <= observation_days <= MAX_OBSERVATION_DAYS):
+        return False
+
+    # Warnings validation
+    warnings = payload.get("warnings", [])
+    if not isinstance(warnings, list):
+        return False
+    if len(warnings) > MAX_WARNINGS_COUNT:
+        return False
+    for warning in warnings:
+        if not isinstance(warning, str):
+            return False
+        if len(warning) > MAX_WARNING_LENGTH:
+            return False
+        # Warning must be from valid set
+        if warning and warning not in VALID_WARNINGS:
+            return False
+
+    return True
+
+
+def create_peer_reputation(
+    reporter_id: str,
+    peer_id: str,
+    rpc,
+    uptime_pct: float = 1.0,
+    response_time_ms: int = 0,
+    force_close_count: int = 0,
+    fee_stability: float = 1.0,
+    htlc_success_rate: float = 1.0,
+    channel_age_days: int = 0,
+    total_routed_sats: int = 0,
+    warnings: List[str] = None,
+    observation_days: int = 7
+) -> Optional[bytes]:
+    """
+    Create a signed PEER_REPUTATION message.
+
+    Args:
+        reporter_id: Hive member reporting this observation
+        peer_id: External peer being reported on
+        rpc: RPC interface for signing
+        uptime_pct: Peer uptime percentage (0-1)
+        response_time_ms: Average HTLC response time
+        force_close_count: Number of force closes by peer
+        fee_stability: Fee stability score (0-1)
+        htlc_success_rate: HTLC success rate (0-1)
+        channel_age_days: Channel age in days
+        total_routed_sats: Total volume routed through peer
+        warnings: List of warning codes
+        observation_days: Days covered by this report
+
+    Returns:
+        Serialized and signed PEER_REPUTATION message, or None on error
+    """
+    timestamp = int(time.time())
+
+    payload = {
+        "reporter_id": reporter_id,
+        "peer_id": peer_id,
+        "timestamp": timestamp,
+        "uptime_pct": uptime_pct,
+        "response_time_ms": response_time_ms,
+        "force_close_count": force_close_count,
+        "fee_stability": fee_stability,
+        "htlc_success_rate": htlc_success_rate,
+        "channel_age_days": channel_age_days,
+        "total_routed_sats": total_routed_sats,
+        "warnings": warnings or [],
+        "observation_days": observation_days,
+    }
+
+    # Sign the payload
+    signing_message = get_peer_reputation_signing_payload(payload)
+    try:
+        sig_result = rpc.signmessage(signing_message)
+        payload["signature"] = sig_result["zbase"]
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.PEER_REPUTATION, payload)
 
 
 def create_fee_intelligence(
