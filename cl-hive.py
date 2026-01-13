@@ -74,6 +74,15 @@ from modules.cooperative_expansion import CooperativeExpansionManager
 from modules.clboss_bridge import CLBossBridge
 from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
+from modules.rpc_commands import (
+    HiveContext,
+    status as rpc_status,
+    get_config as rpc_get_config,
+    members as rpc_members,
+    vpn_status as rpc_vpn_status,
+    vpn_add_peer as rpc_vpn_add_peer,
+    vpn_remove_peer as rpc_vpn_remove_peer,
+)
 
 # Initialize the plugin
 plugin = Plugin()
@@ -368,6 +377,41 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
             }
 
     return None  # Permission granted
+
+
+def _get_hive_context() -> HiveContext:
+    """
+    Create a HiveContext with all current global dependencies.
+
+    This bundles the global state for RPC command handlers in modules/rpc_commands.py.
+    Note: Some globals may not be initialized yet if init() hasn't completed.
+    """
+    # These globals are always defined (may be None before init())
+    _database = database if 'database' in globals() else None
+    _config = config if 'config' in globals() else None
+    _safe_plugin = safe_plugin if 'safe_plugin' in globals() else None
+    _our_pubkey = our_pubkey if 'our_pubkey' in globals() else None
+    _vpn_transport = vpn_transport if 'vpn_transport' in globals() else None
+    _planner = planner if 'planner' in globals() else None
+    _bridge = bridge if 'bridge' in globals() else None
+    _intent_mgr = intent_mgr if 'intent_mgr' in globals() else None
+    _membership_mgr = membership_mgr if 'membership_mgr' in globals() else None
+    # coop_expansion is the global name, not coop_expansion_mgr
+    _coop_expansion = coop_expansion if 'coop_expansion' in globals() else None
+
+    return HiveContext(
+        database=_database,
+        config=_config,
+        safe_plugin=_safe_plugin,
+        our_pubkey=_our_pubkey,
+        vpn_transport=_vpn_transport,
+        planner=_planner,
+        quality_scorer=None,  # Local to init(), not needed for current commands
+        bridge=_bridge,
+        intent_mgr=_intent_mgr,
+        membership_mgr=_membership_mgr,
+        coop_expansion_mgr=_coop_expansion,
+    )
 
 
 # =============================================================================
@@ -3526,29 +3570,7 @@ def hive_status(plugin: Plugin):
     Returns:
         Dict with hive state, member count, governance mode, etc.
     """
-    if not database:
-        return {"error": "Hive not initialized"}
-
-    members = database.get_all_members()
-    member_count = len([m for m in members if m['tier'] == 'member'])
-    neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
-    admin_count = len([m for m in members if m['tier'] == 'admin'])
-
-    return {
-        "status": "active" if members else "genesis_required",
-        "governance_mode": config.governance_mode if config else "unknown",
-        "members": {
-            "total": len(members),
-            "admin": admin_count,
-            "member": member_count,
-            "neophyte": neophyte_count,
-        },
-        "limits": {
-            "max_members": config.max_members if config else 50,
-            "market_share_cap": config.market_share_cap_pct if config else 0.20,
-        },
-        "version": "0.1.0-dev",
-    }
+    return rpc_status(_get_hive_context())
 
 
 @plugin.method("hive-config")
@@ -3565,50 +3587,7 @@ def hive_config(plugin: Plugin):
     Returns:
         Dict with all current config values and metadata.
     """
-    if not config:
-        return {"error": "Hive not initialized"}
-
-    return {
-        "config_version": config._version,
-        "hot_reload_enabled": True,
-        "immutable": {
-            "db_path": config.db_path,
-        },
-        "governance": {
-            "governance_mode": config.governance_mode,
-            "autonomous_budget_per_day": config.autonomous_budget_per_day,
-            "autonomous_actions_per_hour": config.autonomous_actions_per_hour,
-            "oracle_url": config.oracle_url,
-            "oracle_timeout_seconds": config.oracle_timeout_seconds,
-        },
-        "membership": {
-            "membership_enabled": config.membership_enabled,
-            "auto_vouch_enabled": config.auto_vouch_enabled,
-            "auto_promote_enabled": config.auto_promote_enabled,
-            "ban_autotrigger_enabled": config.ban_autotrigger_enabled,
-            "neophyte_fee_discount_pct": config.neophyte_fee_discount_pct,
-            "member_fee_ppm": config.member_fee_ppm,
-            "probation_days": config.probation_days,
-            "vouch_threshold_pct": config.vouch_threshold_pct,
-            "min_vouch_count": config.min_vouch_count,
-            "max_members": config.max_members,
-        },
-        "protocol": {
-            "market_share_cap_pct": config.market_share_cap_pct,
-            "intent_hold_seconds": config.intent_hold_seconds,
-            "intent_expire_seconds": config.intent_expire_seconds,
-            "gossip_threshold_pct": config.gossip_threshold_pct,
-            "heartbeat_interval": config.heartbeat_interval,
-        },
-        "planner": {
-            "planner_interval": config.planner_interval,
-            "planner_enable_expansions": config.planner_enable_expansions,
-            "planner_min_channel_sats": config.planner_min_channel_sats,
-            "planner_max_channel_sats": config.planner_max_channel_sats,
-            "planner_default_channel_sats": config.planner_default_channel_sats,
-        },
-        "vpn": vpn_transport.get_status() if vpn_transport else {"enabled": False},
-    }
+    return rpc_get_config(_get_hive_context())
 
 
 @plugin.method("hive-reinit-bridge")
@@ -3664,24 +3643,7 @@ def hive_vpn_status(plugin: Plugin, peer_id: str = None):
 
     Permission: Member (read-only status)
     """
-    if not vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    if peer_id:
-        # Get info for specific peer
-        peer_info = vpn_transport.get_peer_vpn_info(peer_id)
-        if peer_info:
-            return {
-                "peer_id": peer_id,
-                **peer_info
-            }
-        return {
-            "peer_id": peer_id,
-            "message": "No VPN info for this peer"
-        }
-
-    # Return full status
-    return vpn_transport.get_status()
+    return rpc_vpn_status(_get_hive_context(), peer_id)
 
 
 @plugin.method("hive-vpn-add-peer")
@@ -3700,34 +3662,7 @@ def hive_vpn_add_peer(plugin: Plugin, pubkey: str, vpn_address: str):
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    # Parse address
-    if ':' in vpn_address:
-        ip, port = vpn_address.rsplit(':', 1)
-        port = int(port)
-    else:
-        ip = vpn_address
-        port = 9735
-
-    success = vpn_transport.add_vpn_peer(pubkey, ip, port)
-    if success:
-        return {
-            "success": True,
-            "pubkey": pubkey,
-            "vpn_address": f"{ip}:{port}",
-            "message": "VPN peer mapping added"
-        }
-    return {
-        "success": False,
-        "error": "Failed to add peer - max peers may be reached"
-    }
+    return rpc_vpn_add_peer(_get_hive_context(), pubkey, vpn_address)
 
 
 @plugin.method("hive-vpn-remove-peer")
@@ -3743,26 +3678,7 @@ def hive_vpn_remove_peer(plugin: Plugin, pubkey: str):
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    success = vpn_transport.remove_vpn_peer(pubkey)
-    if success:
-        return {
-            "success": True,
-            "pubkey": pubkey,
-            "message": "VPN peer mapping removed"
-        }
-    return {
-        "success": False,
-        "pubkey": pubkey,
-        "message": "Peer not found in VPN mappings"
-    }
+    return rpc_vpn_remove_peer(_get_hive_context(), pubkey)
 
 
 @plugin.method("hive-members")
@@ -3773,14 +3689,7 @@ def hive_members(plugin: Plugin):
     Returns:
         List of member records with tier, contribution ratio, uptime, etc.
     """
-    if not database:
-        return {"error": "Hive not initialized"}
-
-    members = database.get_all_members()
-    return {
-        "count": len(members),
-        "members": members,
-    }
+    return rpc_members(_get_hive_context())
 
 
 @plugin.method("hive-topology")
