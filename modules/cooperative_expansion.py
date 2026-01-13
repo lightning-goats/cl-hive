@@ -134,7 +134,8 @@ class CooperativeExpansionManager:
         database: 'HiveDatabase',
         quality_scorer: 'PeerQualityScorer' = None,
         plugin=None,
-        our_id: str = None
+        our_id: str = None,
+        config_getter=None
     ):
         """
         Initialize the CooperativeExpansionManager.
@@ -144,11 +145,13 @@ class CooperativeExpansionManager:
             quality_scorer: PeerQualityScorer for evaluating peers
             plugin: Plugin instance for RPC and logging
             our_id: Our node's pubkey
+            config_getter: Callable that returns current HiveConfig
         """
         self.database = database
         self.quality_scorer = quality_scorer
         self.plugin = plugin
         self.our_id = our_id
+        self._config_getter = config_getter
 
         # Active rounds (keyed by round_id)
         self._rounds: Dict[str, ExpansionRound] = {}
@@ -195,6 +198,55 @@ class CooperativeExpansionManager:
             )
         except Exception:
             return 0
+
+    def _get_budget_constrained_liquidity(self) -> int:
+        """
+        Get available liquidity constrained by budget settings.
+
+        Applies:
+        1. Reserve percentage (keeps some onchain for future ops)
+        2. Daily budget limit
+        3. Max per-channel percentage of daily budget
+
+        Returns:
+            Available sats for channel opening
+        """
+        raw_balance = self._get_onchain_balance()
+
+        if not self._config_getter:
+            # No config, use 80% of raw balance as default
+            return int(raw_balance * 0.8)
+
+        try:
+            cfg = self._config_getter()
+            if not cfg:
+                return int(raw_balance * 0.8)
+
+            # Apply reserve percentage (keep some onchain)
+            reserve_pct = getattr(cfg, 'budget_reserve_pct', 0.20)
+            after_reserve = int(raw_balance * (1.0 - reserve_pct))
+
+            # Apply daily budget limit
+            daily_budget = getattr(cfg, 'autonomous_budget_per_day', 10_000_000)
+
+            # Apply max per-channel percentage
+            max_per_channel_pct = getattr(cfg, 'budget_max_per_channel_pct', 0.50)
+            max_per_channel = int(daily_budget * max_per_channel_pct)
+
+            # Return the minimum of constraints
+            available = min(after_reserve, daily_budget, max_per_channel)
+
+            self._log(
+                f"Budget-constrained liquidity: {available:,} sats "
+                f"(raw={raw_balance:,}, reserve={reserve_pct:.0%}, "
+                f"daily={daily_budget:,}, max_per_ch={max_per_channel:,})",
+                level='debug'
+            )
+
+            return available
+        except Exception as e:
+            self._log(f"Error calculating budget-constrained liquidity: {e}", level='warn')
+            return int(raw_balance * 0.8)
 
     def _get_channel_count(self) -> int:
         """Get our total channel count."""
@@ -405,17 +457,17 @@ class CooperativeExpansionManager:
             )
             return
 
-        # Check liquidity
-        available = self._get_onchain_balance()
+        # Check budget-constrained liquidity (respects reserve and daily budget)
+        available = self._get_budget_constrained_liquidity()
         min_required = 1_000_000  # 1M sats minimum
         if available < min_required:
             self._log(
-                f"Not nominating - insufficient liquidity: {available}",
+                f"Not nominating - insufficient budget-constrained liquidity: {available:,} sats",
                 level='debug'
             )
             return
 
-        # Create nomination
+        # Create nomination with budget-constrained liquidity
         nomination = Nomination(
             nominator_id=our_id,
             target_peer_id=target_peer_id,

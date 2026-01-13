@@ -803,7 +803,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database=database,
         quality_scorer=quality_scorer,
         plugin=safe_plugin,
-        our_id=our_pubkey
+        our_id=our_pubkey,
+        config_getter=lambda: config  # Provides access to budget settings
     )
     plugin.log("cl-hive: Cooperative expansion manager initialized")
 
@@ -2913,6 +2914,14 @@ def planner_loop():
                     safe_plugin.log(
                         f"cl-hive: Planner cycle complete: {len(decisions)} decisions"
                     )
+
+                # Clean up expired expansion rounds
+                if coop_expansion:
+                    cleaned = coop_expansion.cleanup_expired_rounds()
+                    if cleaned > 0 and safe_plugin:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned} expired expansion rounds"
+                        )
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Planner loop error: {e}", level='warn')
@@ -3947,6 +3956,28 @@ def hive_expansion_elect(plugin: Plugin, round_id: str):
         nomination_count=len(round_obj.nominations)
     )
 
+    # If we were elected, queue the pending action locally
+    # (we won't receive our own broadcast message)
+    if elected_id == our_pubkey and database and config:
+        cfg = config.snapshot()
+        channel_size = round_obj.recommended_size_sats or cfg.planner_default_channel_sats
+        action_id = database.add_pending_action(
+            action_type="channel_open",
+            payload={
+                "target": round_obj.target_peer_id,
+                "amount_sats": channel_size,
+                "source": "cooperative_expansion",
+                "round_id": round_id,
+                "reason": "Elected by hive for cooperative expansion"
+            },
+            expires_hours=24
+        )
+        plugin.log(
+            f"cl-hive: Queued channel open to {round_obj.target_peer_id[:16]}... "
+            f"(action_id={action_id}, size={channel_size})",
+            level='info'
+        )
+
     return {
         "round_id": round_id,
         "elected": True,
@@ -4239,8 +4270,16 @@ def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None)
         # Extract channel details from payload
         target = payload.get('target')
         context = payload.get('context', {})
-        intent_id = context.get('intent_id')
-        proposed_size = context.get('channel_size_sats', context.get('amount_sats', 1_000_000))
+        intent_id = context.get('intent_id') or payload.get('intent_id')
+
+        # Get channel size from context (planner) or top-level (cooperative expansion)
+        proposed_size = (
+            context.get('channel_size_sats') or
+            context.get('amount_sats') or
+            payload.get('amount_sats') or
+            payload.get('channel_size_sats') or
+            1_000_000  # Default 1M sats
+        )
 
         # Apply member override if provided
         if amount_sats is not None:
