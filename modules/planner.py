@@ -67,8 +67,9 @@ MIN_TARGET_CAPACITY_SATS = 100_000_000  # 1 BTC
 # Underserved threshold (targets with low Hive share)
 UNDERSERVED_THRESHOLD_PCT = 0.05  # < 5% Hive share = underserved
 
-# Minimum channel size for expansion (sats)
-MIN_CHANNEL_SIZE_SATS = 100_000  # 100k sats minimum
+# Legacy minimum channel size (now configurable via planner_min_channel_sats)
+# Kept for backwards compatibility in case config is not available
+MIN_CHANNEL_SIZE_SATS_FALLBACK = 1_000_000  # 1M sats fallback
 
 # Maximum expansion proposals per cycle (rate limiting)
 MAX_EXPANSIONS_PER_CYCLE = 1
@@ -106,6 +107,271 @@ class UnderservedResult:
     public_capacity_sats: int
     hive_share_pct: float
     score: float  # Higher = more attractive for expansion
+
+
+@dataclass
+class ChannelSizeResult:
+    """Result of intelligent channel sizing calculation."""
+    recommended_size_sats: int
+    factors: Dict[str, Any]
+    reasoning: str
+
+
+# =============================================================================
+# INTELLIGENT CHANNEL SIZING
+# =============================================================================
+
+class ChannelSizer:
+    """
+    Intelligent channel sizing engine for Hive expansion proposals.
+
+    Factors considered:
+    1. Target capacity - larger nodes warrant larger channels (credibility)
+    2. Hive share gap - lower share → larger channel to reach target share
+    3. Routing potential - nodes with high connectivity get larger channels
+    4. Available liquidity - don't overcommit, leave operational reserve
+    5. Economics - expected fee revenue vs capital lockup cost
+
+    The algorithm produces a weighted score that determines channel size
+    within the configured min/max bounds.
+    """
+
+    # Weight factors for each sizing component (sum to 1.0)
+    WEIGHT_TARGET_CAPACITY = 0.20  # 20% - larger targets get larger channels
+    WEIGHT_SHARE_GAP = 0.25        # 25% - underserved targets get priority
+    WEIGHT_ROUTING_POTENTIAL = 0.25  # 25% - high-connectivity nodes
+    WEIGHT_LIQUIDITY = 0.15        # 15% - available balance consideration
+    WEIGHT_ECONOMICS = 0.15        # 15% - expected ROI
+
+    # Routing potential thresholds
+    HIGH_CONNECTIVITY_CHANNELS = 50   # Node with 50+ channels = high connectivity
+    VERY_HIGH_CONNECTIVITY_CHANNELS = 200  # 200+ = major routing node
+
+    # Economic assumptions
+    EXPECTED_ANNUAL_FEE_RATE = 0.001  # 0.1% annual return on channel capacity
+    OPPORTUNITY_COST_RATE = 0.05      # 5% opportunity cost of locked capital
+
+    def __init__(self, plugin=None):
+        """Initialize the ChannelSizer."""
+        self.plugin = plugin
+
+    def _log(self, msg: str, level: str = "debug") -> None:
+        """Log a message if plugin is available."""
+        if self.plugin:
+            self.plugin.log(f"[ChannelSizer] {msg}", level=level)
+
+    def calculate_size(
+        self,
+        target: str,
+        target_capacity_sats: int,
+        target_channel_count: int,
+        hive_share_pct: float,
+        target_share_cap: float,
+        onchain_balance_sats: int,
+        min_channel_sats: int,
+        max_channel_sats: int,
+        default_channel_sats: int,
+        hive_total_capacity_sats: int = 0,
+        avg_fee_rate_ppm: int = 500,
+    ) -> ChannelSizeResult:
+        """
+        Calculate the optimal channel size for a target.
+
+        Args:
+            target: Target node pubkey
+            target_capacity_sats: Target's total public capacity
+            target_channel_count: Number of channels the target has
+            hive_share_pct: Current hive share to this target (0.0-1.0)
+            target_share_cap: Maximum share we want (e.g., 0.20 for 20%)
+            onchain_balance_sats: Available onchain balance
+            min_channel_sats: Minimum allowed channel size
+            max_channel_sats: Maximum allowed channel size
+            default_channel_sats: Default channel size (baseline)
+            hive_total_capacity_sats: Total hive capacity (for liquidity calc)
+            avg_fee_rate_ppm: Average fee rate in ppm for economic calc
+
+        Returns:
+            ChannelSizeResult with recommended size and reasoning
+        """
+        factors = {}
+
+        # =================================================================
+        # Factor 1: Target Capacity Score (0.0 to 2.0)
+        # Larger nodes warrant larger channels for credibility
+        # =================================================================
+        # Baseline: 1 BTC capacity = 1.0 score
+        # Scale logarithmically: 10 BTC = 1.5, 100 BTC = 2.0
+        import math
+        btc_capacity = target_capacity_sats / 100_000_000
+        if btc_capacity <= 0:
+            capacity_score = 0.5
+        else:
+            capacity_score = min(2.0, 0.5 + 0.5 * math.log10(max(1, btc_capacity)))
+        factors['capacity_score'] = round(capacity_score, 3)
+        factors['target_capacity_btc'] = round(btc_capacity, 2)
+
+        # =================================================================
+        # Factor 2: Share Gap Score (0.0 to 2.0)
+        # Lower current share = higher score (need to catch up)
+        # =================================================================
+        share_gap = target_share_cap - hive_share_pct
+        if share_gap <= 0:
+            # Already at or above target share
+            share_score = 0.5
+        else:
+            # Scale: 0% share = 2.0, target_share = 1.0
+            share_score = 1.0 + (share_gap / target_share_cap)
+        share_score = min(2.0, max(0.5, share_score))
+        factors['share_score'] = round(share_score, 3)
+        factors['share_gap_pct'] = round(share_gap * 100, 2)
+
+        # =================================================================
+        # Factor 3: Routing Potential Score (0.0 to 2.0)
+        # More connected nodes = better routing potential
+        # =================================================================
+        if target_channel_count >= self.VERY_HIGH_CONNECTIVITY_CHANNELS:
+            routing_score = 2.0  # Major routing hub
+        elif target_channel_count >= self.HIGH_CONNECTIVITY_CHANNELS:
+            routing_score = 1.5  # Well-connected node
+        elif target_channel_count >= 20:
+            routing_score = 1.2  # Moderately connected
+        elif target_channel_count >= 10:
+            routing_score = 1.0  # Average
+        else:
+            routing_score = 0.7  # Low connectivity (risky)
+        factors['routing_score'] = routing_score
+        factors['target_channel_count'] = target_channel_count
+
+        # =================================================================
+        # Factor 4: Liquidity Score (0.5 to 1.5)
+        # Don't overcommit - leave operational reserve
+        # =================================================================
+        # Reserve: keep at least 20% of balance for other operations
+        available_for_channel = onchain_balance_sats * 0.8
+
+        # Score based on how comfortable we are with the allocation
+        if available_for_channel >= max_channel_sats * 3:
+            liquidity_score = 1.5  # Very comfortable
+        elif available_for_channel >= max_channel_sats * 2:
+            liquidity_score = 1.3  # Comfortable
+        elif available_for_channel >= max_channel_sats:
+            liquidity_score = 1.0  # Adequate
+        elif available_for_channel >= min_channel_sats * 2:
+            liquidity_score = 0.8  # Tight
+        else:
+            liquidity_score = 0.5  # Very tight - use minimum
+        factors['liquidity_score'] = liquidity_score
+        factors['available_sats'] = int(available_for_channel)
+
+        # =================================================================
+        # Factor 5: Economics Score (0.5 to 1.5)
+        # Expected fee revenue vs capital lockup cost
+        # =================================================================
+        # Simple model: (expected_annual_fees / locked_capital) vs threshold
+        # Higher fee rate environments = larger channels make more sense
+
+        # Expected annual fee revenue per sat locked
+        fee_multiplier = avg_fee_rate_ppm / 1_000_000
+        annual_turns = 12  # Assume capital turns over ~12x per year
+        expected_annual_return = fee_multiplier * annual_turns
+
+        # ROI score
+        if expected_annual_return >= 0.02:  # 2%+ return
+            economics_score = 1.5
+        elif expected_annual_return >= 0.01:  # 1%+ return
+            economics_score = 1.2
+        elif expected_annual_return >= 0.005:  # 0.5%+ return
+            economics_score = 1.0
+        else:
+            economics_score = 0.7  # Low return environment
+        factors['economics_score'] = economics_score
+        factors['expected_annual_return_pct'] = round(expected_annual_return * 100, 2)
+        factors['avg_fee_rate_ppm'] = avg_fee_rate_ppm
+
+        # =================================================================
+        # Calculate Weighted Score
+        # =================================================================
+        weighted_score = (
+            capacity_score * self.WEIGHT_TARGET_CAPACITY +
+            share_score * self.WEIGHT_SHARE_GAP +
+            routing_score * self.WEIGHT_ROUTING_POTENTIAL +
+            liquidity_score * self.WEIGHT_LIQUIDITY +
+            economics_score * self.WEIGHT_ECONOMICS
+        )
+        factors['weighted_score'] = round(weighted_score, 3)
+
+        # =================================================================
+        # Convert Score to Channel Size
+        # =================================================================
+        # Score range: ~0.5 to ~2.0
+        # Map to channel size range: min to max
+        # Score of 1.0 = default size
+        # Score of 0.5 = min size
+        # Score of 2.0 = max size
+
+        if weighted_score <= 1.0:
+            # Below average: scale between min and default
+            ratio = (weighted_score - 0.5) / 0.5  # 0.0 to 1.0
+            size_range = default_channel_sats - min_channel_sats
+            recommended_size = min_channel_sats + int(size_range * ratio)
+        else:
+            # Above average: scale between default and max
+            ratio = (weighted_score - 1.0) / 1.0  # 0.0 to 1.0
+            size_range = max_channel_sats - default_channel_sats
+            recommended_size = default_channel_sats + int(size_range * ratio)
+
+        # =================================================================
+        # Apply Hard Limits
+        # =================================================================
+        # Never exceed available liquidity (with reserve)
+        max_from_liquidity = int(available_for_channel * 0.5)  # Max 50% of available
+        recommended_size = min(recommended_size, max_from_liquidity)
+
+        # Ensure within config bounds
+        recommended_size = max(min_channel_sats, min(recommended_size, max_channel_sats))
+
+        factors['size_before_limits'] = recommended_size
+        factors['max_from_liquidity'] = max_from_liquidity
+
+        # =================================================================
+        # Generate Reasoning
+        # =================================================================
+        reasoning_parts = []
+
+        if capacity_score >= 1.5:
+            reasoning_parts.append(f"large target ({btc_capacity:.1f} BTC)")
+        elif capacity_score <= 0.7:
+            reasoning_parts.append(f"small target ({btc_capacity:.1f} BTC)")
+
+        if share_score >= 1.5:
+            reasoning_parts.append(f"underserved ({share_gap*100:.1f}% gap)")
+
+        if routing_score >= 1.5:
+            reasoning_parts.append(f"high routing potential ({target_channel_count} channels)")
+        elif routing_score <= 0.8:
+            reasoning_parts.append(f"low connectivity ({target_channel_count} channels)")
+
+        if liquidity_score <= 0.7:
+            reasoning_parts.append("liquidity constrained")
+
+        if economics_score >= 1.3:
+            reasoning_parts.append(f"favorable economics ({expected_annual_return*100:.1f}% expected)")
+
+        if reasoning_parts:
+            reasoning = f"Size factors: {', '.join(reasoning_parts)}"
+        else:
+            reasoning = "Standard sizing applied"
+
+        self._log(
+            f"Sizing for {target[:16]}...: {recommended_size:,} sats "
+            f"(score={weighted_score:.2f}, {reasoning})"
+        )
+
+        return ChannelSizeResult(
+            recommended_size_sats=recommended_size,
+            factors=factors,
+            reasoning=reasoning
+        )
 
 
 # =============================================================================
@@ -708,6 +974,52 @@ class Planner:
             self._log(f"Error getting onchain balance: {e}", level='warn')
             return 0
 
+    def _get_target_channel_count(self, target: str) -> int:
+        """
+        Get the number of channels a target node has.
+
+        Uses the network cache to count unique channel partners.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            Number of channels the target has
+        """
+        if target not in self._network_cache:
+            return 0
+
+        # Count unique partners (each channel has source/destination)
+        partners = set()
+        for channel in self._network_cache.get(target, []):
+            # Add both ends of each channel
+            if channel.source == target:
+                partners.add(channel.destination)
+            else:
+                partners.add(channel.source)
+
+        return len(partners)
+
+    def _get_avg_fee_rate(self) -> int:
+        """
+        Get average fee rate from cl-revenue-ops if available.
+
+        Returns:
+            Average fee rate in ppm, or 500 as default
+        """
+        if not self.bridge:
+            return 500
+
+        try:
+            # Try to get policy info from bridge
+            policy = self.bridge.get_current_policy()
+            if policy and 'avg_fee_ppm' in policy:
+                return policy['avg_fee_ppm']
+        except Exception:
+            pass
+
+        return 500  # Default if unavailable
+
     def _has_pending_intent(self, target: str) -> bool:
         """
         Check if there's already a pending intent for this target.
@@ -764,7 +1076,8 @@ class Planner:
 
         # Check onchain balance
         onchain_balance = self._get_local_onchain_balance()
-        min_required = MIN_CHANNEL_SIZE_SATS * 2
+        min_channel_size = getattr(cfg, 'planner_min_channel_sats', MIN_CHANNEL_SIZE_SATS_FALLBACK)
+        min_required = min_channel_size * 2  # Need at least 2x min for fees/reserve
 
         if onchain_balance < min_required:
             self._log(
@@ -841,13 +1154,45 @@ class Planner:
 
             # Use DecisionEngine for governance decision if available
             if self.decision_engine:
-                # Build context for governance decision
+                # Calculate proposed channel size using intelligent sizing algorithm
+                default_size = getattr(cfg, 'planner_default_channel_sats', 5_000_000)
+                max_size = getattr(cfg, 'planner_max_channel_sats', 50_000_000)
+                market_share_cap = getattr(cfg, 'market_share_cap_pct', 0.20)
+
+                # Get target's channel count for routing potential calculation
+                target_channel_count = self._get_target_channel_count(selected_target.target)
+                avg_fee_rate = self._get_avg_fee_rate()
+
+                # Use intelligent channel sizer
+                sizer = ChannelSizer(plugin=self.plugin)
+                sizing_result = sizer.calculate_size(
+                    target=selected_target.target,
+                    target_capacity_sats=selected_target.public_capacity_sats,
+                    target_channel_count=target_channel_count,
+                    hive_share_pct=selected_target.hive_share_pct,
+                    target_share_cap=market_share_cap * 0.5,  # Aim for half of cap
+                    onchain_balance_sats=onchain_balance,
+                    min_channel_sats=min_channel_size,
+                    max_channel_sats=max_size,
+                    default_channel_sats=default_size,
+                    avg_fee_rate_ppm=avg_fee_rate,
+                )
+
+                proposed_size = sizing_result.recommended_size_sats
+
+                # Build context for governance decision (includes sizing factors)
                 context = {
                     'intent_id': intent.intent_id,
                     'public_capacity_sats': selected_target.public_capacity_sats,
                     'hive_share_pct': round(selected_target.hive_share_pct, 4),
                     'onchain_balance': onchain_balance,
-                    'amount_sats': MIN_CHANNEL_SIZE_SATS,  # For budget tracking
+                    'amount_sats': proposed_size,  # For budget tracking
+                    'channel_size_sats': proposed_size,  # Recommended channel size
+                    'min_channel_sats': min_channel_size,
+                    'max_channel_sats': max_size,
+                    'sizing_factors': sizing_result.factors,
+                    'sizing_reasoning': sizing_result.reasoning,
+                    'target_channel_count': target_channel_count,
                 }
 
                 # Define executor for channel_open (broadcasts intent)

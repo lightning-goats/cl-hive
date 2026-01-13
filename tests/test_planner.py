@@ -79,6 +79,10 @@ def mock_config():
     cfg = MagicMock()
     cfg.market_share_cap_pct = 0.20  # 20%
     cfg.governance_mode = 'advisor'
+    # Channel size options (new)
+    cfg.planner_min_channel_sats = 1_000_000  # 1M sats
+    cfg.planner_max_channel_sats = 50_000_000  # 50M sats
+    cfg.planner_default_channel_sats = 5_000_000  # 5M sats
     return cfg
 
 
@@ -597,10 +601,10 @@ class TestExpansionLogic:
         mock_intent_mgr = MagicMock()
         planner.intent_manager = mock_intent_mgr
 
-        # Mock insufficient funds
+        # Mock insufficient funds (50k sats < 2M required with 1M min channel size)
         mock_plugin.rpc.listfunds.return_value = {
             'outputs': [
-                {'status': 'confirmed', 'amount_msat': 50000000}  # 50k sats < 200k required
+                {'status': 'confirmed', 'amount_msat': 50000000}  # 50k sats
             ]
         }
 
@@ -625,10 +629,10 @@ class TestExpansionLogic:
         mock_intent_mgr.create_intent_message.return_value = {'intent_type': 'channel_open', 'target': target}
         planner.intent_manager = mock_intent_mgr
 
-        # Mock sufficient funds
+        # Mock sufficient funds (10M sats > 2M required with 1M min channel size)
         mock_plugin.rpc.listfunds.return_value = {
             'outputs': [
-                {'status': 'confirmed', 'amount_msat': 500000000}  # 500k sats
+                {'status': 'confirmed', 'amount_msat': 10000000000}  # 10M sats
             ]
         }
 
@@ -671,7 +675,7 @@ class TestExpansionLogic:
 
         # Mock sufficient funds
         mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
 
         # Mock underserved targets
@@ -727,7 +731,7 @@ class TestExpansionLogic:
 
         # Mock sufficient funds
         mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
 
         # Mock add_pending_action to return an action ID
@@ -797,7 +801,7 @@ class TestPlannerGovernanceIntegration:
         planner.intent_manager.create_intent.return_value = mock_intent
 
         mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
 
         from modules.planner import UnderservedResult
@@ -855,7 +859,7 @@ class TestPlannerGovernanceIntegration:
         planner.intent_manager.create_intent.return_value = mock_intent
 
         mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 500000000}]
+            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
 
         from modules.planner import UnderservedResult

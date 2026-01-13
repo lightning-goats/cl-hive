@@ -255,144 +255,333 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
 # PLUGIN OPTIONS
 # =============================================================================
 
+# Database path is NOT dynamic (immutable after init)
 plugin.add_option(
     name='hive-db-path',
     default='~/.lightning/cl_hive.db',
-    description='Path to the SQLite database for Hive state'
+    description='Path to the SQLite database for Hive state (immutable)'
 )
 
+# All other options are dynamic (hot-reloadable via `lightning-cli setconfig`)
 plugin.add_option(
     name='hive-governance-mode',
     default='advisor',
-    description='Governance mode: advisor (human approval), autonomous (auto-execute), oracle (external API)'
+    description='Governance mode: advisor (human approval), autonomous (auto-execute), oracle (external API)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-neophyte-fee-discount',
     default='0.5',
-    description='Fee discount for Neophyte members (0.5 = 50% of public rate)'
+    description='Fee discount for Neophyte members (0.5 = 50% of public rate)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-member-fee-ppm',
     default='0',
-    description='Fee charged to full Hive members (default: 0 = free)'
+    description='Fee charged to full Hive members (default: 0 = free)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-probation-days',
     default='30',
-    description='Minimum days as Neophyte before promotion eligibility'
+    description='Minimum days as Neophyte before promotion eligibility',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-vouch-threshold',
     default='0.51',
-    description='Percentage of member vouches required for promotion (0.51 = 51%)'
+    description='Percentage of member vouches required for promotion (0.51 = 51%)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-min-vouch-count',
     default='3',
-    description='Minimum number of vouches required for promotion'
+    description='Minimum number of vouches required for promotion',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-max-members',
     default='50',
-    description='Maximum Hive members (Dunbar cap for gossip efficiency)'
+    description='Maximum Hive members (Dunbar cap for gossip efficiency)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-market-share-cap',
     default='0.20',
-    description='Maximum market share per target (0.20 = 20%, anti-monopoly)'
+    description='Maximum market share per target (0.20 = 20%, anti-monopoly)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-membership-enabled',
     default='true',
-    description='Enable membership & promotion protocol (default: true)'
+    description='Enable membership & promotion protocol (default: true)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-auto-vouch',
     default='true',
-    description='Auto-vouch for eligible neophytes (default: true)'
+    description='Auto-vouch for eligible neophytes (default: true)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-auto-promote',
     default='true',
-    description='Auto-promote when quorum reached (default: true)'
+    description='Auto-promote when quorum reached (default: true)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-ban-autotrigger',
     default='false',
-    description='Auto-trigger ban proposal on sustained leeching (default: false)'
+    description='Auto-trigger ban proposal on sustained leeching (default: false)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-intent-hold-seconds',
     default='60',
-    description='Hold period before committing an Intent (conflict resolution)'
+    description='Hold period before committing an Intent (conflict resolution)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-gossip-threshold',
     default='0.10',
-    description='Capacity change threshold to trigger gossip (0.10 = 10%)'
+    description='Capacity change threshold to trigger gossip (0.10 = 10%)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-heartbeat-interval',
     default='300',
-    description='Heartbeat broadcast interval in seconds (default: 5 min)'
+    description='Heartbeat broadcast interval in seconds (default: 5 min)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-planner-interval',
     default='3600',
-    description='Planner cycle interval in seconds (default: 1 hour, minimum: 300)'
+    description='Planner cycle interval in seconds (default: 1 hour, minimum: 300)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-planner-enable-expansions',
     default='false',
-    description='Enable expansion proposals (new channel openings) in Planner'
+    description='Enable expansion proposals (new channel openings) in Planner',
+    dynamic=True
 )
 
-# VPN Transport Options
+plugin.add_option(
+    name='hive-planner-min-channel-sats',
+    default='1000000',
+    description='Minimum channel size for expansion proposals (default: 1M sats)',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-planner-max-channel-sats',
+    default='50000000',
+    description='Maximum channel size for expansion proposals (default: 50M sats)',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-planner-default-channel-sats',
+    default='5000000',
+    description='Default channel size for expansion proposals (default: 5M sats)',
+    dynamic=True
+)
+
+# VPN Transport Options (all dynamic)
 plugin.add_option(
     name='hive-transport-mode',
     default='any',
-    description='Hive transport mode: any, vpn-only, vpn-preferred'
+    description='Hive transport mode: any, vpn-only, vpn-preferred',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-vpn-subnets',
     default='',
-    description='VPN subnets for hive peers (CIDR, comma-separated). Example: 10.8.0.0/24'
+    description='VPN subnets for hive peers (CIDR, comma-separated). Example: 10.8.0.0/24',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-vpn-bind',
     default='',
-    description='VPN bind address for hive traffic (ip:port)'
+    description='VPN bind address for hive traffic (ip:port)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-vpn-peers',
     default='',
-    description='VPN peer mappings (pubkey@ip:port, comma-separated)'
+    description='VPN peer mappings (pubkey@ip:port, comma-separated)',
+    dynamic=True
 )
 
 plugin.add_option(
     name='hive-vpn-required-messages',
     default='all',
-    description='Message types requiring VPN: all, gossip, intent, sync, none'
+    description='Message types requiring VPN: all, gossip, intent, sync, none',
+    dynamic=True
 )
+
+
+# =============================================================================
+# HOT-RELOAD SUPPORT (setconfig handler)
+# =============================================================================
+
+# Mapping from plugin option names to config attribute names and types
+OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
+    'hive-governance-mode': ('governance_mode', str),
+    'hive-neophyte-fee-discount': ('neophyte_fee_discount_pct', float),
+    'hive-member-fee-ppm': ('member_fee_ppm', int),
+    'hive-probation-days': ('probation_days', int),
+    'hive-vouch-threshold': ('vouch_threshold_pct', float),
+    'hive-min-vouch-count': ('min_vouch_count', int),
+    'hive-max-members': ('max_members', int),
+    'hive-market-share-cap': ('market_share_cap_pct', float),
+    'hive-membership-enabled': ('membership_enabled', bool),
+    'hive-auto-vouch': ('auto_vouch_enabled', bool),
+    'hive-auto-promote': ('auto_promote_enabled', bool),
+    'hive-ban-autotrigger': ('ban_autotrigger_enabled', bool),
+    'hive-intent-hold-seconds': ('intent_hold_seconds', int),
+    'hive-gossip-threshold': ('gossip_threshold_pct', float),
+    'hive-heartbeat-interval': ('heartbeat_interval', int),
+    'hive-planner-interval': ('planner_interval', int),
+    'hive-planner-enable-expansions': ('planner_enable_expansions', bool),
+    'hive-planner-min-channel-sats': ('planner_min_channel_sats', int),
+    'hive-planner-max-channel-sats': ('planner_max_channel_sats', int),
+    'hive-planner-default-channel-sats': ('planner_default_channel_sats', int),
+}
+
+# VPN options require special handling (reconfigure VPN transport)
+VPN_OPTIONS = {
+    'hive-transport-mode',
+    'hive-vpn-subnets',
+    'hive-vpn-bind',
+    'hive-vpn-peers',
+    'hive-vpn-required-messages',
+}
+
+
+def _parse_setconfig_value(value: Any, target_type: type) -> Any:
+    """Parse a setconfig value to the target type."""
+    if target_type == bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() in ('true', '1', 'yes', 'on')
+    elif target_type == int:
+        return int(value)
+    elif target_type == float:
+        return float(value)
+    else:
+        return str(value)
+
+
+@plugin.subscribe("setconfig")
+def on_setconfig(plugin: Plugin, config_var: str, val: Any, **kwargs):
+    """
+    Handle dynamic configuration changes via `lightning-cli setconfig`.
+
+    This allows hot-reloading of most hive settings without restarting the node.
+
+    Example usage:
+        lightning-cli setconfig hive-governance-mode autonomous
+        lightning-cli setconfig hive-member-fee-ppm 100
+        lightning-cli setconfig hive-planner-enable-expansions true
+    """
+    global config, vpn_transport
+
+    # Check if this is a hive option
+    if not config_var.startswith('hive-'):
+        return
+
+    plugin.log(f"cl-hive: setconfig received: {config_var}={val}")
+
+    # Reject changes to immutable options
+    if config_var == 'hive-db-path':
+        plugin.log(f"cl-hive: Cannot change immutable option {config_var} at runtime", level='warn')
+        return
+
+    # Handle VPN options (special case - reconfigure VPN transport)
+    if config_var in VPN_OPTIONS:
+        if vpn_transport is not None:
+            # Get current VPN config and update the changed option
+            current_mode = plugin.get_option('hive-transport-mode')
+            current_subnets = plugin.get_option('hive-vpn-subnets')
+            current_bind = plugin.get_option('hive-vpn-bind')
+            current_peers = plugin.get_option('hive-vpn-peers')
+            current_required = plugin.get_option('hive-vpn-required-messages')
+
+            # Override the changed option
+            if config_var == 'hive-transport-mode':
+                current_mode = val
+            elif config_var == 'hive-vpn-subnets':
+                current_subnets = val
+            elif config_var == 'hive-vpn-bind':
+                current_bind = val
+            elif config_var == 'hive-vpn-peers':
+                current_peers = val
+            elif config_var == 'hive-vpn-required-messages':
+                current_required = val
+
+            # Reconfigure VPN transport
+            vpn_result = vpn_transport.configure(
+                mode=current_mode,
+                vpn_subnets=current_subnets,
+                vpn_bind=current_bind,
+                vpn_peers=current_peers,
+                required_messages=current_required
+            )
+            plugin.log(f"cl-hive: VPN transport reconfigured - mode={vpn_result['mode']}")
+        return
+
+    # Handle standard config options
+    if config_var in OPTION_TO_CONFIG_MAP:
+        attr_name, attr_type = OPTION_TO_CONFIG_MAP[config_var]
+
+        try:
+            # Parse the value to the correct type
+            parsed_value = _parse_setconfig_value(val, attr_type)
+
+            # Update the config
+            old_value = getattr(config, attr_name, None)
+            setattr(config, attr_name, parsed_value)
+
+            # Increment config version for snapshot detection
+            config._version += 1
+
+            plugin.log(
+                f"cl-hive: Config updated: {attr_name} = {parsed_value} "
+                f"(was: {old_value}, version: {config._version})"
+            )
+
+            # Validate the new config
+            validation_error = config.validate()
+            if validation_error:
+                # Revert the change
+                setattr(config, attr_name, old_value)
+                config._version -= 1
+                plugin.log(f"cl-hive: Config change reverted - {validation_error}", level='warn')
+
+        except (ValueError, TypeError) as e:
+            plugin.log(f"cl-hive: Failed to parse {config_var}={val}: {e}", level='warn')
+    else:
+        plugin.log(f"cl-hive: Unknown config option: {config_var}", level='debug')
 
 
 # =============================================================================
@@ -439,6 +628,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         heartbeat_interval=int(options.get('hive-heartbeat-interval', '300')),
         planner_interval=int(options.get('hive-planner-interval', '3600')),
         planner_enable_expansions=_parse_bool(options.get('hive-planner-enable-expansions', 'false')),
+        planner_min_channel_sats=int(options.get('hive-planner-min-channel-sats', '1000000')),
+        planner_max_channel_sats=int(options.get('hive-planner-max-channel-sats', '50000000')),
+        planner_default_channel_sats=int(options.get('hive-planner-default-channel-sats', '5000000')),
     )
     
     # Initialize database
@@ -2147,18 +2339,18 @@ def planner_loop():
 def hive_status(plugin: Plugin):
     """
     Get current Hive status and membership info.
-    
+
     Returns:
         Dict with hive state, member count, governance mode, etc.
     """
     if not database:
         return {"error": "Hive not initialized"}
-    
+
     members = database.get_all_members()
     member_count = len([m for m in members if m['tier'] == 'member'])
     neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
     admin_count = len([m for m in members if m['tier'] == 'admin'])
-    
+
     return {
         "status": "active" if members else "genesis_required",
         "governance_mode": config.governance_mode if config else "unknown",
@@ -2173,6 +2365,66 @@ def hive_status(plugin: Plugin):
             "market_share_cap": config.market_share_cap_pct if config else 0.20,
         },
         "version": "0.1.0-dev",
+    }
+
+
+@plugin.method("hive-config")
+def hive_config(plugin: Plugin):
+    """
+    Get current Hive configuration values.
+
+    Shows all config options and their current values. Useful for verifying
+    hot-reload changes made via `lightning-cli setconfig`.
+
+    Example:
+        lightning-cli hive-config
+
+    Returns:
+        Dict with all current config values and metadata.
+    """
+    if not config:
+        return {"error": "Hive not initialized"}
+
+    return {
+        "config_version": config._version,
+        "hot_reload_enabled": True,
+        "immutable": {
+            "db_path": config.db_path,
+        },
+        "governance": {
+            "governance_mode": config.governance_mode,
+            "autonomous_budget_per_day": config.autonomous_budget_per_day,
+            "autonomous_actions_per_hour": config.autonomous_actions_per_hour,
+            "oracle_url": config.oracle_url,
+            "oracle_timeout_seconds": config.oracle_timeout_seconds,
+        },
+        "membership": {
+            "membership_enabled": config.membership_enabled,
+            "auto_vouch_enabled": config.auto_vouch_enabled,
+            "auto_promote_enabled": config.auto_promote_enabled,
+            "ban_autotrigger_enabled": config.ban_autotrigger_enabled,
+            "neophyte_fee_discount_pct": config.neophyte_fee_discount_pct,
+            "member_fee_ppm": config.member_fee_ppm,
+            "probation_days": config.probation_days,
+            "vouch_threshold_pct": config.vouch_threshold_pct,
+            "min_vouch_count": config.min_vouch_count,
+            "max_members": config.max_members,
+        },
+        "protocol": {
+            "market_share_cap_pct": config.market_share_cap_pct,
+            "intent_hold_seconds": config.intent_hold_seconds,
+            "intent_expire_seconds": config.intent_expire_seconds,
+            "gossip_threshold_pct": config.gossip_threshold_pct,
+            "heartbeat_interval": config.heartbeat_interval,
+        },
+        "planner": {
+            "planner_interval": config.planner_interval,
+            "planner_enable_expansions": config.planner_enable_expansions,
+            "planner_min_channel_sats": config.planner_min_channel_sats,
+            "planner_max_channel_sats": config.planner_max_channel_sats,
+            "planner_default_channel_sats": config.planner_default_channel_sats,
+        },
+        "vpn": vpn_transport.get_status() if vpn_transport else {"enabled": False},
     }
 
 
@@ -2676,20 +2928,24 @@ def hive_approve_action(plugin: Plugin, action_id: int):
 
     # Execute based on action type
     if action_type == 'channel_open':
-        # Get the intent and broadcast it
-        intent_id = payload.get('intent_id')
-        if not intent_id:
-            return {"error": "Missing intent_id in action payload", "action_id": action_id}
+        # Extract channel details from payload
+        target = payload.get('target')
+        context = payload.get('context', {})
+        intent_id = context.get('intent_id')
+        channel_size_sats = context.get('channel_size_sats', context.get('amount_sats', 1_000_000))
 
-        # Get intent from database
-        intent_record = database.get_intent_by_id(intent_id)
-        if not intent_record:
-            return {"error": "Intent not found", "intent_id": intent_id}
+        if not target:
+            return {"error": "Missing target in action payload", "action_id": action_id}
 
-        # Broadcast the intent to all members
-        if intent_mgr:
+        # Get intent from database (if available)
+        intent_record = None
+        if intent_id and database:
+            intent_record = database.get_intent_by_id(intent_id)
+
+        # Step 1: Broadcast the intent to all hive members (coordination)
+        broadcast_count = 0
+        if intent_mgr and intent_record:
             try:
-                # Create an intent object for broadcasting
                 from modules.intent_manager import Intent
                 intent = Intent(
                     intent_id=intent_record['id'],
@@ -2706,7 +2962,6 @@ def hive_approve_action(plugin: Plugin, action_id: int):
                 msg = serialize(HiveMessageType.INTENT, intent_payload)
                 members = database.get_all_members()
 
-                broadcast_count = 0
                 for member in members:
                     member_id = member.get('peer_id')
                     if not member_id or member_id == our_pubkey:
@@ -2720,20 +2975,83 @@ def hive_approve_action(plugin: Plugin, action_id: int):
                     except Exception:
                         pass
 
-                plugin.log(f"cl-hive: Approved action {action_id}, broadcast intent to {broadcast_count} peers")
+                plugin.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members")
 
             except Exception as e:
-                return {"error": f"Failed to broadcast intent: {e}", "action_id": action_id}
+                plugin.log(f"cl-hive: Intent broadcast failed: {e}", level='warn')
 
-        # Update action status
-        database.update_action_status(action_id, 'approved')
+        # Step 2: Connect to target if not already connected
+        try:
+            # Check if already connected
+            peers = safe_plugin.rpc.listpeers(target)
+            if not peers.get('peers'):
+                # Try to connect (will fail if no address known, but that's OK)
+                try:
+                    safe_plugin.rpc.connect(target)
+                    plugin.log(f"cl-hive: Connected to {target[:16]}...")
+                except Exception as conn_err:
+                    plugin.log(f"cl-hive: Could not connect to {target[:16]}...: {conn_err}", level='warn')
+                    # Continue anyway - fundchannel might still work if peer connects to us
+        except Exception:
+            pass
 
-        return {
-            "status": "approved",
-            "action_id": action_id,
-            "action_type": action_type,
-            "target": payload.get('target'),
-        }
+        # Step 3: Execute fundchannel to actually open the channel
+        try:
+            plugin.log(
+                f"cl-hive: Opening channel to {target[:16]}... "
+                f"for {channel_size_sats:,} sats"
+            )
+
+            # fundchannel with the calculated size
+            result = safe_plugin.rpc.fundchannel(
+                id=target,
+                amount=channel_size_sats,
+                announce=True  # Public channel
+            )
+
+            channel_id = result.get('channel_id', 'unknown')
+            txid = result.get('txid', 'unknown')
+
+            plugin.log(
+                f"cl-hive: Channel opened! txid={txid[:16]}... "
+                f"channel_id={channel_id}"
+            )
+
+            # Update intent status if we have one
+            if intent_id and database:
+                database.update_intent_status(intent_id, 'committed')
+
+            # Update action status
+            database.update_action_status(action_id, 'executed')
+
+            return {
+                "status": "executed",
+                "action_id": action_id,
+                "action_type": action_type,
+                "target": target,
+                "channel_size_sats": channel_size_sats,
+                "channel_id": channel_id,
+                "txid": txid,
+                "broadcast_count": broadcast_count,
+                "sizing_reasoning": context.get('sizing_reasoning', 'N/A'),
+            }
+
+        except Exception as e:
+            error_msg = str(e)
+            plugin.log(f"cl-hive: fundchannel failed: {error_msg}", level='error')
+
+            # Update action status to failed
+            database.update_action_status(action_id, 'failed')
+
+            return {
+                "status": "failed",
+                "action_id": action_id,
+                "action_type": action_type,
+                "target": target,
+                "channel_size_sats": channel_size_sats,
+                "error": error_msg,
+                "broadcast_count": broadcast_count,
+            }
 
     else:
         # Unknown action type - just mark as approved

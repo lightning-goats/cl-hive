@@ -40,6 +40,9 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'heartbeat_interval': int,
     'planner_interval': int,
     'planner_enable_expansions': bool,
+    'planner_min_channel_sats': int,
+    'planner_max_channel_sats': int,
+    'planner_default_channel_sats': int,
     # Governance (Phase 7)
     'autonomous_budget_per_day': int,
     'autonomous_actions_per_hour': int,
@@ -61,6 +64,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'gossip_threshold_pct': (0.01, 0.5),
     'heartbeat_interval': (60, 3600),
     'planner_interval': (300, 86400),  # Min 5 minutes, max 24 hours
+    'planner_min_channel_sats': (100_000, 100_000_000),  # 100k to 100M sats
+    'planner_max_channel_sats': (1_000_000, 1_000_000_000),  # 1M to 1B sats (10 BTC)
+    'planner_default_channel_sats': (100_000, 500_000_000),  # 100k to 500M sats (5 BTC)
     # Governance (Phase 7)
     'autonomous_budget_per_day': (100_000, 100_000_000),  # 100k to 100M sats
     'autonomous_actions_per_hour': (1, 10),  # 1 to 10 actions per hour
@@ -115,6 +121,9 @@ class HiveConfig:
     # Planner (Phase 6)
     planner_interval: int = 3600               # 1 hour between planner cycles
     planner_enable_expansions: bool = False    # Disabled by default (safety)
+    planner_min_channel_sats: int = 1_000_000  # 1M sats minimum channel size
+    planner_max_channel_sats: int = 50_000_000  # 50M sats maximum channel size
+    planner_default_channel_sats: int = 5_000_000  # 5M sats default channel size
 
     # Governance (Phase 7)
     autonomous_budget_per_day: int = 10_000_000  # 10M sats daily budget
@@ -182,6 +191,9 @@ class HiveConfigSnapshot:
     heartbeat_interval: int
     planner_interval: int
     planner_enable_expansions: bool
+    planner_min_channel_sats: int
+    planner_max_channel_sats: int
+    planner_default_channel_sats: int
     # Governance (Phase 7)
     autonomous_budget_per_day: int
     autonomous_actions_per_hour: int
@@ -212,6 +224,9 @@ class HiveConfigSnapshot:
             heartbeat_interval=config.heartbeat_interval,
             planner_interval=config.planner_interval,
             planner_enable_expansions=config.planner_enable_expansions,
+            planner_min_channel_sats=config.planner_min_channel_sats,
+            planner_max_channel_sats=config.planner_max_channel_sats,
+            planner_default_channel_sats=config.planner_default_channel_sats,
             autonomous_budget_per_day=config.autonomous_budget_per_day,
             autonomous_actions_per_hour=config.autonomous_actions_per_hour,
             oracle_url=config.oracle_url,
