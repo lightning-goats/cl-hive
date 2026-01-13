@@ -14,6 +14,8 @@ This package contains the core modules for the Hive swarm intelligence layer:
 - membership: Two-tier membership system (Phase 5)
 - contribution: Contribution ratio tracking (Phase 5)
 - planner: Topology optimization (Phase 6)
+- quality_scorer: Peer quality scoring (Phase 6.2)
+- cooperative_expansion: Coordinated channel opening (Phase 6.4)
 - governance: Decision engine modes (Phase 7)
 - vpn_transport: VPN-based transport policy for hive gossip
 """

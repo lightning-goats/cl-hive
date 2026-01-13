@@ -310,7 +310,79 @@ class HiveDatabase:
                 details TEXT
             )
         """)
-        
+
+        # =====================================================================
+        # PEER EVENTS TABLE (Phase 6.1 - Topology Intelligence)
+        # =====================================================================
+        # Stores PEER_AVAILABLE events for quality metrics and topology decisions
+        # Events include channel opens, closes, and quality reports from hive members
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                reporter_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                channel_id TEXT,
+                capacity_sats INTEGER DEFAULT 0,
+                duration_days INTEGER DEFAULT 0,
+                total_revenue_sats INTEGER DEFAULT 0,
+                total_rebalance_cost_sats INTEGER DEFAULT 0,
+                net_pnl_sats INTEGER DEFAULT 0,
+                forward_count INTEGER DEFAULT 0,
+                forward_volume_sats INTEGER DEFAULT 0,
+                our_fee_ppm INTEGER DEFAULT 0,
+                their_fee_ppm INTEGER DEFAULT 0,
+                routing_score REAL DEFAULT 0.5,
+                profitability_score REAL DEFAULT 0.5,
+                our_funding_sats INTEGER DEFAULT 0,
+                their_funding_sats INTEGER DEFAULT 0,
+                opener TEXT,
+                closer TEXT,
+                reason TEXT
+            )
+        """)
+
+        # Index for querying events by peer
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_peer_events_peer_ts
+            ON peer_events(peer_id, timestamp DESC)
+        """)
+
+        # Index for querying events by type
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_peer_events_type_ts
+            ON peer_events(event_type, timestamp DESC)
+        """)
+
+        # Index for querying events by reporter (hive member)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_peer_events_reporter
+            ON peer_events(reporter_id, timestamp DESC)
+        """)
+
+        # =====================================================================
+        # BUDGET TRACKING TABLE (Phase 6 - Autonomous Mode Limits)
+        # =====================================================================
+        # Tracks daily spending for autonomous mode budget enforcement
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS budget_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date_key TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                target TEXT,
+                action_id INTEGER,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+
+        # Index for querying budget by date
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_budget_date_key
+            ON budget_tracking(date_key)
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -1291,3 +1363,421 @@ class HiveDatabase:
             WHERE status != 'pending' AND proposed_at < ?
         """, (cutoff,))
         return result.rowcount
+
+    # =========================================================================
+    # PEER EVENTS (Phase 6.1 - Topology Intelligence)
+    # =========================================================================
+
+    def store_peer_event(self, peer_id: str, reporter_id: str, event_type: str,
+                         timestamp: int, channel_id: str = None,
+                         capacity_sats: int = 0, duration_days: int = 0,
+                         total_revenue_sats: int = 0, total_rebalance_cost_sats: int = 0,
+                         net_pnl_sats: int = 0, forward_count: int = 0,
+                         forward_volume_sats: int = 0, our_fee_ppm: int = 0,
+                         their_fee_ppm: int = 0, routing_score: float = 0.5,
+                         profitability_score: float = 0.5, our_funding_sats: int = 0,
+                         their_funding_sats: int = 0, opener: str = None,
+                         closer: str = None, reason: str = None) -> int:
+        """
+        Store a peer event from a PEER_AVAILABLE message.
+
+        These events are used for:
+        - Calculating peer quality scores (routing, profitability, stability)
+        - Informing topology decisions (which peers to expand to)
+        - Tracking channel lifecycle across the hive
+
+        Args:
+            peer_id: External peer involved in the event
+            reporter_id: Hive member reporting the event
+            event_type: Type of event (channel_open, remote_close, etc.)
+            timestamp: Unix timestamp of the event
+            channel_id: Channel short ID (if applicable)
+            capacity_sats: Channel capacity
+            duration_days: How long channel was open (for closes)
+            total_revenue_sats: Routing fees earned
+            total_rebalance_cost_sats: Rebalancing costs
+            net_pnl_sats: Net profit/loss
+            forward_count: Number of forwards routed
+            forward_volume_sats: Total volume routed
+            our_fee_ppm: Fee rate we charged
+            their_fee_ppm: Fee rate they charged us
+            routing_score: Routing quality score (0-1)
+            profitability_score: Profitability score (0-1)
+            our_funding_sats: Amount we funded (for opens)
+            their_funding_sats: Amount they funded (for opens)
+            opener: Who opened (local/remote)
+            closer: Who closed (local/remote/mutual)
+            reason: Human-readable reason
+
+        Returns:
+            ID of the inserted event, or -1 on failure
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute("""
+                INSERT INTO peer_events (
+                    peer_id, reporter_id, event_type, timestamp, channel_id,
+                    capacity_sats, duration_days, total_revenue_sats,
+                    total_rebalance_cost_sats, net_pnl_sats, forward_count,
+                    forward_volume_sats, our_fee_ppm, their_fee_ppm,
+                    routing_score, profitability_score, our_funding_sats,
+                    their_funding_sats, opener, closer, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                peer_id, reporter_id, event_type, timestamp, channel_id,
+                capacity_sats, duration_days, total_revenue_sats,
+                total_rebalance_cost_sats, net_pnl_sats, forward_count,
+                forward_volume_sats, our_fee_ppm, their_fee_ppm,
+                routing_score, profitability_score, our_funding_sats,
+                their_funding_sats, opener, closer, reason
+            ))
+            event_id = cursor.lastrowid
+            self.plugin.log(
+                f"Stored peer event: {event_type} for {peer_id[:16]}... "
+                f"from {reporter_id[:16]}... (id={event_id})",
+                level='debug'
+            )
+            return event_id
+        except Exception as e:
+            self.plugin.log(f"Failed to store peer event: {e}", level='error')
+            return -1
+
+    def get_peer_events(self, peer_id: str = None, event_type: str = None,
+                        reporter_id: str = None, days: int = 90,
+                        limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Query peer events with optional filters.
+
+        Args:
+            peer_id: Filter by external peer (optional)
+            event_type: Filter by event type (optional)
+            reporter_id: Filter by reporting hive member (optional)
+            days: Only include events from last N days (default: 90)
+            limit: Maximum number of events to return (default: 500)
+
+        Returns:
+            List of event dictionaries, ordered by timestamp descending
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days * 86400)
+
+        query = "SELECT * FROM peer_events WHERE timestamp > ?"
+        params = [cutoff]
+
+        if peer_id:
+            query += " AND peer_id = ?"
+            params.append(peer_id)
+        if event_type:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        if reporter_id:
+            query += " AND reporter_id = ?"
+            params.append(reporter_id)
+
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_peer_event_summary(self, peer_id: str, days: int = 90) -> Dict[str, Any]:
+        """
+        Get aggregated event statistics for a peer.
+
+        Useful for calculating quality scores and making topology decisions.
+
+        Args:
+            peer_id: The external peer to summarize
+            days: Only include events from last N days (default: 90)
+
+        Returns:
+            Dict with aggregated statistics:
+            - event_count: Total number of events
+            - open_count: Number of channel opens
+            - close_count: Number of channel closes
+            - remote_close_count: Closes initiated by remote
+            - local_close_count: Closes initiated by local
+            - mutual_close_count: Mutual closes
+            - total_revenue_sats: Sum of revenue across all closes
+            - total_rebalance_cost_sats: Sum of rebalance costs
+            - total_net_pnl_sats: Sum of net P&L
+            - total_forward_count: Sum of forwards
+            - avg_routing_score: Average routing score
+            - avg_profitability_score: Average profitability score
+            - avg_duration_days: Average channel duration
+            - reporters: List of unique hive members who reported
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days * 86400)
+
+        # Get all events for this peer
+        rows = conn.execute("""
+            SELECT * FROM peer_events
+            WHERE peer_id = ? AND timestamp > ?
+            ORDER BY timestamp DESC
+        """, (peer_id, cutoff)).fetchall()
+
+        events = [dict(row) for row in rows]
+
+        if not events:
+            return {
+                "peer_id": peer_id,
+                "event_count": 0,
+                "open_count": 0,
+                "close_count": 0,
+                "remote_close_count": 0,
+                "local_close_count": 0,
+                "mutual_close_count": 0,
+                "total_revenue_sats": 0,
+                "total_rebalance_cost_sats": 0,
+                "total_net_pnl_sats": 0,
+                "total_forward_count": 0,
+                "avg_routing_score": 0.5,
+                "avg_profitability_score": 0.5,
+                "avg_duration_days": 0,
+                "reporters": []
+            }
+
+        # Aggregate statistics
+        open_events = [e for e in events if e['event_type'] == 'channel_open']
+        close_events = [e for e in events if e['event_type'].endswith('_close')]
+        remote_closes = [e for e in close_events if e.get('closer') == 'remote']
+        local_closes = [e for e in close_events if e.get('closer') == 'local']
+        mutual_closes = [e for e in close_events if e.get('closer') == 'mutual']
+
+        total_revenue = sum(e.get('total_revenue_sats', 0) for e in close_events)
+        total_rebalance = sum(e.get('total_rebalance_cost_sats', 0) for e in close_events)
+        total_pnl = sum(e.get('net_pnl_sats', 0) for e in close_events)
+        total_forwards = sum(e.get('forward_count', 0) for e in close_events)
+
+        routing_scores = [e.get('routing_score', 0.5) for e in events if e.get('routing_score')]
+        profit_scores = [e.get('profitability_score', 0.5) for e in events if e.get('profitability_score')]
+        durations = [e.get('duration_days', 0) for e in close_events if e.get('duration_days')]
+
+        reporters = list(set(e['reporter_id'] for e in events))
+
+        return {
+            "peer_id": peer_id,
+            "event_count": len(events),
+            "open_count": len(open_events),
+            "close_count": len(close_events),
+            "remote_close_count": len(remote_closes),
+            "local_close_count": len(local_closes),
+            "mutual_close_count": len(mutual_closes),
+            "total_revenue_sats": total_revenue,
+            "total_rebalance_cost_sats": total_rebalance,
+            "total_net_pnl_sats": total_pnl,
+            "total_forward_count": total_forwards,
+            "avg_routing_score": sum(routing_scores) / len(routing_scores) if routing_scores else 0.5,
+            "avg_profitability_score": sum(profit_scores) / len(profit_scores) if profit_scores else 0.5,
+            "avg_duration_days": sum(durations) / len(durations) if durations else 0,
+            "reporters": reporters
+        }
+
+    def get_recent_channel_events(self, event_types: List[str] = None,
+                                   days: int = 7, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get recent channel events across all peers.
+
+        Useful for topology monitoring and cooperative expansion decisions.
+
+        Args:
+            event_types: Filter by event types (default: all)
+            days: Only include events from last N days (default: 7)
+            limit: Maximum number of events (default: 100)
+
+        Returns:
+            List of recent events with peer summaries
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days * 86400)
+
+        if event_types:
+            placeholders = ','.join('?' * len(event_types))
+            query = f"""
+                SELECT * FROM peer_events
+                WHERE timestamp > ? AND event_type IN ({placeholders})
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            params = [cutoff] + event_types + [limit]
+        else:
+            query = """
+                SELECT * FROM peer_events
+                WHERE timestamp > ?
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            params = [cutoff, limit]
+
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_peers_with_events(self, days: int = 90) -> List[str]:
+        """
+        Get list of all external peers that have event history.
+
+        Args:
+            days: Only include peers with events in last N days
+
+        Returns:
+            List of peer_id strings
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days * 86400)
+
+        rows = conn.execute("""
+            SELECT DISTINCT peer_id FROM peer_events
+            WHERE timestamp > ?
+        """, (cutoff,)).fetchall()
+
+        return [row['peer_id'] for row in rows]
+
+    def prune_peer_events(self, older_than_days: int = 180) -> int:
+        """
+        Remove peer events older than specified days.
+
+        Keeps database size manageable while retaining useful history.
+
+        Args:
+            older_than_days: Delete events older than this (default: 180)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        result = conn.execute(
+            "DELETE FROM peer_events WHERE timestamp < ?",
+            (cutoff,)
+        )
+        deleted = result.rowcount
+        if deleted > 0:
+            self.plugin.log(f"Pruned {deleted} old peer events", level='info')
+        return deleted
+
+    # =========================================================================
+    # BUDGET TRACKING
+    # =========================================================================
+
+    def get_today_date_key(self) -> str:
+        """Get today's date key in YYYY-MM-DD format (UTC)."""
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    def record_budget_spend(self, action_type: str, amount_sats: int,
+                            target: str = None, action_id: int = None) -> bool:
+        """
+        Record a budget expenditure for tracking.
+
+        Args:
+            action_type: Type of action (channel_open, etc.)
+            amount_sats: Amount spent in satoshis
+            target: Optional target peer ID
+            action_id: Optional action ID reference
+
+        Returns:
+            True if recorded successfully
+        """
+        conn = self._get_connection()
+        date_key = self.get_today_date_key()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO budget_tracking
+                (date_key, action_type, amount_sats, target, action_id, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (date_key, action_type, amount_sats, target, action_id, now))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Failed to record budget spend: {e}", level='error')
+            return False
+
+    def get_daily_spend(self, date_key: str = None) -> int:
+        """
+        Get total spending for a given day.
+
+        Args:
+            date_key: Date in YYYY-MM-DD format (default: today)
+
+        Returns:
+            Total satoshis spent on that day
+        """
+        conn = self._get_connection()
+        if date_key is None:
+            date_key = self.get_today_date_key()
+
+        result = conn.execute("""
+            SELECT COALESCE(SUM(amount_sats), 0) as total
+            FROM budget_tracking WHERE date_key = ?
+        """, (date_key,)).fetchone()
+
+        return result['total'] if result else 0
+
+    def get_available_budget(self, daily_budget: int) -> int:
+        """
+        Get available budget for today.
+
+        Args:
+            daily_budget: Configured daily budget in satoshis
+
+        Returns:
+            Available budget (daily_budget - spent today)
+        """
+        spent_today = self.get_daily_spend()
+        available = max(0, daily_budget - spent_today)
+        return available
+
+    def get_budget_summary(self, daily_budget: int, days: int = 7) -> Dict[str, Any]:
+        """
+        Get budget summary for the past N days.
+
+        Args:
+            daily_budget: Configured daily budget
+            days: Number of days to include (default: 7)
+
+        Returns:
+            Dict with budget summary info
+        """
+        conn = self._get_connection()
+        from datetime import datetime, timezone, timedelta
+
+        # Get spending for past N days
+        today = datetime.now(timezone.utc)
+        daily_spending = []
+
+        for i in range(days):
+            day = today - timedelta(days=i)
+            date_key = day.strftime('%Y-%m-%d')
+            spent = self.get_daily_spend(date_key)
+            daily_spending.append({
+                'date': date_key,
+                'spent_sats': spent,
+                'budget_sats': daily_budget,
+                'utilization_pct': round((spent / daily_budget) * 100, 1) if daily_budget > 0 else 0
+            })
+
+        # Get today's details
+        today_key = self.get_today_date_key()
+        today_spent = self.get_daily_spend(today_key)
+        available = max(0, daily_budget - today_spent)
+
+        # Get action breakdown for today
+        rows = conn.execute("""
+            SELECT action_type, COUNT(*) as count, SUM(amount_sats) as total
+            FROM budget_tracking WHERE date_key = ?
+            GROUP BY action_type
+        """, (today_key,)).fetchall()
+        action_breakdown = {row['action_type']: {'count': row['count'], 'total': row['total']}
+                          for row in rows}
+
+        return {
+            'today': {
+                'date': today_key,
+                'daily_budget_sats': daily_budget,
+                'spent_sats': today_spent,
+                'available_sats': available,
+                'utilization_pct': round((today_spent / daily_budget) * 100, 1) if daily_budget > 0 else 0
+            },
+            'action_breakdown': action_breakdown,
+            'history': daily_spending
+        }

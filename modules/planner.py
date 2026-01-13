@@ -47,6 +47,12 @@ except ImportError:
     def serialize(msg_type, payload):
         return b''
 
+try:
+    from modules.quality_scorer import PeerQualityScorer
+except ImportError:
+    # For testing without quality_scorer
+    PeerQualityScorer = None
+
 
 # =============================================================================
 # CONSTANTS
@@ -73,6 +79,10 @@ MIN_CHANNEL_SIZE_SATS_FALLBACK = 1_000_000  # 1M sats fallback
 
 # Maximum expansion proposals per cycle (rate limiting)
 MAX_EXPANSIONS_PER_CYCLE = 1
+
+# Quality scoring thresholds (Phase 6.2)
+MIN_QUALITY_SCORE = 0.45  # Minimum quality score for expansion
+QUALITY_SCORE_DAYS = 90   # Days of history to consider for quality scoring
 
 
 # =============================================================================
@@ -107,6 +117,9 @@ class UnderservedResult:
     public_capacity_sats: int
     hive_share_pct: float
     score: float  # Higher = more attractive for expansion
+    quality_score: float = 0.5  # Peer quality score (Phase 6.2)
+    quality_confidence: float = 0.0  # Confidence in quality score
+    quality_recommendation: str = "neutral"  # Quality recommendation
 
 
 @dataclass
@@ -131,17 +144,20 @@ class ChannelSizer:
     3. Routing potential - nodes with high connectivity get larger channels
     4. Available liquidity - don't overcommit, leave operational reserve
     5. Economics - expected fee revenue vs capital lockup cost
+    6. Quality score - peer reliability based on historical hive data (Phase 6.3)
 
     The algorithm produces a weighted score that determines channel size
     within the configured min/max bounds.
     """
 
     # Weight factors for each sizing component (sum to 1.0)
-    WEIGHT_TARGET_CAPACITY = 0.20  # 20% - larger targets get larger channels
-    WEIGHT_SHARE_GAP = 0.25        # 25% - underserved targets get priority
-    WEIGHT_ROUTING_POTENTIAL = 0.25  # 25% - high-connectivity nodes
+    # Phase 6.3: Redistributed to include quality factor
+    WEIGHT_TARGET_CAPACITY = 0.15  # 15% - larger targets get larger channels
+    WEIGHT_SHARE_GAP = 0.20        # 20% - underserved targets get priority
+    WEIGHT_ROUTING_POTENTIAL = 0.20  # 20% - high-connectivity nodes
     WEIGHT_LIQUIDITY = 0.15        # 15% - available balance consideration
-    WEIGHT_ECONOMICS = 0.15        # 15% - expected ROI
+    WEIGHT_ECONOMICS = 0.10        # 10% - expected ROI
+    WEIGHT_QUALITY = 0.20          # 20% - peer quality score (Phase 6.3)
 
     # Routing potential thresholds
     HIGH_CONNECTIVITY_CHANNELS = 50   # Node with 50+ channels = high connectivity
@@ -151,9 +167,22 @@ class ChannelSizer:
     EXPECTED_ANNUAL_FEE_RATE = 0.001  # 0.1% annual return on channel capacity
     OPPORTUNITY_COST_RATE = 0.05      # 5% opportunity cost of locked capital
 
-    def __init__(self, plugin=None):
-        """Initialize the ChannelSizer."""
+    # Quality score thresholds (Phase 6.3)
+    QUALITY_EXCELLENT_THRESHOLD = 0.75  # Excellent quality - bonus sizing
+    QUALITY_GOOD_THRESHOLD = 0.55       # Good quality - normal sizing
+    QUALITY_NEUTRAL_THRESHOLD = 0.40    # Neutral - slightly reduced
+    # Below NEUTRAL = caution - significantly reduced
+
+    def __init__(self, plugin=None, quality_scorer=None):
+        """
+        Initialize the ChannelSizer.
+
+        Args:
+            plugin: Plugin instance for logging
+            quality_scorer: PeerQualityScorer instance for quality lookups (Phase 6.3)
+        """
         self.plugin = plugin
+        self.quality_scorer = quality_scorer
 
     def _log(self, msg: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
@@ -173,6 +202,10 @@ class ChannelSizer:
         default_channel_sats: int,
         hive_total_capacity_sats: int = 0,
         avg_fee_rate_ppm: int = 500,
+        quality_score: float = None,
+        quality_confidence: float = 0.0,
+        quality_recommendation: str = "neutral",
+        available_budget_sats: int = None,
     ) -> ChannelSizeResult:
         """
         Calculate the optimal channel size for a target.
@@ -189,11 +222,28 @@ class ChannelSizer:
             default_channel_sats: Default channel size (baseline)
             hive_total_capacity_sats: Total hive capacity (for liquidity calc)
             avg_fee_rate_ppm: Average fee rate in ppm for economic calc
+            quality_score: Peer quality score 0-1 (Phase 6.3, optional)
+            quality_confidence: Confidence in quality score 0-1 (Phase 6.3)
+            quality_recommendation: Quality recommendation string (Phase 6.3)
+            available_budget_sats: Available budget for channel opens (optional)
+                If provided, caps the channel size to stay within budget.
 
         Returns:
             ChannelSizeResult with recommended size and reasoning
         """
         factors = {}
+
+        # Phase 6.3: Lookup quality if not provided and scorer is available
+        if quality_score is None and self.quality_scorer:
+            quality_result = self.quality_scorer.calculate_score(target)
+            quality_score = quality_result.overall_score
+            quality_confidence = quality_result.confidence
+            quality_recommendation = quality_result.recommendation
+        elif quality_score is None:
+            # Default to neutral if no quality data
+            quality_score = 0.5
+            quality_confidence = 0.0
+            quality_recommendation = "neutral"
 
         # =================================================================
         # Factor 1: Target Capacity Score (0.0 to 2.0)
@@ -289,6 +339,47 @@ class ChannelSizer:
         factors['avg_fee_rate_ppm'] = avg_fee_rate_ppm
 
         # =================================================================
+        # Factor 6: Quality Score (0.5 to 2.0) - Phase 6.3
+        # Higher quality peers get larger channels
+        # =================================================================
+        # Quality score ranges from 0 to 1, we map to 0.5 to 2.0
+        # - Excellent (>0.75): 1.5 to 2.0 - larger channels
+        # - Good (0.55-0.75): 1.0 to 1.5 - normal to bonus
+        # - Neutral (0.40-0.55): 0.8 to 1.0 - slightly reduced
+        # - Caution (<0.40): 0.5 to 0.8 - significantly reduced
+
+        if quality_confidence < 0.3:
+            # Low confidence - use neutral scoring
+            quality_factor = 1.0
+            factors['quality_note'] = 'low_confidence_neutral'
+        elif quality_score >= self.QUALITY_EXCELLENT_THRESHOLD:
+            # Excellent quality - bonus sizing
+            excess = quality_score - self.QUALITY_EXCELLENT_THRESHOLD
+            quality_factor = 1.5 + (excess / 0.25) * 0.5  # 1.5 to 2.0
+            quality_factor = min(2.0, quality_factor)
+        elif quality_score >= self.QUALITY_GOOD_THRESHOLD:
+            # Good quality - normal to bonus
+            ratio = (quality_score - self.QUALITY_GOOD_THRESHOLD) / (
+                self.QUALITY_EXCELLENT_THRESHOLD - self.QUALITY_GOOD_THRESHOLD
+            )
+            quality_factor = 1.0 + ratio * 0.5  # 1.0 to 1.5
+        elif quality_score >= self.QUALITY_NEUTRAL_THRESHOLD:
+            # Neutral - slightly reduced
+            ratio = (quality_score - self.QUALITY_NEUTRAL_THRESHOLD) / (
+                self.QUALITY_GOOD_THRESHOLD - self.QUALITY_NEUTRAL_THRESHOLD
+            )
+            quality_factor = 0.8 + ratio * 0.2  # 0.8 to 1.0
+        else:
+            # Caution - significantly reduced
+            ratio = quality_score / self.QUALITY_NEUTRAL_THRESHOLD
+            quality_factor = 0.5 + ratio * 0.3  # 0.5 to 0.8
+
+        factors['quality_factor'] = round(quality_factor, 3)
+        factors['quality_score'] = round(quality_score, 3)
+        factors['quality_confidence'] = round(quality_confidence, 3)
+        factors['quality_recommendation'] = quality_recommendation
+
+        # =================================================================
         # Calculate Weighted Score
         # =================================================================
         weighted_score = (
@@ -296,7 +387,8 @@ class ChannelSizer:
             share_score * self.WEIGHT_SHARE_GAP +
             routing_score * self.WEIGHT_ROUTING_POTENTIAL +
             liquidity_score * self.WEIGHT_LIQUIDITY +
-            economics_score * self.WEIGHT_ECONOMICS
+            economics_score * self.WEIGHT_ECONOMICS +
+            quality_factor * self.WEIGHT_QUALITY
         )
         factors['weighted_score'] = round(weighted_score, 3)
 
@@ -323,14 +415,30 @@ class ChannelSizer:
         # =================================================================
         # Apply Hard Limits
         # =================================================================
+        size_before_limits = recommended_size
+
         # Never exceed available liquidity (with reserve)
         max_from_liquidity = int(available_for_channel * 0.5)  # Max 50% of available
         recommended_size = min(recommended_size, max_from_liquidity)
 
+        # Never exceed available budget (if provided)
+        budget_limited = False
+        if available_budget_sats is not None and available_budget_sats > 0:
+            if recommended_size > available_budget_sats:
+                recommended_size = available_budget_sats
+                budget_limited = True
+            factors['available_budget_sats'] = available_budget_sats
+            factors['budget_limited'] = budget_limited
+
         # Ensure within config bounds
         recommended_size = max(min_channel_sats, min(recommended_size, max_channel_sats))
 
-        factors['size_before_limits'] = recommended_size
+        # If budget is less than minimum, we can't open this channel
+        if available_budget_sats is not None and available_budget_sats < min_channel_sats:
+            factors['insufficient_budget'] = True
+            factors['budget_shortfall_sats'] = min_channel_sats - available_budget_sats
+
+        factors['size_before_limits'] = size_before_limits
         factors['max_from_liquidity'] = max_from_liquidity
 
         # =================================================================
@@ -357,6 +465,21 @@ class ChannelSizer:
         if economics_score >= 1.3:
             reasoning_parts.append(f"favorable economics ({expected_annual_return*100:.1f}% expected)")
 
+        # Phase 6.3: Add quality to reasoning
+        if quality_confidence >= 0.3:
+            if quality_factor >= 1.5:
+                reasoning_parts.append(f"excellent quality ({quality_score:.2f})")
+            elif quality_factor >= 1.0:
+                reasoning_parts.append(f"good quality ({quality_score:.2f})")
+            elif quality_factor < 0.8:
+                reasoning_parts.append(f"quality concern ({quality_score:.2f}/{quality_recommendation})")
+
+        # Add budget constraints to reasoning
+        if budget_limited:
+            reasoning_parts.append(f"budget-limited to {available_budget_sats:,} sats")
+        if factors.get('insufficient_budget'):
+            reasoning_parts.append(f"INSUFFICIENT BUDGET (need {min_channel_sats:,}, have {available_budget_sats:,})")
+
         if reasoning_parts:
             reasoning = f"Size factors: {', '.join(reasoning_parts)}"
         else:
@@ -364,7 +487,7 @@ class ChannelSizer:
 
         self._log(
             f"Sizing for {target[:16]}...: {recommended_size:,} sats "
-            f"(score={weighted_score:.2f}, {reasoning})"
+            f"(score={weighted_score:.2f}, quality={quality_score:.2f}, {reasoning})"
         )
 
         return ChannelSizeResult(
@@ -414,6 +537,12 @@ class Planner:
         self.plugin = plugin
         self.intent_manager = intent_manager
         self.decision_engine = decision_engine
+
+        # Quality scorer for peer evaluation (Phase 6.2)
+        if PeerQualityScorer and database:
+            self.quality_scorer = PeerQualityScorer(database, plugin)
+        else:
+            self.quality_scorer = None
 
         # Network cache (refreshed each cycle)
         self._network_cache: Dict[str, List[ChannelInfo]] = {}
@@ -894,7 +1023,7 @@ class Planner:
     # EXPANSION LOGIC (Ticket 6-02)
     # =========================================================================
 
-    def get_underserved_targets(self, cfg) -> List[UnderservedResult]:
+    def get_underserved_targets(self, cfg, include_low_quality: bool = False) -> List[UnderservedResult]:
         """
         Get targets with low Hive coverage that are candidates for expansion.
 
@@ -902,9 +1031,15 @@ class Planner:
         - Public capacity > MIN_TARGET_CAPACITY_SATS (1 BTC)
         - Hive share < UNDERSERVED_THRESHOLD_PCT (5%)
         - Target exists in public graph (verified via network cache)
+        - Quality score >= MIN_QUALITY_SCORE (Phase 6.2) or insufficient data
+
+        Args:
+            cfg: Config snapshot
+            include_low_quality: If True, include targets with low quality scores
+                                 (they will be flagged but not filtered)
 
         Returns:
-            List of UnderservedResult sorted by score (highest first)
+            List of UnderservedResult sorted by combined score (highest first)
         """
         underserved = []
 
@@ -921,19 +1056,67 @@ class Planner:
             if result.hive_share_pct >= UNDERSERVED_THRESHOLD_PCT:
                 continue
 
-            # Calculate score: higher capacity + lower Hive share = more attractive
+            # Phase 6.2: Get quality score for the target
+            quality_score = 0.5  # Default neutral
+            quality_confidence = 0.0
+            quality_recommendation = "neutral"
+
+            if self.quality_scorer:
+                quality_result = self.quality_scorer.calculate_score(
+                    target, days=QUALITY_SCORE_DAYS
+                )
+                quality_score = quality_result.overall_score
+                quality_confidence = quality_result.confidence
+                quality_recommendation = quality_result.recommendation
+
+                # Filter out low-quality targets unless explicitly included
+                if not include_low_quality:
+                    # Skip targets with 'avoid' recommendation
+                    if quality_recommendation == "avoid":
+                        self._log(
+                            f"Skipping {target[:16]}... - quality='avoid' "
+                            f"(score={quality_score:.2f}, confidence={quality_confidence:.2f})",
+                            level='debug'
+                        )
+                        continue
+
+                    # Skip targets below minimum score with sufficient confidence
+                    if quality_confidence >= 0.3 and quality_score < MIN_QUALITY_SCORE:
+                        self._log(
+                            f"Skipping {target[:16]}... - low quality score "
+                            f"({quality_score:.2f} < {MIN_QUALITY_SCORE})",
+                            level='debug'
+                        )
+                        continue
+
+            # Calculate base score: higher capacity + lower Hive share = more attractive
             # Score = capacity_btc * (1 - hive_share)
             capacity_btc = public_capacity / 100_000_000
-            score = capacity_btc * (1 - result.hive_share_pct)
+            base_score = capacity_btc * (1 - result.hive_share_pct)
+
+            # Phase 6.2: Factor in quality score
+            # Combined score = base_score * quality_multiplier
+            # Quality multiplier ranges from 0.5 (avoid) to 1.5 (excellent)
+            if quality_confidence > 0.3:
+                # Quality data is meaningful - apply multiplier
+                quality_multiplier = 0.5 + quality_score  # 0.5 to 1.5
+            else:
+                # Low confidence - use neutral multiplier
+                quality_multiplier = 1.0
+
+            combined_score = base_score * quality_multiplier
 
             underserved.append(UnderservedResult(
                 target=target,
                 public_capacity_sats=public_capacity,
                 hive_share_pct=result.hive_share_pct,
-                score=score
+                score=combined_score,
+                quality_score=quality_score,
+                quality_confidence=quality_confidence,
+                quality_recommendation=quality_recommendation
             ))
 
-        # Sort by score (highest first)
+        # Sort by combined score (highest first)
         underserved.sort(key=lambda r: r.score, reverse=True)
         return underserved
 
@@ -1115,10 +1298,12 @@ class Planner:
             return decisions
 
         # Create intent and potentially broadcast
+        # Phase 6.2: Include quality information in log
         self._log(
             f"Proposing expansion to {selected_target.target[:16]}... "
             f"(share={selected_target.hive_share_pct:.1%}, "
-            f"capacity={selected_target.public_capacity_sats} sats)"
+            f"capacity={selected_target.public_capacity_sats} sats, "
+            f"quality={selected_target.quality_score:.2f}/{selected_target.quality_recommendation})"
         )
 
         try:
@@ -1130,7 +1315,7 @@ class Planner:
 
             self._expansions_this_cycle += 1
 
-            # Log the decision
+            # Log the decision with quality information (Phase 6.2)
             self.db.log_planner_action(
                 action_type='expansion',
                 result='proposed',
@@ -1140,6 +1325,9 @@ class Planner:
                     'public_capacity_sats': selected_target.public_capacity_sats,
                     'hive_share_pct': round(selected_target.hive_share_pct, 4),
                     'score': round(selected_target.score, 4),
+                    'quality_score': round(selected_target.quality_score, 3),
+                    'quality_confidence': round(selected_target.quality_confidence, 3),
+                    'quality_recommendation': selected_target.quality_recommendation,
                     'onchain_balance': onchain_balance,
                     'run_id': run_id
                 }
@@ -1163,8 +1351,8 @@ class Planner:
                 target_channel_count = self._get_target_channel_count(selected_target.target)
                 avg_fee_rate = self._get_avg_fee_rate()
 
-                # Use intelligent channel sizer
-                sizer = ChannelSizer(plugin=self.plugin)
+                # Phase 6.3: Use intelligent channel sizer with quality scoring
+                sizer = ChannelSizer(plugin=self.plugin, quality_scorer=self.quality_scorer)
                 sizing_result = sizer.calculate_size(
                     target=selected_target.target,
                     target_capacity_sats=selected_target.public_capacity_sats,
@@ -1176,6 +1364,10 @@ class Planner:
                     max_channel_sats=max_size,
                     default_channel_sats=default_size,
                     avg_fee_rate_ppm=avg_fee_rate,
+                    # Phase 6.3: Pass quality data from UnderservedResult
+                    quality_score=selected_target.quality_score,
+                    quality_confidence=selected_target.quality_confidence,
+                    quality_recommendation=selected_target.quality_recommendation,
                 )
 
                 proposed_size = sizing_result.recommended_size_sats
@@ -1193,6 +1385,10 @@ class Planner:
                     'sizing_factors': sizing_result.factors,
                     'sizing_reasoning': sizing_result.reasoning,
                     'target_channel_count': target_channel_count,
+                    # Phase 6.3: Include quality information
+                    'quality_score': round(selected_target.quality_score, 3),
+                    'quality_confidence': round(selected_target.quality_confidence, 3),
+                    'quality_recommendation': selected_target.quality_recommendation,
                 }
 
                 # Define executor for channel_open (broadcasts intent)

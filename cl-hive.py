@@ -49,6 +49,9 @@ from modules.protocol import (
     MAX_MESSAGE_BYTES, is_hive_message, deserialize, serialize,
     validate_promotion_request, validate_vouch, validate_promotion,
     validate_member_left, validate_ban_proposal, validate_ban_vote,
+    validate_peer_available, create_peer_available,
+    validate_expansion_nominate, validate_expansion_elect,
+    create_expansion_nominate, create_expansion_elect,
     VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
     create_challenge, create_welcome
 )
@@ -59,7 +62,9 @@ from modules.intent_manager import IntentManager, Intent, IntentType
 from modules.bridge import Bridge, BridgeStatus, CircuitOpenError
 from modules.contribution import ContributionManager
 from modules.membership import MembershipManager, MembershipTier
-from modules.planner import Planner
+from modules.planner import Planner, ChannelSizer
+from modules.quality_scorer import PeerQualityScorer
+from modules.cooperative_expansion import CooperativeExpansionManager
 from modules.clboss_bridge import CLBossBridge
 from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
@@ -195,6 +200,7 @@ planner: Optional[Planner] = None
 clboss_bridge: Optional[CLBossBridge] = None
 decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
+coop_expansion: Optional[CooperativeExpansionManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -403,6 +409,28 @@ plugin.add_option(
     dynamic=True
 )
 
+# Budget Options (Phase 7 - Governance)
+plugin.add_option(
+    name='hive-autonomous-budget-per-day',
+    default='10000000',
+    description='Daily budget for autonomous channel opens in sats (default: 10M)',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-budget-reserve-pct',
+    default='0.20',
+    description='Reserve percentage of onchain balance for future expansion (default: 20%)',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-budget-max-per-channel-pct',
+    default='0.50',
+    description='Maximum per-channel spend as percentage of daily budget (default: 50%)',
+    dynamic=True
+)
+
 # VPN Transport Options (all dynamic)
 plugin.add_option(
     name='hive-transport-mode',
@@ -466,6 +494,10 @@ OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
     'hive-planner-min-channel-sats': ('planner_min_channel_sats', int),
     'hive-planner-max-channel-sats': ('planner_max_channel_sats', int),
     'hive-planner-default-channel-sats': ('planner_default_channel_sats', int),
+    # Budget options
+    'hive-autonomous-budget-per-day': ('autonomous_budget_per_day', int),
+    'hive-budget-reserve-pct': ('budget_reserve_pct', float),
+    'hive-budget-max-per-channel-pct': ('budget_max_per_channel_pct', float),
 }
 
 # VPN options require special handling (reconfigure VPN transport)
@@ -631,6 +663,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=int(options.get('hive-planner-min-channel-sats', '1000000')),
         planner_max_channel_sats=int(options.get('hive-planner-max-channel-sats', '50000000')),
         planner_default_channel_sats=int(options.get('hive-planner-default-channel-sats', '5000000')),
+        # Budget options
+        autonomous_budget_per_day=int(options.get('hive-autonomous-budget-per-day', '10000000')),
+        budget_reserve_pct=float(options.get('hive-budget-reserve-pct', '0.20')),
+        budget_max_per_channel_pct=float(options.get('hive-budget-max-per-channel-pct', '0.50')),
     )
     
     # Initialize database
@@ -760,6 +796,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     planner_thread.start()
     plugin.log("cl-hive: Planner thread started")
 
+    # Initialize Cooperative Expansion Manager (Phase 6.4)
+    global coop_expansion
+    quality_scorer = PeerQualityScorer(database, safe_plugin)
+    coop_expansion = CooperativeExpansionManager(
+        database=database,
+        quality_scorer=quality_scorer,
+        plugin=safe_plugin,
+        our_id=our_pubkey
+    )
+    plugin.log("cl-hive: Cooperative expansion manager initialized")
+
     # Sync fee policies for existing members (Phase 4 integration)
     if bridge and bridge.status == BridgeStatus.ENABLED:
         _sync_member_policies(plugin)
@@ -872,6 +919,14 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_ban_proposal(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.BAN_VOTE:
             return handle_ban_vote(peer_id, msg_payload, plugin)
+        # Phase 6: Channel Coordination
+        elif msg_type == HiveMessageType.PEER_AVAILABLE:
+            return handle_peer_available(peer_id, msg_payload, plugin)
+        # Phase 6.4: Cooperative Expansion
+        elif msg_type == HiveMessageType.EXPANSION_NOMINATE:
+            return handle_expansion_nominate(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.EXPANSION_ELECT:
+            return handle_expansion_elect(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type (Phase 4+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -1581,9 +1636,17 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
 # PHASE 5: PROMOTION PROTOCOL HANDLERS
 # =============================================================================
 
-def _broadcast_to_members(message_bytes: bytes) -> None:
+def _broadcast_to_members(message_bytes: bytes) -> int:
+    """
+    Broadcast a message to all hive members (excluding ourselves).
+
+    Returns:
+        Number of members the message was successfully sent to.
+    """
     if not database or not safe_plugin:
-        return
+        return 0
+
+    sent_count = 0
     for member in database.get_all_members():
         tier = member.get("tier")
         # Broadcast to both members and admins
@@ -1597,8 +1660,11 @@ def _broadcast_to_members(message_bytes: bytes) -> None:
                 "node_id": member_id,
                 "msg": message_bytes.hex()
             })
+            sent_count += 1
         except Exception as e:
-            safe_plugin.log(f"Failed to send promotion msg to {member_id[:16]}...: {e}", level='debug')
+            safe_plugin.log(f"Failed to send message to {member_id[:16]}...: {e}", level='debug')
+
+    return sent_count
 
 
 def _sync_member_policies(plugin: Plugin) -> None:
@@ -2158,6 +2224,544 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
 
 
 # =============================================================================
+# PHASE 6: CHANNEL COORDINATION - PEER AVAILABLE HANDLING
+# =============================================================================
+
+def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle PEER_AVAILABLE message - a hive member reporting a channel event.
+
+    This is sent when:
+    - A channel opens (local or remote initiated)
+    - A channel closes (any type)
+    - A peer's routing quality is exceptional
+
+    Phase 6.1: ALL events are stored in peer_events table for topology intelligence.
+    The receiving node uses this data to make informed expansion decisions.
+    """
+    if not config or not database:
+        return {"result": "continue"}
+
+    if not validate_peer_available(payload):
+        plugin.log(f"cl-hive: PEER_AVAILABLE from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: PEER_AVAILABLE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Extract all fields from payload
+    target_peer_id = payload["target_peer_id"]
+    reporter_peer_id = payload["reporter_peer_id"]
+    event_type = payload["event_type"]
+    timestamp = payload["timestamp"]
+
+    # Channel info
+    channel_id = payload.get("channel_id", "")
+    capacity_sats = payload.get("capacity_sats", 0)
+
+    # Profitability data
+    duration_days = payload.get("duration_days", 0)
+    total_revenue_sats = payload.get("total_revenue_sats", 0)
+    total_rebalance_cost_sats = payload.get("total_rebalance_cost_sats", 0)
+    net_pnl_sats = payload.get("net_pnl_sats", 0)
+    forward_count = payload.get("forward_count", 0)
+    forward_volume_sats = payload.get("forward_volume_sats", 0)
+    our_fee_ppm = payload.get("our_fee_ppm", 0)
+    their_fee_ppm = payload.get("their_fee_ppm", 0)
+    routing_score = payload.get("routing_score", 0.5)
+    profitability_score = payload.get("profitability_score", 0.5)
+
+    # Funding info
+    our_funding_sats = payload.get("our_funding_sats", 0)
+    their_funding_sats = payload.get("their_funding_sats", 0)
+    opener = payload.get("opener", "")
+    closer = payload.get("closer", "")
+    reason = payload.get("reason", "")
+
+    # Determine closer from event_type if not explicitly set
+    if not closer and event_type.endswith('_close'):
+        if event_type == 'remote_close':
+            closer = 'remote'
+        elif event_type == 'local_close':
+            closer = 'local'
+        elif event_type == 'mutual_close':
+            closer = 'mutual'
+
+    plugin.log(
+        f"cl-hive: PEER_AVAILABLE from {reporter_peer_id[:16]}...: "
+        f"target={target_peer_id[:16]}... event={event_type} "
+        f"capacity={capacity_sats} pnl={net_pnl_sats}",
+        level='info'
+    )
+
+    # =========================================================================
+    # PHASE 6.1: Store ALL events for topology intelligence
+    # =========================================================================
+    database.store_peer_event(
+        peer_id=target_peer_id,
+        reporter_id=reporter_peer_id,
+        event_type=event_type,
+        timestamp=timestamp,
+        channel_id=channel_id,
+        capacity_sats=capacity_sats,
+        duration_days=duration_days,
+        total_revenue_sats=total_revenue_sats,
+        total_rebalance_cost_sats=total_rebalance_cost_sats,
+        net_pnl_sats=net_pnl_sats,
+        forward_count=forward_count,
+        forward_volume_sats=forward_volume_sats,
+        our_fee_ppm=our_fee_ppm,
+        their_fee_ppm=their_fee_ppm,
+        routing_score=routing_score,
+        profitability_score=profitability_score,
+        our_funding_sats=our_funding_sats,
+        their_funding_sats=their_funding_sats,
+        opener=opener,
+        closer=closer,
+        reason=reason
+    )
+
+    # =========================================================================
+    # Evaluate expansion opportunities (only for close events)
+    # =========================================================================
+    # Channel opens are informational only - no action needed
+    if event_type == 'channel_open':
+        return {"result": "continue"}
+
+    # Don't open channels to ourselves
+    if safe_plugin:
+        try:
+            our_id = safe_plugin.rpc.getinfo().get("id")
+            if target_peer_id == our_id:
+                return {"result": "continue"}
+        except Exception:
+            pass
+
+    # Check if we already have a channel to this peer
+    if safe_plugin:
+        try:
+            channels = safe_plugin.rpc.listpeerchannels(id=target_peer_id)
+            if channels.get("channels"):
+                plugin.log(
+                    f"cl-hive: Already have channel to {target_peer_id[:16]}..., "
+                    f"event stored for topology tracking",
+                    level='debug'
+                )
+                return {"result": "continue"}
+        except Exception:
+            pass  # Peer not connected, which is fine
+
+    # Check if target is in the ban list
+    if database.is_banned(target_peer_id):
+        plugin.log(f"cl-hive: Ignoring expansion to banned peer {target_peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Only consider expansion for remote-initiated closures
+    # (local/mutual closes don't indicate the peer wants more channels)
+    if event_type != 'remote_close':
+        return {"result": "continue"}
+
+    # Check quality thresholds before proposing expansion
+    if routing_score < 0.2:
+        plugin.log(
+            f"cl-hive: Peer {target_peer_id[:16]}... has low routing score ({routing_score}), "
+            f"not proposing expansion",
+            level='debug'
+        )
+        return {"result": "continue"}
+
+    cfg = config.snapshot()
+
+    if not cfg.planner_enable_expansions:
+        plugin.log(
+            f"cl-hive: Expansions disabled, storing PEER_AVAILABLE for manual review",
+            level='debug'
+        )
+        _store_peer_available_action(target_peer_id, reporter_peer_id, event_type,
+                                     capacity_sats, routing_score, reason)
+        return {"result": "continue"}
+
+    # =========================================================================
+    # Phase 6.4: Trigger cooperative expansion round
+    # =========================================================================
+    if coop_expansion:
+        # Start a cooperative expansion round for this peer
+        round_id = coop_expansion.evaluate_expansion(
+            target_peer_id=target_peer_id,
+            event_type=event_type,
+            reporter_id=reporter_peer_id,
+            capacity_sats=capacity_sats,
+            quality_score=profitability_score  # Use reported profitability as hint
+        )
+
+        if round_id:
+            plugin.log(
+                f"cl-hive: Started cooperative expansion round {round_id[:8]}... "
+                f"for {target_peer_id[:16]}...",
+                level='info'
+            )
+            # Broadcast our nomination to other hive members
+            _broadcast_expansion_nomination(round_id, target_peer_id)
+        else:
+            plugin.log(
+                f"cl-hive: No cooperative round started for {target_peer_id[:16]}... "
+                f"(may be on cooldown or insufficient quality)",
+                level='debug'
+            )
+    else:
+        # Fallback: In autonomous mode, create a pending action for channel opening
+        if cfg.governance_mode == 'autonomous':
+            _store_peer_available_action(target_peer_id, reporter_peer_id, event_type,
+                                         capacity_sats, routing_score, reason)
+            plugin.log(
+                f"cl-hive: Queued channel opportunity to {target_peer_id[:16]}... from PEER_AVAILABLE",
+                level='info'
+            )
+
+    return {"result": "continue"}
+
+
+def _store_peer_available_action(target_peer_id: str, reporter_peer_id: str,
+                                  event_type: str, capacity_sats: int,
+                                  routing_score: float, reason: str) -> None:
+    """Store a PEER_AVAILABLE as a pending action for review/execution."""
+    if not database:
+        return
+
+    # Use planner's channel sizer if available
+    suggested_sats = capacity_sats
+    if planner and config and capacity_sats == 0:
+        cfg = config.snapshot()
+        suggested_sats = cfg.planner_default_channel_sats
+
+    database.add_pending_action(
+        action_type="channel_open",
+        payload={
+            "target": target_peer_id,
+            "amount_sats": suggested_sats,
+            "source": "peer_available",
+            "reporter": reporter_peer_id,
+            "event_type": event_type,
+            "routing_score": routing_score,
+            "reason": reason or f"Peer available via {event_type}"
+        },
+        expires_hours=24
+    )
+
+
+def broadcast_peer_available(target_peer_id: str, event_type: str,
+                              channel_id: str = "",
+                              capacity_sats: int = 0,
+                              routing_score: float = 0.0,
+                              profitability_score: float = 0.0,
+                              reason: str = "",
+                              # Profitability data
+                              duration_days: int = 0,
+                              total_revenue_sats: int = 0,
+                              total_rebalance_cost_sats: int = 0,
+                              net_pnl_sats: int = 0,
+                              forward_count: int = 0,
+                              forward_volume_sats: int = 0,
+                              our_fee_ppm: int = 0,
+                              their_fee_ppm: int = 0,
+                              # Funding info (for opens)
+                              our_funding_sats: int = 0,
+                              their_funding_sats: int = 0,
+                              opener: str = "") -> int:
+    """
+    Broadcast PEER_AVAILABLE to all hive members.
+
+    Args:
+        target_peer_id: The external peer involved
+        event_type: 'channel_open', 'channel_close', 'remote_close', etc.
+        channel_id: The channel short ID
+        capacity_sats: Channel capacity
+        routing_score: Peer's routing quality score (0-1)
+        profitability_score: Overall profitability score (0-1)
+        reason: Human-readable reason
+
+        # Profitability data (for closures):
+        duration_days, total_revenue_sats, total_rebalance_cost_sats,
+        net_pnl_sats, forward_count, forward_volume_sats,
+        our_fee_ppm, their_fee_ppm
+
+        # Funding info (for opens):
+        our_funding_sats, their_funding_sats, opener
+
+    Returns:
+        Number of members message was sent to
+    """
+    if not safe_plugin or not database:
+        return 0
+
+    try:
+        our_id = safe_plugin.rpc.getinfo().get("id")
+    except Exception:
+        return 0
+
+    import time
+    msg = create_peer_available(
+        target_peer_id=target_peer_id,
+        reporter_peer_id=our_id,
+        event_type=event_type,
+        timestamp=int(time.time()),
+        channel_id=channel_id,
+        capacity_sats=capacity_sats,
+        routing_score=routing_score,
+        profitability_score=profitability_score,
+        reason=reason,
+        duration_days=duration_days,
+        total_revenue_sats=total_revenue_sats,
+        total_rebalance_cost_sats=total_rebalance_cost_sats,
+        net_pnl_sats=net_pnl_sats,
+        forward_count=forward_count,
+        forward_volume_sats=forward_volume_sats,
+        our_fee_ppm=our_fee_ppm,
+        their_fee_ppm=their_fee_ppm,
+        our_funding_sats=our_funding_sats,
+        their_funding_sats=their_funding_sats,
+        opener=opener
+    )
+
+    return _broadcast_to_members(msg)
+
+
+def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
+    """
+    Broadcast an EXPANSION_NOMINATE message to all hive members.
+
+    Args:
+        round_id: The cooperative expansion round ID
+        target_peer_id: The target peer for the expansion
+
+    Returns:
+        Number of members message was sent to
+    """
+    if not safe_plugin or not database or not coop_expansion:
+        return 0
+
+    try:
+        our_id = safe_plugin.rpc.getinfo().get("id")
+    except Exception:
+        return 0
+
+    # Get our nomination info
+    try:
+        funds = safe_plugin.rpc.listfunds()
+        outputs = funds.get('outputs', [])
+        available_liquidity = sum(
+            (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
+             else int(o.get('amount_msat', '0msat')[:-4]) // 1000
+             if isinstance(o.get('amount_msat'), str) else o.get('value', 0))
+            for o in outputs if o.get('status') == 'confirmed'
+        )
+    except Exception:
+        available_liquidity = 0
+
+    try:
+        channels = safe_plugin.rpc.listpeerchannels()
+        channel_count = len(channels.get('channels', []))
+    except Exception:
+        channel_count = 0
+
+    # Check if we have a channel to target
+    try:
+        target_channels = safe_plugin.rpc.listpeerchannels(id=target_peer_id)
+        has_existing = len(target_channels.get('channels', [])) > 0
+    except Exception:
+        has_existing = False
+
+    # Get quality score for the target
+    quality_score = 0.5
+    if database:
+        try:
+            scorer = PeerQualityScorer(database, safe_plugin)
+            result = scorer.calculate_score(target_peer_id)
+            quality_score = result.overall_score
+        except Exception:
+            pass
+
+    import time
+    msg = create_expansion_nominate(
+        round_id=round_id,
+        target_peer_id=target_peer_id,
+        nominator_id=our_id,
+        timestamp=int(time.time()),
+        available_liquidity_sats=available_liquidity,
+        quality_score=quality_score,
+        has_existing_channel=has_existing,
+        channel_count=channel_count,
+        reason="auto_nominate"
+    )
+
+    sent = _broadcast_to_members(msg)
+    safe_plugin.log(
+        f"cl-hive: [BROADCAST] Sent nomination for round {round_id[:8]}... "
+        f"target={target_peer_id[:16]}... to {sent} members",
+        level='info'
+    )
+
+    return sent
+
+
+def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: str,
+                                channel_size_sats: int = 0, quality_score: float = 0.5,
+                                nomination_count: int = 0) -> int:
+    """
+    Broadcast an EXPANSION_ELECT message to all hive members.
+
+    Args:
+        round_id: The cooperative expansion round ID
+        target_peer_id: The target peer for the expansion
+        elected_id: The elected member who should open the channel
+        channel_size_sats: Recommended channel size
+        quality_score: Target's quality score
+        nomination_count: Number of nominations received
+
+    Returns:
+        Number of members message was sent to
+    """
+    if not safe_plugin or not database:
+        return 0
+
+    import time
+    msg = create_expansion_elect(
+        round_id=round_id,
+        target_peer_id=target_peer_id,
+        elected_id=elected_id,
+        timestamp=int(time.time()),
+        channel_size_sats=channel_size_sats,
+        quality_score=quality_score,
+        nomination_count=nomination_count,
+        reason="elected_by_coordinator"
+    )
+
+    sent = _broadcast_to_members(msg)
+    if sent > 0:
+        safe_plugin.log(
+            f"cl-hive: Broadcast expansion election for round {round_id[:8]}... "
+            f"elected={elected_id[:16]}... to {sent} members",
+            level='info'
+        )
+
+    return sent
+
+
+def handle_expansion_nominate(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle EXPANSION_NOMINATE message from another hive member.
+
+    This message indicates a member is interested in opening a channel
+    to a target peer during a cooperative expansion round.
+    """
+    plugin.log(
+        f"cl-hive: [NOMINATE] Received from {peer_id[:16]}... "
+        f"round={payload.get('round_id', '')[:8]}... "
+        f"nominator={payload.get('nominator_id', '')[:16]}...",
+        level='info'
+    )
+
+    if not coop_expansion or not database:
+        plugin.log("cl-hive: [NOMINATE] coop_expansion or database not initialized", level='warn')
+        return {"result": "continue"}
+
+    if not validate_expansion_nominate(payload):
+        plugin.log(f"cl-hive: [NOMINATE] Invalid payload from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: [NOMINATE] Rejected - {peer_id[:16]}... not a member or banned", level='info')
+        return {"result": "continue"}
+
+    # Process the nomination
+    result = coop_expansion.handle_nomination(peer_id, payload)
+
+    plugin.log(
+        f"cl-hive: [NOMINATE] Processed: success={result.get('success')}, "
+        f"joined={result.get('joined')}, round={result.get('round_id', '')[:8]}...",
+        level='info'
+    )
+
+    # If we joined a new round and added our nomination, broadcast it to other members
+    # This ensures all members' nominations propagate across the network
+    if result.get('joined') and result.get('success'):
+        round_id = result.get('round_id', '')
+        target_peer_id = payload.get('target_peer_id', '')
+        if round_id and target_peer_id:
+            plugin.log(
+                f"cl-hive: [NOMINATE] Re-broadcasting our nomination for round {round_id[:8]}...",
+                level='info'
+            )
+            _broadcast_expansion_nomination(round_id, target_peer_id)
+
+    return {"result": "continue", "nomination_result": result}
+
+
+def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle EXPANSION_ELECT message announcing the winner of an expansion round.
+
+    If we are the elected member, we should proceed to open the channel.
+    """
+    if not coop_expansion or not database:
+        return {"result": "continue"}
+
+    if not validate_expansion_elect(payload):
+        plugin.log(f"cl-hive: Invalid EXPANSION_ELECT from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: EXPANSION_ELECT from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Process the election
+    result = coop_expansion.handle_elect(peer_id, payload)
+
+    elected_id = payload.get("elected_id", "")
+    target_peer_id = payload.get("target_peer_id", "")
+    channel_size = payload.get("channel_size_sats", 0)
+
+    # Check if we were elected
+    if result.get("action") == "open_channel":
+        plugin.log(
+            f"cl-hive: We were elected to open channel to {target_peer_id[:16]}... "
+            f"(size={channel_size})",
+            level='info'
+        )
+
+        # Queue the channel open via pending actions
+        if database and config:
+            cfg = config.snapshot()
+            action_id = database.add_pending_action(
+                action_type="channel_open",
+                payload={
+                    "target": target_peer_id,
+                    "amount_sats": channel_size or cfg.planner_default_channel_sats,
+                    "source": "cooperative_expansion",
+                    "round_id": payload.get("round_id", ""),
+                    "reason": "Elected by hive for cooperative expansion"
+                },
+                expires_hours=24
+            )
+            plugin.log(f"cl-hive: Queued channel open to {target_peer_id[:16]}... (action_id={action_id})", level='info')
+    else:
+        plugin.log(
+            f"cl-hive: {elected_id[:16]}... elected for round {payload.get('round_id', '')[:8]}... "
+            f"(not us)",
+            level='debug'
+        )
+
+    return {"result": "continue", "election_result": result}
+
+
+# =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
 
@@ -2651,6 +3255,707 @@ def hive_topology(plugin: Plugin):
     }
 
 
+@plugin.method("hive-channel-closed")
+def hive_channel_closed(plugin: Plugin, peer_id: str, channel_id: str,
+                        closer: str, close_type: str,
+                        capacity_sats: int = 0,
+                        # Profitability data
+                        duration_days: int = 0,
+                        total_revenue_sats: int = 0,
+                        total_rebalance_cost_sats: int = 0,
+                        net_pnl_sats: int = 0,
+                        forward_count: int = 0,
+                        forward_volume_sats: int = 0,
+                        our_fee_ppm: int = 0,
+                        their_fee_ppm: int = 0,
+                        routing_score: float = 0.0,
+                        profitability_score: float = 0.0):
+    """
+    Notification from cl-revenue-ops that a channel has closed.
+
+    ALL closures are broadcast to hive members for topology awareness.
+    This helps the hive make informed decisions about channel openings.
+
+    Args:
+        peer_id: The peer whose channel closed
+        channel_id: The closed channel ID
+        closer: Who initiated: 'local', 'remote', 'mutual', or 'unknown'
+        close_type: Type of closure
+        capacity_sats: Channel capacity that was closed
+
+        # Profitability data from cl-revenue-ops:
+        duration_days: How long the channel was open
+        total_revenue_sats: Total routing fees earned
+        total_rebalance_cost_sats: Total rebalancing costs
+        net_pnl_sats: Net profit/loss for the channel
+        forward_count: Number of forwards routed
+        forward_volume_sats: Total volume routed through channel
+        our_fee_ppm: Fee rate we charged
+        their_fee_ppm: Fee rate they charged us
+        routing_score: Routing quality score (0-1)
+        profitability_score: Overall profitability score (0-1)
+
+    Returns:
+        Dict with action taken
+    """
+    if not config or not database:
+        return {"error": "Hive not initialized"}
+
+    result = {
+        "peer_id": peer_id,
+        "channel_id": channel_id,
+        "closer": closer,
+        "close_type": close_type,
+        "action": "none",
+        "broadcast_count": 0
+    }
+
+    # Don't notify about banned peers
+    if database.is_banned(peer_id):
+        result["action"] = "ignored"
+        result["reason"] = "Peer is banned"
+        return result
+
+    # Map closer to event_type
+    if closer == 'remote':
+        event_type = 'remote_close'
+    elif closer == 'local':
+        event_type = 'local_close'
+    elif closer == 'mutual':
+        event_type = 'mutual_close'
+    else:
+        event_type = 'channel_close'
+
+    # Broadcast to all hive members for topology awareness
+    broadcast_count = broadcast_peer_available(
+        target_peer_id=peer_id,
+        event_type=event_type,
+        channel_id=channel_id,
+        capacity_sats=capacity_sats,
+        routing_score=routing_score,
+        profitability_score=profitability_score,
+        duration_days=duration_days,
+        total_revenue_sats=total_revenue_sats,
+        total_rebalance_cost_sats=total_rebalance_cost_sats,
+        net_pnl_sats=net_pnl_sats,
+        forward_count=forward_count,
+        forward_volume_sats=forward_volume_sats,
+        our_fee_ppm=our_fee_ppm,
+        their_fee_ppm=their_fee_ppm,
+        reason=f"Channel {channel_id} closed ({closer})"
+    )
+
+    result["action"] = "notified_hive"
+    result["broadcast_count"] = broadcast_count
+    result["event_type"] = event_type
+    result["message"] = f"Notified {broadcast_count} hive members about channel closure"
+
+    plugin.log(
+        f"cl-hive: Channel {channel_id} closed by {closer}, "
+        f"notified {broadcast_count} members (pnl={net_pnl_sats} sats)",
+        level='info'
+    )
+
+    return result
+
+
+@plugin.method("hive-channel-opened")
+def hive_channel_opened(plugin: Plugin, peer_id: str, channel_id: str,
+                        opener: str, capacity_sats: int = 0,
+                        our_funding_sats: int = 0, their_funding_sats: int = 0):
+    """
+    Notification from cl-revenue-ops that a channel has opened.
+
+    ALL opens are broadcast to hive members for topology awareness.
+    This helps the hive track who has channels to which peers.
+
+    Args:
+        peer_id: The peer the channel was opened with
+        channel_id: The new channel ID
+        opener: Who initiated: 'local' or 'remote'
+        capacity_sats: Total channel capacity
+        our_funding_sats: Amount we funded
+        their_funding_sats: Amount they funded
+
+    Returns:
+        Dict with action taken
+    """
+    if not config or not database:
+        return {"error": "Hive not initialized"}
+
+    result = {
+        "peer_id": peer_id,
+        "channel_id": channel_id,
+        "opener": opener,
+        "capacity_sats": capacity_sats,
+        "action": "none",
+        "broadcast_count": 0
+    }
+
+    # Check if peer is a hive member (internal channel)
+    member = database.get_member(peer_id)
+    is_hive_internal = member is not None and not database.is_banned(peer_id)
+
+    # Broadcast to all hive members
+    broadcast_count = broadcast_peer_available(
+        target_peer_id=peer_id,
+        event_type='channel_open',
+        channel_id=channel_id,
+        capacity_sats=capacity_sats,
+        our_funding_sats=our_funding_sats,
+        their_funding_sats=their_funding_sats,
+        opener=opener,
+        reason=f"Channel {channel_id} opened ({opener})"
+    )
+
+    result["action"] = "notified_hive"
+    result["broadcast_count"] = broadcast_count
+    result["is_hive_internal"] = is_hive_internal
+    result["message"] = f"Notified {broadcast_count} hive members about new channel"
+
+    plugin.log(
+        f"cl-hive: Channel {channel_id} opened with {peer_id[:16]}... ({opener}), "
+        f"notified {broadcast_count} members",
+        level='info'
+    )
+
+    return result
+
+
+@plugin.method("hive-peer-events")
+def hive_peer_events(plugin: Plugin, peer_id: str = None, event_type: str = None,
+                     reporter_id: str = None, days: int = 90, limit: int = 100,
+                     summary: bool = False):
+    """
+    Query peer events for topology intelligence (Phase 6.1).
+
+    This RPC provides access to the peer_events table which stores all channel
+    open/close events received from hive members. Use this data to understand
+    peer quality and make informed channel decisions.
+
+    Args:
+        peer_id: Filter by external peer pubkey (optional)
+        event_type: Filter by event type: channel_open, channel_close,
+                    remote_close, local_close, mutual_close (optional)
+        reporter_id: Filter by reporting hive member pubkey (optional)
+        days: Only include events from last N days (default: 90)
+        limit: Maximum number of events to return (default: 100, max: 500)
+        summary: If True and peer_id is set, return aggregated summary instead
+
+    Returns:
+        If summary=False: Dict with events list and metadata
+        If summary=True: Dict with aggregated statistics for the peer
+
+    Examples:
+        # Get all events from last 30 days
+        hive-peer-events days=30
+
+        # Get events for a specific peer
+        hive-peer-events peer_id=02abc123...
+
+        # Get summary statistics for a peer
+        hive-peer-events peer_id=02abc123... summary=true
+
+        # Get only remote close events
+        hive-peer-events event_type=remote_close
+
+        # Get events reported by a specific hive member
+        hive-peer-events reporter_id=03def456...
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Bound limit
+    limit = min(max(1, limit), 500)
+    days = min(max(1, days), 365)
+
+    # If summary requested with peer_id, return aggregated stats
+    if summary and peer_id:
+        stats = database.get_peer_event_summary(peer_id, days=days)
+        return {
+            "peer_id": peer_id,
+            "days": days,
+            "summary": stats,
+        }
+
+    # Otherwise return event list
+    events = database.get_peer_events(
+        peer_id=peer_id,
+        event_type=event_type,
+        reporter_id=reporter_id,
+        days=days,
+        limit=limit
+    )
+
+    # Get list of unique peers with events if no peer_id filter
+    peers_with_events = []
+    if not peer_id:
+        peers_with_events = database.get_peers_with_events(days=days)
+
+    return {
+        "count": len(events),
+        "limit": limit,
+        "days": days,
+        "filters": {
+            "peer_id": peer_id,
+            "event_type": event_type,
+            "reporter_id": reporter_id,
+        },
+        "peers_with_events": len(peers_with_events),
+        "events": events,
+    }
+
+
+@plugin.method("hive-peer-quality")
+def hive_peer_quality(plugin: Plugin, peer_id: str = None, days: int = 90,
+                      min_confidence: float = 0.0, limit: int = 50):
+    """
+    Calculate quality scores for external peers (Phase 6.2).
+
+    Quality scores are based on historical channel event data from hive members.
+    Use this to evaluate peer reliability, profitability, and routing potential
+    before opening channels.
+
+    Score Components:
+        - Reliability (35%): Based on closure behavior and duration
+        - Profitability (25%): Based on P&L and revenue data
+        - Routing (25%): Based on forward activity
+        - Consistency (15%): Based on agreement across reporters
+
+    Args:
+        peer_id: Specific peer to score (optional). If not provided,
+                 returns scores for all peers with event data.
+        days: Number of days of history to consider (default: 90)
+        min_confidence: Minimum confidence threshold (0-1) to include (default: 0)
+        limit: Maximum number of peers to return when peer_id not set (default: 50)
+
+    Returns:
+        Dict with quality scores and recommendations.
+
+    Examples:
+        # Get quality score for a specific peer
+        hive-peer-quality peer_id=02abc123...
+
+        # Get top 20 highest quality peers
+        hive-peer-quality limit=20
+
+        # Get only high-confidence scores
+        hive-peer-quality min_confidence=0.5
+
+        # Use 30 days of data instead of 90
+        hive-peer-quality peer_id=02abc123... days=30
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Create scorer instance
+    scorer = PeerQualityScorer(database, plugin)
+
+    # Bound parameters
+    days = min(max(1, days), 365)
+    limit = min(max(1, limit), 200)
+    min_confidence = max(0.0, min(1.0, min_confidence))
+
+    if peer_id:
+        # Single peer score
+        result = scorer.calculate_score(peer_id, days=days)
+        return {
+            "peer_id": peer_id,
+            "days": days,
+            "score": result.to_dict(),
+        }
+
+    # All peers with event data
+    results = scorer.get_scored_peers(days=days, min_confidence=min_confidence)
+
+    # Limit results
+    results = results[:limit]
+
+    return {
+        "count": len(results),
+        "limit": limit,
+        "days": days,
+        "min_confidence": min_confidence,
+        "peers": [r.to_dict() for r in results],
+        "score_breakdown": {
+            "excellent": len([r for r in results if r.recommendation == "excellent"]),
+            "good": len([r for r in results if r.recommendation == "good"]),
+            "neutral": len([r for r in results if r.recommendation == "neutral"]),
+            "caution": len([r for r in results if r.recommendation == "caution"]),
+            "avoid": len([r for r in results if r.recommendation == "avoid"]),
+        }
+    }
+
+
+@plugin.method("hive-quality-check")
+def hive_quality_check(plugin: Plugin, peer_id: str, days: int = 90,
+                       min_score: float = 0.45):
+    """
+    Quick quality check for a peer - should we open a channel? (Phase 6.2)
+
+    This is a convenience method for the planner and governance engine to
+    quickly determine if a peer is suitable for channel opening.
+
+    Args:
+        peer_id: Peer to evaluate (required)
+        days: Days of history to consider (default: 90)
+        min_score: Minimum quality score required (default: 0.45)
+
+    Returns:
+        Dict with recommendation and reasoning.
+
+    Examples:
+        # Check if peer is suitable for channel
+        hive-quality-check peer_id=02abc123...
+
+        # Use stricter threshold
+        hive-quality-check peer_id=02abc123... min_score=0.6
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    # Create scorer and check
+    scorer = PeerQualityScorer(database, plugin)
+    should_open, reason = scorer.should_open_channel(
+        peer_id, days=days, min_score=min_score
+    )
+
+    # Also get full score for context
+    result = scorer.calculate_score(peer_id, days=days)
+
+    return {
+        "peer_id": peer_id,
+        "should_open": should_open,
+        "reason": reason,
+        "overall_score": round(result.overall_score, 3),
+        "confidence": round(result.confidence, 3),
+        "recommendation": result.recommendation,
+        "min_score_threshold": min_score,
+    }
+
+
+@plugin.method("hive-calculate-size")
+def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
+                        channel_count: int = None, hive_share_pct: float = 0.0):
+    """
+    Calculate recommended channel size for a peer (Phase 6.3).
+
+    This RPC previews what channel size would be recommended for a given peer,
+    taking into account quality scores, network factors, and configuration.
+
+    Args:
+        peer_id: Target peer pubkey (required)
+        capacity_sats: Target's public capacity in sats (optional, will lookup)
+        channel_count: Target's channel count (optional, will lookup)
+        hive_share_pct: Current hive share to target 0-1 (default: 0)
+
+    Returns:
+        Dict with recommended size, factors, and reasoning.
+
+    Examples:
+        # Calculate size for a peer (auto-lookup capacity)
+        hive-calculate-size peer_id=02abc123...
+
+        # Override capacity and channel count
+        hive-calculate-size peer_id=02abc123... capacity_sats=100000000 channel_count=50
+
+        # Simulate existing hive share
+        hive-calculate-size peer_id=02abc123... hive_share_pct=0.05
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if not config:
+        return {"error": "Config not initialized"}
+
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    # Get config snapshot
+    cfg = config.snapshot()
+
+    # Lookup capacity and channel count if not provided
+    if capacity_sats is None or channel_count is None:
+        try:
+            # Try to get from listchannels
+            channels = plugin.rpc.listchannels(source=peer_id)
+            peer_channels = channels.get('channels', [])
+
+            if capacity_sats is None:
+                capacity_sats = sum(c.get('amount_msat', 0) // 1000 for c in peer_channels)
+                if capacity_sats == 0:
+                    capacity_sats = 100_000_000  # Default 1 BTC if not found
+
+            if channel_count is None:
+                channel_count = len(peer_channels)
+                if channel_count == 0:
+                    channel_count = 20  # Default moderate connectivity
+        except Exception as e:
+            plugin.log(f"cl-hive: Error looking up peer info: {e}", level='debug')
+            if capacity_sats is None:
+                capacity_sats = 100_000_000  # Default 1 BTC
+            if channel_count is None:
+                channel_count = 20  # Default moderate
+
+    # Get onchain balance
+    try:
+        funds = plugin.rpc.listfunds()
+        outputs = funds.get('outputs', [])
+        onchain_balance = sum(
+            (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
+             else int(o.get('amount_msat', '0msat')[:-4]) // 1000
+             if isinstance(o.get('amount_msat'), str) else o.get('value', 0))
+            for o in outputs if o.get('status') == 'confirmed'
+        )
+    except Exception:
+        onchain_balance = cfg.planner_default_channel_sats * 10  # Assume adequate
+
+    # Get available budget (considering all constraints)
+    daily_remaining = database.get_available_budget(cfg.autonomous_budget_per_day)
+    max_per_channel = int(cfg.autonomous_budget_per_day * cfg.budget_max_per_channel_pct)
+    spendable_onchain = int(onchain_balance * (1.0 - cfg.budget_reserve_pct))
+    available_budget = min(daily_remaining, max_per_channel, spendable_onchain)
+
+    # Create quality scorer and channel sizer
+    scorer = PeerQualityScorer(database, plugin)
+    sizer = ChannelSizer(plugin=plugin, quality_scorer=scorer)
+
+    # Calculate size with budget constraint
+    result = sizer.calculate_size(
+        target=peer_id,
+        target_capacity_sats=capacity_sats,
+        target_channel_count=channel_count,
+        hive_share_pct=hive_share_pct,
+        target_share_cap=cfg.market_share_cap_pct * 0.5,
+        onchain_balance_sats=onchain_balance,
+        min_channel_sats=cfg.planner_min_channel_sats,
+        max_channel_sats=cfg.planner_max_channel_sats,
+        default_channel_sats=cfg.planner_default_channel_sats,
+        available_budget_sats=available_budget,
+    )
+
+    # Get budget summary
+    budget_info = database.get_budget_summary(cfg.autonomous_budget_per_day, days=1)
+
+    return {
+        "peer_id": peer_id,
+        "recommended_size_sats": result.recommended_size_sats,
+        "recommended_size_btc": round(result.recommended_size_sats / 100_000_000, 4),
+        "reasoning": result.reasoning,
+        "factors": result.factors,
+        "inputs": {
+            "capacity_sats": capacity_sats,
+            "channel_count": channel_count,
+            "hive_share_pct": hive_share_pct,
+            "onchain_balance_sats": onchain_balance,
+        },
+        "budget": {
+            "daily_budget_sats": cfg.autonomous_budget_per_day,
+            "spent_today_sats": budget_info['today']['spent_sats'],
+            "daily_remaining_sats": daily_remaining,
+            "max_per_channel_sats": max_per_channel,
+            "reserve_pct": cfg.budget_reserve_pct,
+            "spendable_onchain_sats": spendable_onchain,
+            "effective_budget_sats": available_budget,
+            "budget_limited": result.factors.get('budget_limited', False),
+        },
+        "config_bounds": {
+            "min_channel_sats": cfg.planner_min_channel_sats,
+            "max_channel_sats": cfg.planner_max_channel_sats,
+            "default_channel_sats": cfg.planner_default_channel_sats,
+        }
+    }
+
+
+@plugin.method("hive-expansion-status")
+def hive_expansion_status(plugin: Plugin, round_id: str = None,
+                          target_peer_id: str = None):
+    """
+    Get status of cooperative expansion rounds (Phase 6.4).
+
+    The cooperative expansion system coordinates channel opening decisions
+    across hive members to avoid redundant connections and optimize topology.
+
+    Args:
+        round_id: Get status of a specific round (optional)
+        target_peer_id: Get rounds for a specific target peer (optional)
+
+    Returns:
+        Dict with expansion round status and statistics.
+
+    Examples:
+        # Get overall status
+        hive-expansion-status
+
+        # Get specific round
+        hive-expansion-status round_id=abc12345
+
+        # Get rounds for a target
+        hive-expansion-status target_peer_id=02abc123...
+    """
+    if not coop_expansion:
+        return {"error": "Cooperative expansion not initialized"}
+
+    if round_id:
+        # Get specific round
+        round_obj = coop_expansion.get_round(round_id)
+        if not round_obj:
+            return {"error": f"Round {round_id} not found"}
+        return {
+            "round_id": round_id,
+            "round": round_obj.to_dict(),
+            "nominations": [
+                {
+                    "nominator": n.nominator_id[:16] + "...",
+                    "liquidity": n.available_liquidity_sats,
+                    "quality_score": round(n.quality_score, 3),
+                    "channel_count": n.channel_count,
+                    "has_existing": n.has_existing_channel,
+                }
+                for n in round_obj.nominations.values()
+            ]
+        }
+
+    if target_peer_id:
+        # Get rounds for target
+        rounds = coop_expansion.get_rounds_for_target(target_peer_id)
+        return {
+            "target_peer_id": target_peer_id,
+            "count": len(rounds),
+            "rounds": [r.to_dict() for r in rounds],
+        }
+
+    # Get overall status
+    return coop_expansion.get_status()
+
+
+@plugin.method("hive-expansion-nominate")
+def hive_expansion_nominate(plugin: Plugin, target_peer_id: str, round_id: str = None):
+    """
+    Manually trigger a cooperative expansion round for a peer (Phase 6.4).
+
+    This RPC allows manually starting a cooperative expansion round
+    for a target peer, useful for testing or when automatic triggering
+    is disabled.
+
+    Args:
+        target_peer_id: The external peer to consider for expansion
+        round_id: Optional existing round ID to join (if omitted, starts new round)
+
+    Returns:
+        Dict with round information.
+
+    Examples:
+        # Start a new expansion round
+        hive-expansion-nominate target_peer_id=02abc123...
+
+        # Join an existing round
+        hive-expansion-nominate target_peer_id=02abc123... round_id=abc12345
+    """
+    if not coop_expansion:
+        return {"error": "Cooperative expansion not initialized"}
+
+    if not target_peer_id:
+        return {"error": "target_peer_id is required"}
+
+    if round_id:
+        # Join existing round - create it locally if we don't have it
+        round_obj = coop_expansion.get_round(round_id)
+        if not round_obj:
+            # Create the round locally to join it
+            plugin.log(f"cl-hive: Creating local copy of remote round {round_id[:8]}...")
+            coop_expansion.join_remote_round(
+                round_id=round_id,
+                target_peer_id=target_peer_id,
+                trigger_reporter=our_pubkey or ""
+            )
+
+        # Broadcast our nomination
+        _broadcast_expansion_nomination(round_id, target_peer_id)
+
+        return {
+            "action": "joined",
+            "round_id": round_id,
+            "target_peer_id": target_peer_id,
+        }
+
+    # Start new round
+    new_round_id = coop_expansion.start_round(
+        target_peer_id=target_peer_id,
+        trigger_event="manual",
+        trigger_reporter=our_pubkey or "",
+        quality_score=0.5
+    )
+
+    # Broadcast our nomination
+    _broadcast_expansion_nomination(new_round_id, target_peer_id)
+
+    return {
+        "action": "started",
+        "round_id": new_round_id,
+        "target_peer_id": target_peer_id,
+    }
+
+
+@plugin.method("hive-expansion-elect")
+def hive_expansion_elect(plugin: Plugin, round_id: str):
+    """
+    Manually trigger election for an expansion round (Phase 6.4).
+
+    Normally elections happen automatically after the nomination window.
+    This RPC allows manually triggering an election early.
+
+    Args:
+        round_id: The round to elect for (required)
+
+    Returns:
+        Dict with election result.
+
+    Examples:
+        hive-expansion-elect round_id=abc12345
+    """
+    if not coop_expansion:
+        return {"error": "Cooperative expansion not initialized"}
+
+    if not round_id:
+        return {"error": "round_id is required"}
+
+    round_obj = coop_expansion.get_round(round_id)
+    if not round_obj:
+        return {"error": f"Round {round_id} not found"}
+
+    # Run election
+    elected_id = coop_expansion.elect_winner(round_id)
+
+    if not elected_id:
+        return {
+            "round_id": round_id,
+            "elected": False,
+            "reason": round_obj.result if round_obj else "Unknown",
+        }
+
+    # Broadcast election result
+    _broadcast_expansion_elect(
+        round_id=round_id,
+        target_peer_id=round_obj.target_peer_id,
+        elected_id=elected_id,
+        channel_size_sats=round_obj.recommended_size_sats,
+        quality_score=round_obj.quality_score,
+        nomination_count=len(round_obj.nominations)
+    )
+
+    return {
+        "round_id": round_id,
+        "elected": True,
+        "elected_id": elected_id,
+        "target_peer_id": round_obj.target_peer_id,
+        "nomination_count": len(round_obj.nominations),
+    }
+
+
 @plugin.method("hive-planner-log")
 def hive_planner_log(plugin: Plugin, limit: int = 50):
     """
@@ -2889,15 +4194,18 @@ def hive_pending_actions(plugin: Plugin):
 
 
 @plugin.method("hive-approve-action")
-def hive_approve_action(plugin: Plugin, action_id: int):
+def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None):
     """
     Approve and execute a pending action.
 
     Args:
         action_id: ID of the action to approve
+        amount_sats: Optional override for channel size (member budget control).
+            If provided, uses this amount instead of the proposed amount.
+            Must be >= min_channel_sats and will still be subject to budget limits.
 
     Returns:
-        Dict with approval result.
+        Dict with approval result including budget details.
 
     Permission: Member or Admin only
     """
@@ -2932,10 +4240,85 @@ def hive_approve_action(plugin: Plugin, action_id: int):
         target = payload.get('target')
         context = payload.get('context', {})
         intent_id = context.get('intent_id')
-        channel_size_sats = context.get('channel_size_sats', context.get('amount_sats', 1_000_000))
+        proposed_size = context.get('channel_size_sats', context.get('amount_sats', 1_000_000))
+
+        # Apply member override if provided
+        if amount_sats is not None:
+            channel_size_sats = amount_sats
+            override_applied = True
+        else:
+            channel_size_sats = proposed_size
+            override_applied = False
 
         if not target:
             return {"error": "Missing target in action payload", "action_id": action_id}
+
+        # Calculate intelligent budget limits
+        cfg = config.snapshot() if config else None
+        budget_info = {}
+        if cfg:
+            # Get onchain balance for reserve calculation
+            try:
+                funds = safe_plugin.rpc.listfunds()
+                onchain_sats = sum(o.get('amount_msat', 0) // 1000 for o in funds.get('outputs', [])
+                                   if o.get('status') == 'confirmed')
+            except Exception:
+                onchain_sats = 0
+
+            # Calculate budget components:
+            # 1. Daily budget remaining
+            daily_remaining = database.get_available_budget(cfg.autonomous_budget_per_day)
+
+            # 2. Onchain reserve limit (keep reserve_pct for future expansion)
+            spendable_onchain = int(onchain_sats * (1.0 - cfg.budget_reserve_pct))
+
+            # 3. Max per-channel limit (percentage of daily budget)
+            max_per_channel = int(cfg.autonomous_budget_per_day * cfg.budget_max_per_channel_pct)
+
+            # Effective budget is the minimum of all constraints
+            effective_budget = min(daily_remaining, spendable_onchain, max_per_channel)
+
+            budget_info = {
+                "onchain_sats": onchain_sats,
+                "reserve_pct": cfg.budget_reserve_pct,
+                "spendable_onchain": spendable_onchain,
+                "daily_budget": cfg.autonomous_budget_per_day,
+                "daily_remaining": daily_remaining,
+                "max_per_channel_pct": cfg.budget_max_per_channel_pct,
+                "max_per_channel": max_per_channel,
+                "effective_budget": effective_budget,
+            }
+
+            if channel_size_sats > effective_budget:
+                # Reduce to effective budget if it's above minimum
+                if effective_budget >= cfg.planner_min_channel_sats:
+                    plugin.log(
+                        f"cl-hive: Reducing channel size from {channel_size_sats:,} to {effective_budget:,} "
+                        f"due to budget constraints (daily={daily_remaining:,}, reserve={spendable_onchain:,}, "
+                        f"per-channel={max_per_channel:,})",
+                        level='info'
+                    )
+                    channel_size_sats = effective_budget
+                else:
+                    limiting_factor = "daily budget" if daily_remaining == effective_budget else \
+                                     "reserve limit" if spendable_onchain == effective_budget else \
+                                     "per-channel limit"
+                    return {
+                        "error": f"Insufficient budget for channel open ({limiting_factor})",
+                        "action_id": action_id,
+                        "requested_sats": channel_size_sats,
+                        "effective_budget_sats": effective_budget,
+                        "min_channel_sats": cfg.planner_min_channel_sats,
+                        "budget_info": budget_info,
+                    }
+
+            # Validate member override is within bounds
+            if override_applied and channel_size_sats < cfg.planner_min_channel_sats:
+                return {
+                    "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
+                    "action_id": action_id,
+                    "min_channel_sats": cfg.planner_min_channel_sats,
+                }
 
         # Get intent from database (if available)
         intent_record = None
@@ -3003,11 +4386,12 @@ def hive_approve_action(plugin: Plugin, action_id: int):
             )
 
             # fundchannel with the calculated size
-            result = safe_plugin.rpc.fundchannel(
-                id=target,
-                amount=channel_size_sats,
-                announce=True  # Public channel
-            )
+            # Use rpc.call() for explicit control over parameter names
+            result = safe_plugin.rpc.call("fundchannel", {
+                "id": target,
+                "amount": channel_size_sats,
+                "announce": True  # Public channel
+            })
 
             channel_id = result.get('channel_id', 'unknown')
             txid = result.get('txid', 'unknown')
@@ -3024,17 +4408,33 @@ def hive_approve_action(plugin: Plugin, action_id: int):
             # Update action status
             database.update_action_status(action_id, 'executed')
 
-            return {
+            # Record budget spending
+            database.record_budget_spend(
+                action_type='channel_open',
+                amount_sats=channel_size_sats,
+                target=target,
+                action_id=action_id
+            )
+            plugin.log(f"cl-hive: Recorded budget spend of {channel_size_sats:,} sats", level='debug')
+
+            result = {
                 "status": "executed",
                 "action_id": action_id,
                 "action_type": action_type,
                 "target": target,
                 "channel_size_sats": channel_size_sats,
+                "proposed_size_sats": proposed_size,
                 "channel_id": channel_id,
                 "txid": txid,
                 "broadcast_count": broadcast_count,
                 "sizing_reasoning": context.get('sizing_reasoning', 'N/A'),
             }
+            if override_applied:
+                result["override_applied"] = True
+                result["override_amount"] = amount_sats
+            if budget_info:
+                result["budget_info"] = budget_info
+            return result
 
         except Exception as e:
             error_msg = str(e)
@@ -3108,6 +4508,41 @@ def hive_reject_action(plugin: Plugin, action_id: int):
         "status": "rejected",
         "action_id": action_id,
         "action_type": action['action_type'],
+    }
+
+
+@plugin.method("hive-budget-summary")
+def hive_budget_summary(plugin: Plugin, days: int = 7):
+    """
+    Get budget usage summary for autonomous mode.
+
+    Args:
+        days: Number of days of history to include (default: 7)
+
+    Returns:
+        Dict with budget utilization and spending history.
+
+    Permission: Member or Admin only
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    cfg = config.snapshot() if config else None
+    if not cfg:
+        return {"error": "Config not initialized"}
+
+    daily_budget = cfg.autonomous_budget_per_day
+    summary = database.get_budget_summary(daily_budget, days)
+
+    return {
+        "daily_budget_sats": daily_budget,
+        "governance_mode": cfg.governance_mode,
+        **summary
     }
 
 

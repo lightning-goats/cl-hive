@@ -48,6 +48,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'autonomous_actions_per_hour': int,
     'oracle_url': str,
     'oracle_timeout_seconds': int,
+    'budget_reserve_pct': float,
+    'budget_max_per_channel_pct': float,
 }
 
 # Range constraints for numeric fields
@@ -71,6 +73,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'autonomous_budget_per_day': (100_000, 100_000_000),  # 100k to 100M sats
     'autonomous_actions_per_hour': (1, 10),  # 1 to 10 actions per hour
     'oracle_timeout_seconds': (1, 30),  # 1 to 30 seconds
+    'budget_reserve_pct': (0.05, 0.50),  # 5% to 50% reserve
+    'budget_max_per_channel_pct': (0.10, 1.0),  # 10% to 100% of daily budget per channel
 }
 
 # Valid governance modes
@@ -130,6 +134,8 @@ class HiveConfig:
     autonomous_actions_per_hour: int = 2         # Max 2 actions per hour
     oracle_url: Optional[str] = None             # External oracle API URL
     oracle_timeout_seconds: int = 5              # Oracle API timeout
+    budget_reserve_pct: float = 0.20             # Reserve 20% of onchain for future expansion
+    budget_max_per_channel_pct: float = 0.50     # Max 50% of daily budget per single channel
 
     # Internal version tracking
     _version: int = field(default=0, repr=False, compare=False)
@@ -199,8 +205,10 @@ class HiveConfigSnapshot:
     autonomous_actions_per_hour: int
     oracle_url: Optional[str]
     oracle_timeout_seconds: int
+    budget_reserve_pct: float
+    budget_max_per_channel_pct: float
     version: int
-    
+
     @classmethod
     def from_config(cls, config: HiveConfig) -> 'HiveConfigSnapshot':
         """Create a frozen snapshot from mutable config."""
@@ -231,5 +239,7 @@ class HiveConfigSnapshot:
             autonomous_actions_per_hour=config.autonomous_actions_per_hour,
             oracle_url=config.oracle_url,
             oracle_timeout_seconds=config.oracle_timeout_seconds,
+            budget_reserve_pct=config.budget_reserve_pct,
+            budget_max_per_channel_pct=config.budget_max_per_channel_pct,
             version=config._version,
         )

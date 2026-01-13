@@ -79,6 +79,11 @@ class HiveMessageType(IntEnum):
     BAN_PROPOSAL = 32799  # Propose banning a member (requires vote)
     BAN_VOTE = 32801     # Vote on a pending ban proposal
 
+    # Phase 6: Channel Coordination
+    PEER_AVAILABLE = 32803  # Notify hive that a peer is available for channels
+    EXPANSION_NOMINATE = 32805  # Nominate self to open channel (Phase 6.4)
+    EXPANSION_ELECT = 32807     # Announce elected member for expansion (Phase 6.4)
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -409,6 +414,62 @@ def validate_ban_vote(payload: Dict[str, Any]) -> bool:
     return True
 
 
+def validate_peer_available(payload: Dict[str, Any]) -> bool:
+    """Validate PEER_AVAILABLE payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    target_peer_id = payload.get("target_peer_id")
+    reporter_peer_id = payload.get("reporter_peer_id")
+    event_type = payload.get("event_type")
+    timestamp = payload.get("timestamp")
+
+    # target_peer_id must be valid pubkey (the external peer)
+    if not _valid_pubkey(target_peer_id):
+        return False
+
+    # reporter_peer_id must be valid pubkey (the hive member reporting)
+    if not _valid_pubkey(reporter_peer_id):
+        return False
+
+    # event_type must be a valid string
+    valid_event_types = (
+        'channel_open',      # New channel opened
+        'channel_close',     # Channel closed (any type)
+        'remote_close',      # Remote peer initiated close
+        'local_close',       # Local node initiated close
+        'mutual_close',      # Mutual close
+        'channel_expired',   # Channel expired/timeout
+        'peer_quality'       # Periodic quality report
+    )
+    if event_type not in valid_event_types:
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # Optional numeric fields - validate if present
+    optional_int_fields = [
+        'capacity_sats', 'channel_id', 'duration_days',
+        'total_revenue_sats', 'total_rebalance_cost_sats', 'net_pnl_sats',
+        'forward_count', 'forward_volume_sats', 'our_fee_ppm', 'their_fee_ppm',
+        'our_funding_sats', 'their_funding_sats'
+    ]
+    for field in optional_int_fields:
+        val = payload.get(field)
+        if val is not None and not isinstance(val, int):
+            return False
+
+    optional_float_fields = ['routing_score', 'profitability_score']
+    for field in optional_float_fields:
+        val = payload.get(field)
+        if val is not None and not isinstance(val, (int, float)):
+            return False
+
+    return True
+
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
@@ -443,7 +504,7 @@ def create_attest(pubkey: str, version: str, features: list,
     })
 
 
-def create_welcome(hive_id: str, tier: str, member_count: int, 
+def create_welcome(hive_id: str, tier: str, member_count: int,
                    state_hash: str) -> bytes:
     """Create a HIVE_WELCOME message."""
     return serialize(HiveMessageType.WELCOME, {
@@ -452,3 +513,286 @@ def create_welcome(hive_id: str, tier: str, member_count: int,
         "member_count": member_count,
         "state_hash": state_hash
     })
+
+
+def create_peer_available(target_peer_id: str, reporter_peer_id: str,
+                          event_type: str, timestamp: int,
+                          channel_id: str = "",
+                          capacity_sats: int = 0,
+                          routing_score: float = 0.0,
+                          profitability_score: float = 0.0,
+                          reason: str = "",
+                          # Profitability data from cl-revenue-ops
+                          duration_days: int = 0,
+                          total_revenue_sats: int = 0,
+                          total_rebalance_cost_sats: int = 0,
+                          net_pnl_sats: int = 0,
+                          forward_count: int = 0,
+                          forward_volume_sats: int = 0,
+                          our_fee_ppm: int = 0,
+                          their_fee_ppm: int = 0,
+                          # Channel funding info (for opens)
+                          our_funding_sats: int = 0,
+                          their_funding_sats: int = 0,
+                          opener: str = "") -> bytes:
+    """
+    Create a PEER_AVAILABLE message.
+
+    Used to notify hive members about channel events for topology awareness.
+    Sent when:
+    - A channel opens (local or remote initiated)
+    - A channel closes (any type)
+    - A peer's routing quality is exceptional
+
+    Args:
+        target_peer_id: The external peer involved
+        reporter_peer_id: The hive member reporting (our pubkey)
+        event_type: 'channel_open', 'channel_close', 'remote_close', 'local_close',
+                    'mutual_close', 'channel_expired', or 'peer_quality'
+        timestamp: Unix timestamp
+        channel_id: The channel short ID
+        capacity_sats: Channel capacity
+        routing_score: Peer's routing quality score (0-1)
+        profitability_score: Overall profitability score (0-1)
+        reason: Human-readable reason
+
+        # Profitability data (for closures):
+        duration_days: How long the channel was open
+        total_revenue_sats: Total routing fees earned
+        total_rebalance_cost_sats: Total rebalancing costs
+        net_pnl_sats: Net profit/loss
+        forward_count: Number of forwards routed
+        forward_volume_sats: Total volume routed
+        our_fee_ppm: Fee rate we charged
+        their_fee_ppm: Fee rate they charged us
+
+        # Funding info (for opens):
+        our_funding_sats: Amount we funded
+        their_funding_sats: Amount they funded
+        opener: Who opened: 'local' or 'remote'
+
+    Returns:
+        Serialized PEER_AVAILABLE message
+    """
+    payload = {
+        "target_peer_id": target_peer_id,
+        "reporter_peer_id": reporter_peer_id,
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "reason": reason
+    }
+
+    # Add non-zero optional fields to reduce message size
+    if channel_id:
+        payload["channel_id"] = channel_id
+    if capacity_sats:
+        payload["capacity_sats"] = capacity_sats
+    if routing_score:
+        payload["routing_score"] = routing_score
+    if profitability_score:
+        payload["profitability_score"] = profitability_score
+
+    # Profitability data
+    if duration_days:
+        payload["duration_days"] = duration_days
+    if total_revenue_sats:
+        payload["total_revenue_sats"] = total_revenue_sats
+    if total_rebalance_cost_sats:
+        payload["total_rebalance_cost_sats"] = total_rebalance_cost_sats
+    if net_pnl_sats:
+        payload["net_pnl_sats"] = net_pnl_sats
+    if forward_count:
+        payload["forward_count"] = forward_count
+    if forward_volume_sats:
+        payload["forward_volume_sats"] = forward_volume_sats
+    if our_fee_ppm:
+        payload["our_fee_ppm"] = our_fee_ppm
+    if their_fee_ppm:
+        payload["their_fee_ppm"] = their_fee_ppm
+
+    # Funding info
+    if our_funding_sats:
+        payload["our_funding_sats"] = our_funding_sats
+    if their_funding_sats:
+        payload["their_funding_sats"] = their_funding_sats
+    if opener:
+        payload["opener"] = opener
+
+    return serialize(HiveMessageType.PEER_AVAILABLE, payload)
+
+
+# =============================================================================
+# PHASE 6.4: COOPERATIVE EXPANSION PROTOCOL
+# =============================================================================
+
+def validate_expansion_nominate(payload: Dict[str, Any]) -> bool:
+    """
+    Validate EXPANSION_NOMINATE payload schema.
+
+    This message is sent by hive members to express interest in opening
+    a channel to a target peer during a cooperative expansion round.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    # Required fields
+    round_id = payload.get("round_id")
+    target_peer_id = payload.get("target_peer_id")
+    nominator_id = payload.get("nominator_id")
+    timestamp = payload.get("timestamp")
+
+    # round_id must be a non-empty string
+    if not isinstance(round_id, str) or len(round_id) < 8:
+        return False
+
+    # Pubkeys must be valid
+    if not _valid_pubkey(target_peer_id):
+        return False
+    if not _valid_pubkey(nominator_id):
+        return False
+
+    # Timestamp must be valid
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # Optional: Check numeric fields
+    available_liquidity = payload.get("available_liquidity_sats", 0)
+    if not isinstance(available_liquidity, int) or available_liquidity < 0:
+        return False
+
+    quality_score = payload.get("quality_score", 0.5)
+    if not isinstance(quality_score, (int, float)) or not (0 <= quality_score <= 1):
+        return False
+
+    return True
+
+
+def validate_expansion_elect(payload: Dict[str, Any]) -> bool:
+    """
+    Validate EXPANSION_ELECT payload schema.
+
+    This message announces which hive member has been elected to open
+    a channel to the target peer.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    # Required fields
+    round_id = payload.get("round_id")
+    target_peer_id = payload.get("target_peer_id")
+    elected_id = payload.get("elected_id")
+    timestamp = payload.get("timestamp")
+
+    # round_id must be a non-empty string
+    if not isinstance(round_id, str) or len(round_id) < 8:
+        return False
+
+    # Pubkeys must be valid
+    if not _valid_pubkey(target_peer_id):
+        return False
+    if not _valid_pubkey(elected_id):
+        return False
+
+    # Timestamp must be valid
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # channel_size_sats must be positive if present
+    channel_size = payload.get("channel_size_sats", 0)
+    if not isinstance(channel_size, int) or channel_size < 0:
+        return False
+
+    return True
+
+
+def create_expansion_nominate(
+    round_id: str,
+    target_peer_id: str,
+    nominator_id: str,
+    timestamp: int,
+    available_liquidity_sats: int = 0,
+    quality_score: float = 0.5,
+    has_existing_channel: bool = False,
+    channel_count: int = 0,
+    reason: str = ""
+) -> bytes:
+    """
+    Create an EXPANSION_NOMINATE message.
+
+    Sent by hive members to express interest in opening a channel to a target
+    during a cooperative expansion round.
+
+    Args:
+        round_id: Unique identifier for this expansion round
+        target_peer_id: The external peer to potentially open a channel to
+        nominator_id: The hive member nominating themselves
+        timestamp: Unix timestamp
+        available_liquidity_sats: Nominator's available onchain balance
+        quality_score: Nominator's calculated quality score for the target
+        has_existing_channel: Whether nominator already has a channel to target
+        channel_count: Total number of channels the nominator has
+        reason: Optional reason for nomination
+
+    Returns:
+        Serialized EXPANSION_NOMINATE message
+    """
+    payload = {
+        "round_id": round_id,
+        "target_peer_id": target_peer_id,
+        "nominator_id": nominator_id,
+        "timestamp": timestamp,
+        "available_liquidity_sats": available_liquidity_sats,
+        "quality_score": quality_score,
+        "has_existing_channel": has_existing_channel,
+        "channel_count": channel_count,
+    }
+
+    if reason:
+        payload["reason"] = reason
+
+    return serialize(HiveMessageType.EXPANSION_NOMINATE, payload)
+
+
+def create_expansion_elect(
+    round_id: str,
+    target_peer_id: str,
+    elected_id: str,
+    timestamp: int,
+    channel_size_sats: int = 0,
+    quality_score: float = 0.5,
+    nomination_count: int = 0,
+    reason: str = ""
+) -> bytes:
+    """
+    Create an EXPANSION_ELECT message.
+
+    Broadcast to announce which hive member has been elected to open
+    a channel to the target peer.
+
+    Args:
+        round_id: Unique identifier for this expansion round
+        target_peer_id: The external peer to open a channel to
+        elected_id: The hive member elected to open the channel
+        timestamp: Unix timestamp
+        channel_size_sats: Recommended channel size
+        quality_score: Target's quality score
+        nomination_count: Number of nominations received
+        reason: Reason for election
+
+    Returns:
+        Serialized EXPANSION_ELECT message
+    """
+    payload = {
+        "round_id": round_id,
+        "target_peer_id": target_peer_id,
+        "elected_id": elected_id,
+        "timestamp": timestamp,
+        "channel_size_sats": channel_size_sats,
+        "quality_score": quality_score,
+        "nomination_count": nomination_count,
+    }
+
+    if reason:
+        payload["reason"] = reason
+
+    return serialize(HiveMessageType.EXPANSION_ELECT, payload)
