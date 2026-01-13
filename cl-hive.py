@@ -90,6 +90,12 @@ from modules.rpc_commands import (
     enable_expansions as rpc_enable_expansions,
     pending_admin_promotions as rpc_pending_admin_promotions,
     pending_bans as rpc_pending_bans,
+    # Phase 4: Topology, Planner, and Query Commands
+    reinit_bridge as rpc_reinit_bridge,
+    topology as rpc_topology,
+    planner_log as rpc_planner_log,
+    intent_status as rpc_intent_status,
+    contribution as rpc_contribution,
 )
 
 # Initialize the plugin
@@ -406,6 +412,7 @@ def _get_hive_context() -> HiveContext:
     _membership_mgr = membership_mgr if 'membership_mgr' in globals() else None
     # coop_expansion is the global name, not coop_expansion_mgr
     _coop_expansion = coop_expansion if 'coop_expansion' in globals() else None
+    _contribution_mgr = contribution_mgr if 'contribution_mgr' in globals() else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -423,6 +430,7 @@ def _get_hive_context() -> HiveContext:
         intent_mgr=_intent_mgr,
         membership_mgr=_membership_mgr,
         coop_expansion_mgr=_coop_expansion,
+        contribution_mgr=_contribution_mgr,
         log=_log,
     )
 
@@ -3608,36 +3616,12 @@ def hive_reinit_bridge(plugin: Plugin):
     """
     Re-attempt bridge initialization if it failed at startup.
 
-    Useful for recovering from startup race conditions where cl-revenue-ops
-    wasn't ready when cl-hive initialized. Also useful after cl-revenue-ops
-    is installed or restarted.
-
     Returns:
         Dict with bridge status and details.
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not bridge:
-        return {"error": "Bridge module not initialized"}
-
-    previous_status = bridge.status.value
-    new_status = bridge.reinitialize()
-
-    return {
-        "previous_status": previous_status,
-        "new_status": new_status.value,
-        "revenue_ops_version": bridge._revenue_ops_version,
-        "clboss_available": bridge._clboss_available,
-        "message": (
-            "Bridge enabled successfully" if new_status == BridgeStatus.ENABLED
-            else "Bridge still disabled - check cl-revenue-ops installation"
-        )
-    }
+    return rpc_reinit_bridge(_get_hive_context())
 
 
 @plugin.method("hive-vpn-status")
@@ -3713,47 +3697,7 @@ def hive_topology(plugin: Plugin):
     Returns:
         Dict with saturated targets, planner stats, and config.
     """
-    if not planner:
-        return {"error": "Planner not initialized"}
-    if not config:
-        return {"error": "Config not initialized"}
-
-    # Take config snapshot
-    cfg = config.snapshot()
-
-    # Refresh network cache before analysis
-    planner._refresh_network_cache(force=True)
-
-    # Get saturated targets
-    saturated = planner.get_saturated_targets(cfg)
-    saturated_list = [
-        {
-            "target": r.target[:16] + "...",
-            "target_full": r.target,
-            "hive_capacity_sats": r.hive_capacity_sats,
-            "public_capacity_sats": r.public_capacity_sats,
-            "hive_share_pct": round(r.hive_share_pct * 100, 2),
-        }
-        for r in saturated
-    ]
-
-    # Get planner stats
-    stats = planner.get_planner_stats()
-
-    return {
-        "saturated_targets": saturated_list,
-        "saturated_count": len(saturated_list),
-        "ignored_peers": stats.get("ignored_peers", []),
-        "ignored_count": stats.get("ignored_peers_count", 0),
-        "network_cache_size": stats.get("network_cache_size", 0),
-        "network_cache_age_seconds": stats.get("network_cache_age_seconds", 0),
-        "config": {
-            "market_share_cap_pct": cfg.market_share_cap_pct,
-            "planner_interval_seconds": cfg.planner_interval,
-            "expansions_enabled": cfg.planner_enable_expansions,
-            "governance_mode": cfg.governance_mode,
-        }
-    }
+    return rpc_topology(_get_hive_context())
 
 
 @plugin.method("hive-channel-closed")
@@ -4490,18 +4434,7 @@ def hive_planner_log(plugin: Plugin, limit: int = 50):
     Returns:
         Dict with log entries and count.
     """
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Bound limit to prevent excessive queries
-    limit = min(max(1, limit), 500)
-
-    logs = database.get_planner_logs(limit=limit)
-    return {
-        "count": len(logs),
-        "limit": limit,
-        "logs": logs,
-    }
+    return rpc_planner_log(_get_hive_context(), limit=limit)
 
 
 @plugin.method("hive-test-intent")
@@ -4573,25 +4506,7 @@ def hive_intent_status(plugin: Plugin):
     Returns:
         Dict with pending intents and stats.
     """
-    if not planner or not planner.intent_manager:
-        return {"error": "Intent manager not initialized"}
-
-    intent_mgr = planner.intent_manager
-    stats = intent_mgr.get_intent_stats()
-
-    # Get pending local intents from DB
-    pending = database.get_pending_intents() if database else []
-
-    # Get remote intents from cache
-    remote = intent_mgr.get_remote_intents()
-
-    return {
-        "local_pending": len(pending),
-        "local_intents": pending,
-        "remote_cached": len(remote),
-        "remote_intents": [r.to_dict() for r in remote],
-        "stats": stats
-    }
+    return rpc_intent_status(_get_hive_context())
 
 
 @plugin.method("hive-test-pending-action")
@@ -5541,35 +5456,7 @@ def hive_contribution(plugin: Plugin, peer_id: str = None):
     Returns:
         Dict with contribution statistics.
     """
-    if not contribution_mgr or not database:
-        return {"error": "Contribution tracking not available"}
-
-    target_id = peer_id or our_pubkey
-    if not target_id:
-        return {"error": "No peer specified and our_pubkey not available"}
-
-    # Get contribution stats
-    stats = contribution_mgr.get_contribution_stats(target_id)
-
-    # Get member info
-    member = database.get_member(target_id)
-
-    # Get leech status
-    leech_status = contribution_mgr.check_leech_status(target_id)
-
-    result = {
-        "peer_id": target_id,
-        "forwarded_msat": stats["forwarded"],
-        "received_msat": stats["received"],
-        "contribution_ratio": round(stats["ratio"], 4),
-        "is_leech": leech_status["is_leech"],
-    }
-
-    if member:
-        result["tier"] = member.get("tier")
-        result["uptime_pct"] = member.get("uptime_pct")
-
-    return result
+    return rpc_contribution(_get_hive_context(), peer_id=peer_id)
 
 
 @plugin.method("hive-request-promotion")

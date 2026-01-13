@@ -35,6 +35,7 @@ class HiveContext:
     intent_mgr: Any = None  # IntentManager
     membership_mgr: Any = None  # MembershipManager
     coop_expansion_mgr: Any = None  # CooperativeExpansionManager
+    contribution_mgr: Any = None  # ContributionManager
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
@@ -926,3 +927,181 @@ def pending_bans(ctx: HiveContext) -> Dict[str, Any]:
         "count": len(result),
         "proposals": result
     }
+
+
+# =============================================================================
+# Phase 4: Topology, Planner, and Query Commands
+# =============================================================================
+
+def reinit_bridge(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Re-attempt bridge initialization if it failed at startup.
+
+    Permission: Admin only
+    """
+    perm_error = check_permission(ctx, 'admin')
+    if perm_error:
+        return perm_error
+
+    if not ctx.bridge:
+        return {"error": "Bridge module not initialized"}
+
+    # Import BridgeStatus here to avoid circular imports
+    from modules.bridge import BridgeStatus
+
+    previous_status = ctx.bridge.status.value
+    new_status = ctx.bridge.reinitialize()
+
+    return {
+        "previous_status": previous_status,
+        "new_status": new_status.value,
+        "revenue_ops_version": ctx.bridge._revenue_ops_version,
+        "clboss_available": ctx.bridge._clboss_available,
+        "message": (
+            "Bridge enabled successfully" if new_status == BridgeStatus.ENABLED
+            else "Bridge still disabled - check cl-revenue-ops installation"
+        )
+    }
+
+
+def topology(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get current topology analysis from the Planner.
+
+    Returns:
+        Dict with saturated targets, planner stats, and config.
+    """
+    if not ctx.planner:
+        return {"error": "Planner not initialized"}
+    if not ctx.config:
+        return {"error": "Config not initialized"}
+
+    # Take config snapshot
+    cfg = ctx.config.snapshot()
+
+    # Refresh network cache before analysis
+    ctx.planner._refresh_network_cache(force=True)
+
+    # Get saturated targets
+    saturated = ctx.planner.get_saturated_targets(cfg)
+    saturated_list = [
+        {
+            "target": r.target[:16] + "...",
+            "target_full": r.target,
+            "hive_capacity_sats": r.hive_capacity_sats,
+            "public_capacity_sats": r.public_capacity_sats,
+            "hive_share_pct": round(r.hive_share_pct * 100, 2),
+        }
+        for r in saturated
+    ]
+
+    # Get planner stats
+    stats = ctx.planner.get_planner_stats()
+
+    return {
+        "saturated_targets": saturated_list,
+        "saturated_count": len(saturated_list),
+        "ignored_peers": stats.get("ignored_peers", []),
+        "ignored_count": stats.get("ignored_peers_count", 0),
+        "network_cache_size": stats.get("network_cache_size", 0),
+        "network_cache_age_seconds": stats.get("network_cache_age_seconds", 0),
+        "config": {
+            "market_share_cap_pct": cfg.market_share_cap_pct,
+            "planner_interval_seconds": cfg.planner_interval,
+            "expansions_enabled": cfg.planner_enable_expansions,
+            "governance_mode": cfg.governance_mode,
+        }
+    }
+
+
+def planner_log(ctx: HiveContext, limit: int = 50) -> Dict[str, Any]:
+    """
+    Get recent Planner decision logs.
+
+    Args:
+        limit: Maximum number of log entries to return (default: 50)
+
+    Returns:
+        Dict with log entries and count.
+    """
+    if not ctx.database:
+        return {"error": "Database not initialized"}
+
+    # Bound limit to prevent excessive queries
+    limit = min(max(1, limit), 500)
+
+    logs = ctx.database.get_planner_logs(limit=limit)
+    return {
+        "count": len(logs),
+        "limit": limit,
+        "logs": logs,
+    }
+
+
+def intent_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get current intent status (local and remote intents).
+
+    Returns:
+        Dict with pending intents and stats.
+    """
+    if not ctx.planner or not ctx.planner.intent_manager:
+        return {"error": "Intent manager not initialized"}
+
+    intent_mgr = ctx.planner.intent_manager
+    stats = intent_mgr.get_intent_stats()
+
+    # Get pending local intents from DB
+    pending = ctx.database.get_pending_intents() if ctx.database else []
+
+    # Get remote intents from cache
+    remote = intent_mgr.get_remote_intents()
+
+    return {
+        "local_pending": len(pending),
+        "local_intents": pending,
+        "remote_cached": len(remote),
+        "remote_intents": [r.to_dict() for r in remote],
+        "stats": stats
+    }
+
+
+def contribution(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
+    """
+    View contribution stats for a peer or self.
+
+    Args:
+        peer_id: Optional peer to view (defaults to self)
+
+    Returns:
+        Dict with contribution statistics.
+    """
+    if not ctx.contribution_mgr or not ctx.database:
+        return {"error": "Contribution tracking not available"}
+
+    target_id = peer_id or ctx.our_pubkey
+    if not target_id:
+        return {"error": "No peer specified and our_pubkey not available"}
+
+    # Get contribution stats
+    stats = ctx.contribution_mgr.get_contribution_stats(target_id)
+
+    # Get member info
+    member = ctx.database.get_member(target_id)
+
+    # Get leech status
+    leech_status = ctx.contribution_mgr.check_leech_status(target_id)
+
+    result = {
+        "peer_id": target_id,
+        "forwarded_msat": stats["forwarded"],
+        "received_msat": stats["received"],
+        "contribution_ratio": round(stats["ratio"], 4),
+        "is_leech": leech_status["is_leech"],
+    }
+
+    if member:
+        result["tier"] = member.get("tier")
+        result["uptime_pct"] = member.get("uptime_pct")
+
+    return result
