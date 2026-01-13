@@ -5809,6 +5809,221 @@ def hive_calculate_health(plugin: Plugin):
     }
 
 
+@plugin.method("hive-routing-stats")
+def hive_routing_stats(plugin: Plugin):
+    """
+    Get routing intelligence statistics.
+
+    Shows collective routing intelligence from all hive members including
+    path success rates, probe counts, and route suggestions.
+
+    Returns:
+        Dict with routing intelligence statistics.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not routing_map:
+        return {"error": "Routing intelligence not initialized"}
+
+    stats = routing_map.get_routing_stats()
+    return {
+        "paths_tracked": stats.get("total_paths", 0),
+        "total_probes": stats.get("total_probes", 0),
+        "total_successes": stats.get("total_successes", 0),
+        "unique_destinations": stats.get("unique_destinations", 0),
+        "high_quality_paths": stats.get("high_quality_paths", 0),
+        "overall_success_rate": round(stats.get("overall_success_rate", 0.0), 3),
+    }
+
+
+@plugin.method("hive-route-suggest")
+def hive_route_suggest(plugin: Plugin, destination: str, amount_sats: int = 100000):
+    """
+    Get route suggestions for a destination using hive intelligence.
+
+    Uses collective routing data to suggest optimal paths.
+
+    Args:
+        destination: Target node pubkey
+        amount_sats: Amount to route (default 100000)
+
+    Returns:
+        Dict with route suggestions.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not routing_map:
+        return {"error": "Routing intelligence not initialized"}
+
+    routes = routing_map.get_routes_to(destination, amount_sats)
+
+    return {
+        "destination": destination,
+        "amount_sats": amount_sats,
+        "route_count": len(routes),
+        "routes": [
+            {
+                "path": list(r.path),
+                "success_rate": r.success_rate,
+                "expected_latency_ms": r.expected_latency_ms,
+                "confidence": r.confidence,
+            }
+            for r in routes[:5]  # Top 5 suggestions
+        ]
+    }
+
+
+@plugin.method("hive-peer-reputations")
+def hive_peer_reputations(plugin: Plugin, peer_id: str = None):
+    """
+    Get aggregated peer reputations from hive intelligence.
+
+    Peer reputations are aggregated from reports by all hive members
+    with outlier detection to prevent manipulation.
+
+    Args:
+        peer_id: Optional specific peer to query
+
+    Returns:
+        Dict with peer reputation data.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not peer_reputation_mgr:
+        return {"error": "Peer reputation manager not initialized"}
+
+    if peer_id:
+        rep = peer_reputation_mgr.get_reputation(peer_id)
+        if not rep:
+            return {
+                "peer_id": peer_id,
+                "error": "No reputation data found"
+            }
+        return {
+            "peer_id": rep.peer_id,
+            "reputation_score": rep.reputation_score,
+            "confidence": rep.confidence,
+            "avg_uptime": rep.avg_uptime,
+            "avg_htlc_success": rep.avg_htlc_success,
+            "avg_fee_stability": rep.avg_fee_stability,
+            "total_force_closes": rep.total_force_closes,
+            "report_count": rep.report_count,
+            "reporter_count": len(rep.reporters),
+            "warnings": rep.warnings,
+        }
+    else:
+        stats = peer_reputation_mgr.get_reputation_stats()
+        all_reps = peer_reputation_mgr.get_all_reputations()
+        return {
+            **stats,
+            "reputations": [
+                {
+                    "peer_id": rep.peer_id,
+                    "reputation_score": rep.reputation_score,
+                    "confidence": rep.confidence,
+                    "warnings": list(rep.warnings.keys()),
+                }
+                for rep in all_reps.values()
+            ]
+        }
+
+
+@plugin.method("hive-reputation-stats")
+def hive_reputation_stats(plugin: Plugin):
+    """
+    Get overall reputation tracking statistics.
+
+    Returns summary statistics about tracked peer reputations.
+
+    Returns:
+        Dict with reputation statistics.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not peer_reputation_mgr:
+        return {"error": "Peer reputation manager not initialized"}
+
+    return peer_reputation_mgr.get_reputation_stats()
+
+
+@plugin.method("hive-liquidity-needs")
+def hive_liquidity_needs(plugin: Plugin, peer_id: str = None):
+    """
+    Get current liquidity needs from hive members.
+
+    Shows liquidity requests from members that may need assistance
+    with rebalancing or capacity.
+
+    Args:
+        peer_id: Optional filter by specific member
+
+    Returns:
+        Dict with liquidity needs.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if peer_id:
+        needs = database.get_liquidity_needs_for_reporter(peer_id)
+    else:
+        needs = database.get_all_liquidity_needs(max_age_hours=24)
+
+    return {
+        "need_count": len(needs),
+        "needs": needs
+    }
+
+
+@plugin.method("hive-liquidity-status")
+def hive_liquidity_status(plugin: Plugin):
+    """
+    Get liquidity coordination status.
+
+    Shows rebalance proposals, pending needs, and assistance statistics.
+
+    Returns:
+        Dict with liquidity coordination status.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not liquidity_coord:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    return liquidity_coord.get_status()
+
+
 @plugin.method("hive-set-mode")
 def hive_set_mode(plugin: Plugin, mode: str):
     """

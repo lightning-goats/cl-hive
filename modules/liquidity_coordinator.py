@@ -612,3 +612,31 @@ class LiquidityCoordinator:
         ]
         for rid in old_needs:
             del self._liquidity_needs[rid]
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get overall liquidity coordination status.
+
+        Returns:
+            Dict with coordination status and statistics
+        """
+        nnlb_status = self.get_nnlb_assistance_status()
+
+        # Count need types
+        inbound_needs = sum(
+            1 for n in self._liquidity_needs.values()
+            if n.need_type == NEED_INBOUND
+        )
+        outbound_needs = sum(
+            1 for n in self._liquidity_needs.values()
+            if n.need_type == NEED_OUTBOUND
+        )
+
+        return {
+            "status": "active",
+            "pending_needs": len(self._liquidity_needs),
+            "inbound_needs": inbound_needs,
+            "outbound_needs": outbound_needs,
+            "pending_proposals": len(self._pending_proposals),
+            "nnlb_status": nnlb_status
+        }
