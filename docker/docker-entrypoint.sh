@@ -17,7 +17,7 @@ set -e
 #   WIREGUARD_ENABLED    - Enable WireGuard (default: false)
 #   WIREGUARD_CONFIG     - Path to WireGuard config (default: /etc/wireguard/wg0.conf)
 #   HIVE_GOVERNANCE_MODE - advisor, autonomous, oracle (default: advisor)
-#   CLBOSS_ENABLED       - Enable CLBOSS (default: true)
+#   CLBOSS_ENABLED       - Enable CLBOSS (default: true, optional - hive works without it)
 #   LOG_LEVEL            - debug, info, unusual, broken (default: info)
 # =============================================================================
 
@@ -234,9 +234,9 @@ fi
 # -----------------------------------------------------------------------------
 
 if [ "$CLBOSS_ENABLED" = "true" ]; then
-    echo "CLBOSS enabled"
+    echo "CLBOSS enabled (optional integration)"
 else
-    echo "CLBOSS disabled - removing from plugins"
+    echo "CLBOSS disabled (optional) - hive uses native expansion control"
     rm -f /root/.lightning/plugins/clboss
 fi
 

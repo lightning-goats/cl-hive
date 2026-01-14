@@ -17,6 +17,9 @@ python3 -m pytest tests/test_planner.py
 
 # Run with verbose output
 python3 -m pytest tests/ -v
+
+# Run tests matching a pattern
+python3 -m pytest tests/ -k "test_feerate"
 ```
 
 No build system - this is a CLN plugin deployed by copying `cl-hive.py` and `modules/` to the plugin directory.
@@ -24,9 +27,9 @@ No build system - this is a CLN plugin deployed by copying `cl-hive.py` and `mod
 ## Architecture
 
 ```
-cl-hive (Coordination Layer)
+cl-hive (Coordination Layer - "The Diplomat")
     ↓
-cl-revenue-ops (Execution Layer)
+cl-revenue-ops (Execution Layer - "The CFO")
     ↓
 Core Lightning
 ```
@@ -46,10 +49,12 @@ Core Lightning
 | `gossip.py` | Threshold-based gossip (10% capacity change) with 5-min heartbeat |
 | `intent_manager.py` | Intent Lock protocol - Announce-Wait-Commit with lexicographic tie-breaker |
 | `bridge.py` | Circuit Breaker pattern for cl-revenue-ops integration |
-| `clboss_bridge.py` | CLBoss ignore/unignore for saturation control |
-| `membership.py` | Two-tier system: Neophyte (probation) → Member (51% vouch quorum) |
+| `clboss_bridge.py` | Optional CLBoss integration for saturation control |
+| `membership.py` | Three-tier system: Admin → Member → Neophyte with vouch-based promotion |
 | `contribution.py` | Forwarding stats and anti-leech detection |
-| `planner.py` | Topology optimization - saturation analysis and guard mechanism |
+| `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
+| `config.py` | Hot-reloadable configuration with snapshot pattern |
+| `database.py` | SQLite with WAL mode, thread-local connections |
 
 ### Key Patterns
 
@@ -85,7 +90,16 @@ Core Lightning
 
 ### Database Tables
 
-`hive_members`, `intent_locks`, `hive_state`, `contribution_ledger`, `hive_bans`, `promotion_requests`, `hive_planner_log`, `pending_actions`
+| Table | Purpose |
+|-------|---------|
+| `hive_members` | Member roster with tiers and stats |
+| `intent_locks` | Active intent locks for conflict resolution |
+| `hive_state` | Key-value store for persistent state |
+| `contribution_ledger` | Forwarding contribution tracking |
+| `hive_bans` | Ban proposals and votes |
+| `promotion_requests` | Pending promotion requests |
+| `hive_planner_log` | Planner decision audit log |
+| `pending_actions` | Actions awaiting approval (advisor mode) |
 
 ## Safety Constraints
 
@@ -97,7 +111,7 @@ These are non-negotiable:
 4. **Identity binding**: Sender peer_id must match claimed pubkey in payload
 5. **DoS protection**: Max 200 remote intents cached, rate limits on all loops
 
-## Planner Rules (Phase 6)
+## Planner Rules
 
 The Planner proposes topology changes but cannot open channels directly:
 - May log decisions to `hive_planner_log`
@@ -106,9 +120,73 @@ The Planner proposes topology changes but cannot open channels directly:
 - Max 5 ignores per cycle
 - 20% market share cap per target
 
+### Feerate Gate
+- Expansions blocked when on-chain feerate > `hive-max-expansion-feerate` (default: 5000 sat/kB)
+- Set to 0 to disable feerate checking
+- Uses CLN `feerates` RPC to get current opening feerate
+
+### Cooperative Expansion (Phase 6.4)
+- Fleet-wide election for expansion targets
+- Nomination → Election → Winner opens channel
+- Prevents thundering herd via Intent Lock Protocol
+
+## Optional Integrations
+
+### CLBoss (Optional)
+CLBoss is **not required** for cl-hive to function. The hive provides its own:
+- **Channel opening**: Cooperative expansion with feerate gate
+- **Fee management**: Delegated to cl-revenue-ops
+- **Rebalancing**: Delegated to cl-revenue-ops + sling
+
+If CLBoss IS installed, cl-hive will:
+- Detect it automatically via plugin list
+- Use `clboss-unmanage` to prevent redundant channel opens to saturated targets
+- Coordinate via the "Gateway Pattern" to avoid conflicts
+
+To run without CLBoss: Simply don't install it. No configuration needed.
+
+### Sling (Optional for cl-hive)
+Sling rebalancer is optional for cl-hive. cl-revenue-ops handles rebalancing coordination.
+Note: Sling IS required for cl-revenue-ops itself.
+
 ## Development Notes
 
 - Only external dependency: `pyln-client>=24.0`
 - All crypto done via CLN HSM (signmessage/checkmessage) - no crypto libs imported
-- Plugin options defined at top of `cl-hive.py` (16 configurable parameters)
-- Background loops: intent_monitor_loop, membership_loop, planner_loop
+- Plugin options defined at top of `cl-hive.py` (30 configurable parameters)
+- Background loops: intent_monitor_loop, membership_loop, planner_loop, gossip_loop
+
+## Testing Conventions
+
+- Test files in `tests/` directory
+- Use pytest fixtures for mocking (see `conftest.py`)
+- Mock RPC calls, never hit real network
+- Test categories: unit, integration, feerate, planner, membership
+
+## File Structure
+
+```
+cl-hive/
+├── cl-hive.py              # Main plugin entry point
+├── modules/
+│   ├── protocol.py         # Message types and encoding
+│   ├── handshake.py        # PKI authentication
+│   ├── state_manager.py    # Distributed state
+│   ├── gossip.py           # Gossip protocol
+│   ├── intent_manager.py   # Intent locks
+│   ├── bridge.py           # cl-revenue-ops bridge
+│   ├── clboss_bridge.py    # Optional CLBoss bridge
+│   ├── membership.py       # Member management
+│   ├── contribution.py     # Contribution tracking
+│   ├── planner.py          # Topology planner
+│   ├── config.py           # Configuration
+│   └── database.py         # Database layer
+├── tests/                  # Test suite
+├── docs/                   # Documentation
+│   ├── design/             # Design documents
+│   ├── planning/           # Implementation plans
+│   ├── security/           # Security docs
+│   ├── specs/              # Specifications
+│   └── testing/            # Testing guides
+└── docker/                 # Docker deployment
+```

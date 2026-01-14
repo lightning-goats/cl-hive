@@ -1,22 +1,24 @@
 """
-CLBoss Bridge Module for cl-hive.
+CLBoss Bridge Module for cl-hive (Optional Integration).
 
-Provides a gateway wrapper for CLBoss integration using the ksedgwic/clboss fork:
+CLBoss is NOT required for cl-hive to function. This module provides optional
+integration with CLBoss when it is installed.
+
+If CLBoss IS installed (ksedgwic/clboss fork):
 - Detect availability from plugin list
-- Unmanage peers to prevent channel opens to saturated targets
+- Unmanage peers to prevent CLBoss channel opens to saturated targets
 - Coordinate with cl-revenue-ops for fee/rebalance management
 
+If CLBoss is NOT installed:
+- All methods gracefully return False or empty results
+- Hive uses native cooperative expansion for topology management
+- No warnings or errors are logged
+
 CLBoss Management Tags (ksedgwic/clboss fork):
-- open: Channel opening
+- open: Channel opening (managed by cl-hive)
 - close: Channel closing
 - lnfee: Fee management (delegated to cl-revenue-ops)
 - balance: Rebalancing (delegated to cl-revenue-ops)
-
-The Hive uses clboss-unmanage with 'open' tag to prevent CLBoss from
-opening channels to saturated targets, complementing the Intent Lock Protocol.
-
-Fee and rebalance management is delegated to cl-revenue-ops, which handles
-the 'lnfee' and 'balance' tags via its own ClbossManager.
 """
 
 from typing import Any, Dict, List, Optional
@@ -188,18 +190,25 @@ class CLBossBridge:
 
     def get_status(self) -> Dict[str, Any]:
         """Get CLBoss bridge status for diagnostics."""
+        if not self._available:
+            return {
+                "clboss_installed": False,
+                "note": "CLBoss not installed (optional) - using native expansion control",
+                "coordination_method": "native_cooperative_expansion"
+            }
+
         status = {
+            "clboss_installed": True,
             "clboss_available": self._available,
             "supports_unmanage": self._supports_unmanage,
             "coordination_method": "clboss-unmanage" if self._supports_unmanage else "intent_lock_only"
         }
 
-        if self._available:
-            try:
-                clboss_status = self.rpc.call("clboss-status")
-                status["clboss_version"] = clboss_status.get("info", {}).get("version", "unknown")
-            except RpcError:
-                status["clboss_version"] = "unknown"
+        try:
+            clboss_status = self.rpc.call("clboss-status")
+            status["clboss_version"] = clboss_status.get("info", {}).get("version", "unknown")
+        except RpcError:
+            status["clboss_version"] = "unknown"
 
         return status
 

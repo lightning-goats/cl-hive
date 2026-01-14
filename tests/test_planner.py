@@ -455,8 +455,8 @@ class TestGuardMechanism:
         # Should NOT have called ignore_peer (already ignored)
         mock_clboss_bridge.ignore_peer.assert_not_called()
 
-    def test_clboss_unavailable_skips_ignore(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
-        """Should skip ignore if CLBoss is unavailable."""
+    def test_clboss_unavailable_records_saturation(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
+        """Should record saturation detection when CLBoss is unavailable (CLBoss is optional)."""
         target = '02' + 'z' * 64
         mock_clboss_bridge._available = False
 
@@ -477,8 +477,8 @@ class TestGuardMechanism:
 
             decisions = planner._enforce_saturation(mock_config, 'test-run-4')
 
-        # Should have skipped
-        assert any(d.get('action') == 'ignore_skipped' for d in decisions)
+        # Should record saturation_detected (CLBoss is optional, so this is informational)
+        assert any(d.get('action') == 'saturation_detected' for d in decisions)
 
 
 # =============================================================================

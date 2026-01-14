@@ -919,7 +919,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if bridge_status == BridgeStatus.ENABLED:
         plugin.log(f"cl-hive: Bridge ENABLED - cl-revenue-ops {bridge._revenue_ops_version}")
         if bridge._clboss_available:
-            plugin.log("cl-hive: CLBoss integration available (Gateway Pattern)")
+            plugin.log("cl-hive: CLBoss detected - saturation control via Gateway Pattern")
+        else:
+            plugin.log("cl-hive: CLBoss not detected (optional) - using native expansion control")
     elif bridge_status == BridgeStatus.DEGRADED:
         plugin.log("cl-hive: Bridge DEGRADED - some features unavailable", level='warn')
     else:

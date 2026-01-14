@@ -3,13 +3,18 @@ Planner Module for cl-hive (Phase 6: Topology Optimization)
 
 Implements the "Gardner" algorithm for automated topology management:
 - Saturation Analysis: Calculate Hive market share per target
-- Guard Mechanism: Issue clboss-unmanage for saturated targets (ksedgwic/clboss)
-- Expansion Proposals: (Future tickets - not implemented here)
+- Guard Mechanism: Prevent redundant channel opens to saturated targets
+- Expansion Proposals: Cooperative expansion with feerate gate
 
-CLBoss Integration (ksedgwic/clboss fork):
-- Uses clboss-unmanage with 'open' tag to prevent channel opens to saturated targets
+CLBoss Integration (Optional):
+CLBoss is NOT required. If installed (ksedgwic/clboss fork):
+- Uses clboss-unmanage with 'open' tag to prevent CLBoss channel opens to saturated targets
 - Uses clboss-manage to re-enable opens when saturation drops
 - Fee/balance tags are managed by cl-revenue-ops (not this module)
+
+If CLBoss is NOT installed:
+- Saturation detection still runs for analytics
+- Hive uses native cooperative expansion instead
 
 Security Constraints (Red Team - PHASE6_THREAT_MODEL):
 - Gossip capacity is CLAMPED to public listchannels data
@@ -890,23 +895,25 @@ class Planner:
             if ignores_issued >= MAX_IGNORES_PER_CYCLE:
                 break
 
-            # Check if CLBoss is available
+            # Check if CLBoss is available (optional integration)
             if not self.clboss or not self.clboss._available:
-                self._log(f"CLBoss unavailable, cannot ignore {result.target[:16]}...", level='debug')
+                # CLBoss not installed - this is fine, hive uses native expansion control
+                # Still log for saturation analytics
                 self.db.log_planner_action(
-                    action_type='ignore',
-                    result='skipped',
+                    action_type='saturation_detected',
+                    result='info',
                     target=result.target,
                     details={
-                        'reason': 'clboss_unavailable',
+                        'note': 'clboss_not_installed',
                         'hive_share_pct': round(result.hive_share_pct, 4),
                         'run_id': run_id
                     }
                 )
                 decisions.append({
-                    'action': 'ignore_skipped',
+                    'action': 'saturation_detected',
                     'target': result.target,
-                    'reason': 'clboss_unavailable'
+                    'hive_share_pct': round(result.hive_share_pct, 4),
+                    'note': 'clboss_not_installed'
                 })
                 continue
 

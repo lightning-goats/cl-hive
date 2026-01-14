@@ -7,10 +7,12 @@ Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, a
 - **Core Lightning** v25+ with all plugins
 - **Tor** hidden service for privacy
 - **WireGuard** VPN support (optional)
-- **CLBOSS** for automated channel management
 - **cl-revenue-ops** for fee optimization
 - **cl-hive** for fleet coordination
-- **sling** for rebalancing
+
+### Optional Integrations
+- **CLBOSS** for automated channel management (not required - hive uses native expansion)
+- **sling** for rebalancing (not required - handled by cl-revenue-ops)
 
 ## Quick Start
 
@@ -68,7 +70,7 @@ docker-compose exec cln lightning-cli hive-status
 | `ANNOUNCE_ADDR` | - | Public address to announce |
 | `TOR_ENABLED` | `true` | Enable Tor hidden service |
 | `WIREGUARD_ENABLED` | `false` | Enable WireGuard VPN |
-| `CLBOSS_ENABLED` | `true` | Enable CLBOSS |
+| `CLBOSS_ENABLED` | `true` | Enable CLBOSS (optional, hive works without it) |
 | `HIVE_GOVERNANCE_MODE` | `advisor` | Hive governance mode |
 | `LOG_LEVEL` | `info` | Log level |
 
@@ -331,7 +333,7 @@ docker push my-registry/cl-hive-node:v1.0
 |-----------|---------|
 | Ubuntu | 24.04 |
 | Core Lightning | v25.02.1 |
-| CLBOSS | latest (ksedgwic fork) |
+| CLBOSS | latest (ksedgwic fork, optional) |
 | Sling | v4.1.3 |
 | cl-revenue-ops | bundled |
 | cl-hive | bundled |
