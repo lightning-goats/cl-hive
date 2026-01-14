@@ -54,7 +54,12 @@ from modules.protocol import (
     create_expansion_nominate, create_expansion_elect,
     get_expansion_nominate_signing_payload, get_expansion_elect_signing_payload,
     VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
-    create_challenge, create_welcome
+    create_challenge, create_welcome,
+    # Signed message validation (security hardening)
+    validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
+    get_gossip_signing_payload, get_state_hash_signing_payload,
+    get_full_sync_signing_payload, get_intent_abort_signing_payload,
+    get_peer_available_signing_payload, compute_states_hash,
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
@@ -73,6 +78,30 @@ from modules.fee_intelligence import FeeIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
 from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
+from modules.rpc_commands import (
+    HiveContext,
+    status as rpc_status,
+    get_config as rpc_get_config,
+    members as rpc_members,
+    vpn_status as rpc_vpn_status,
+    vpn_add_peer as rpc_vpn_add_peer,
+    vpn_remove_peer as rpc_vpn_remove_peer,
+    pending_actions as rpc_pending_actions,
+    approve_action as rpc_approve_action,
+    reject_action as rpc_reject_action,
+    budget_summary as rpc_budget_summary,
+    set_mode as rpc_set_mode,
+    enable_expansions as rpc_enable_expansions,
+    pending_admin_promotions as rpc_pending_admin_promotions,
+    pending_bans as rpc_pending_bans,
+    # Phase 4: Topology, Planner, and Query Commands
+    reinit_bridge as rpc_reinit_bridge,
+    topology as rpc_topology,
+    planner_log as rpc_planner_log,
+    intent_status as rpc_intent_status,
+    contribution as rpc_contribution,
+    expansion_status as rpc_expansion_status,
+)
 
 # Initialize the plugin
 plugin = Plugin()
@@ -369,6 +398,48 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
             }
 
     return None  # Permission granted
+
+
+def _get_hive_context() -> HiveContext:
+    """
+    Create a HiveContext with all current global dependencies.
+
+    This bundles the global state for RPC command handlers in modules/rpc_commands.py.
+    Note: Some globals may not be initialized yet if init() hasn't completed.
+    """
+    # These globals are always defined (may be None before init())
+    _database = database if 'database' in globals() else None
+    _config = config if 'config' in globals() else None
+    _safe_plugin = safe_plugin if 'safe_plugin' in globals() else None
+    _our_pubkey = our_pubkey if 'our_pubkey' in globals() else None
+    _vpn_transport = vpn_transport if 'vpn_transport' in globals() else None
+    _planner = planner if 'planner' in globals() else None
+    _bridge = bridge if 'bridge' in globals() else None
+    _intent_mgr = intent_mgr if 'intent_mgr' in globals() else None
+    _membership_mgr = membership_mgr if 'membership_mgr' in globals() else None
+    # coop_expansion is the global name, not coop_expansion_mgr
+    _coop_expansion = coop_expansion if 'coop_expansion' in globals() else None
+    _contribution_mgr = contribution_mgr if 'contribution_mgr' in globals() else None
+
+    # Create a log wrapper that calls plugin.log
+    def _log(msg: str, level: str = 'info'):
+        plugin.log(msg, level=level)
+
+    return HiveContext(
+        database=_database,
+        config=_config,
+        safe_plugin=_safe_plugin,
+        our_pubkey=_our_pubkey,
+        vpn_transport=_vpn_transport,
+        planner=_planner,
+        quality_scorer=None,  # Local to init(), not needed for current commands
+        bridge=_bridge,
+        intent_mgr=_intent_mgr,
+        membership_mgr=_membership_mgr,
+        coop_expansion_mgr=_coop_expansion,
+        contribution_mgr=_contribution_mgr,
+        log=_log,
+    )
 
 
 # =============================================================================
@@ -1379,17 +1450,16 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Initiate state sync with the peer that welcomed us
     if gossip_mgr and safe_plugin:
-        state_hash_payload = gossip_mgr.create_state_hash_payload()
-        state_hash_msg = serialize(HiveMessageType.STATE_HASH, state_hash_payload)
-
-        try:
-            safe_plugin.rpc.call("sendcustommsg", {
-                "node_id": peer_id,
-                "msg": state_hash_msg.hex()
-            })
-            plugin.log(f"cl-hive: STATE_HASH sent to {peer_id[:16]}... for anti-entropy sync")
-        except Exception as e:
-            plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+        state_hash_msg = _create_signed_state_hash_msg()
+        if state_hash_msg:
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": peer_id,
+                    "msg": state_hash_msg.hex()
+                })
+                plugin.log(f"cl-hive: STATE_HASH sent to {peer_id[:16]}... for anti-entropy sync")
+            except Exception as e:
+                plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
     return {"result": "continue"}
 
@@ -1404,11 +1474,46 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Process incoming gossip and update our local state cache.
     The GossipManager handles version validation and StateManager updates.
+
+    SECURITY: Requires cryptographic signature verification.
     """
     if not gossip_mgr:
         return {"result": "continue"}
 
-    # P3-02: Verify sender is a Hive member before processing
+    # SECURITY: Validate payload structure including signature field
+    if not validate_gossip(payload):
+        plugin.log(
+            f"cl-hive: GOSSIP rejected from {peer_id[:16]}...: invalid payload",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    sender_id = payload.get("sender_id")
+    signature = payload.get("signature")
+    signing_payload = get_gossip_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != sender_id:
+            plugin.log(
+                f"cl-hive: GOSSIP signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: GOSSIP signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify sender identity matches peer_id
+    if sender_id != peer_id:
+        plugin.log(
+            f"cl-hive: GOSSIP sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify sender is a Hive member before processing
     if not database:
         return {"result": "continue"}
     member = database.get_member(peer_id)
@@ -1417,11 +1522,11 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     accepted = gossip_mgr.process_gossip(peer_id, payload)
-    
+
     if accepted:
         plugin.log(f"cl-hive: GOSSIP accepted from {peer_id[:16]}... "
                    f"(v{payload.get('version', '?')})", level='debug')
-    
+
     return {"result": "continue"}
 
 
@@ -1431,27 +1536,60 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Compare remote hash against our local state. If mismatch,
     send a FULL_SYNC with our complete state including membership.
+
+    SECURITY: Requires cryptographic signature verification.
     """
     if not gossip_mgr or not state_manager:
+        return {"result": "continue"}
+
+    # SECURITY: Validate payload structure including signature field
+    if not validate_state_hash(payload):
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: invalid payload",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    sender_id = payload.get("sender_id")
+    signature = payload.get("signature")
+    signing_payload = get_state_hash_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != sender_id:
+            plugin.log(
+                f"cl-hive: STATE_HASH signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: STATE_HASH signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify sender identity matches peer_id
+    if sender_id != peer_id:
+        plugin.log(
+            f"cl-hive: STATE_HASH sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
         return {"result": "continue"}
 
     hashes_match = gossip_mgr.process_state_hash(peer_id, payload)
 
     if not hashes_match:
-        # State divergence detected - send FULL_SYNC with membership
+        # State divergence detected - send signed FULL_SYNC with membership
         plugin.log(f"cl-hive: State divergence with {peer_id[:16]}..., sending FULL_SYNC")
 
-        full_sync_payload = gossip_mgr.create_full_sync_payload()
-        full_sync_payload["members"] = _create_membership_payload()
-        full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
-
-        try:
-            safe_plugin.rpc.call("sendcustommsg", {
-                "node_id": peer_id,
-                "msg": full_sync_msg.hex()
-            })
-        except Exception as e:
-            plugin.log(f"cl-hive: Failed to send FULL_SYNC: {e}", level='warn')
+        full_sync_msg = _create_signed_full_sync_msg()
+        if full_sync_msg:
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": peer_id,
+                    "msg": full_sync_msg.hex()
+                })
+            except Exception as e:
+                plugin.log(f"cl-hive: Failed to send FULL_SYNC: {e}", level='warn')
 
     return {"result": "continue"}
 
@@ -1463,13 +1601,59 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Merge the received state with our local state, preferring
     higher version numbers for each peer.
 
-    SECURITY: Only accept FULL_SYNC from Hive members to prevent
-    state poisoning attacks from arbitrary peers.
+    SECURITY: Requires cryptographic signature verification.
+    Only accept FULL_SYNC from authenticated Hive members.
     """
     if not gossip_mgr:
         return {"result": "continue"}
 
-    # SECURITY: Membership check to prevent state poisoning (Issue #8)
+    # SECURITY: Validate payload structure including signature field
+    if not validate_full_sync(payload):
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: invalid payload structure",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    sender_id = payload.get("sender_id")
+    signature = payload.get("signature")
+    signing_payload = get_full_sync_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != sender_id:
+            plugin.log(
+                f"cl-hive: FULL_SYNC signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: FULL_SYNC signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify sender identity matches peer_id (prevent relay attacks)
+    if sender_id != peer_id:
+        plugin.log(
+            f"cl-hive: FULL_SYNC sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # SECURITY: Verify states match the signed fleet_hash (prevent state injection)
+    states = payload.get("states", [])
+    fleet_hash = payload.get("fleet_hash", "")
+    if states and fleet_hash:
+        computed_hash = compute_states_hash(states)
+        if computed_hash != fleet_hash:
+            plugin.log(
+                f"cl-hive: FULL_SYNC states hash mismatch from {peer_id[:16]}...: "
+                f"computed={computed_hash[:16]}... expected={fleet_hash[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+
+    # SECURITY: Membership check to prevent state poisoning
     if database:
         member = database.get_member(peer_id)
         if not member:
@@ -1565,24 +1749,135 @@ def _create_membership_payload() -> list:
     ]
 
 
+def _create_signed_full_sync_msg() -> Optional[bytes]:
+    """
+    Create a signed FULL_SYNC message with membership.
+
+    SECURITY: All FULL_SYNC messages must be cryptographically signed
+    to prevent state poisoning attacks.
+
+    Returns:
+        Serialized and signed FULL_SYNC message, or None if signing fails
+    """
+    if not gossip_mgr or not safe_plugin or not our_pubkey:
+        return None
+
+    # Create base payload
+    full_sync_payload = gossip_mgr.create_full_sync_payload()
+    full_sync_payload["members"] = _create_membership_payload()
+
+    # Add sender identification
+    full_sync_payload["sender_id"] = our_pubkey
+    full_sync_payload["timestamp"] = int(time.time())
+
+    # Sign the payload
+    signing_payload = get_full_sync_signing_payload(full_sync_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        full_sync_payload["signature"] = sig_result["zbase"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign FULL_SYNC: {e}", level='error')
+        return None
+
+    return serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+
+
+def _create_signed_state_hash_msg() -> Optional[bytes]:
+    """
+    Create a signed STATE_HASH message for anti-entropy sync.
+
+    SECURITY: All STATE_HASH messages must be cryptographically signed
+    to prevent hash manipulation attacks.
+
+    Returns:
+        Serialized and signed STATE_HASH message, or None if signing fails
+    """
+    if not gossip_mgr or not safe_plugin or not our_pubkey:
+        return None
+
+    # Create base payload
+    state_hash_payload = gossip_mgr.create_state_hash_payload()
+
+    # Add sender identification and timestamp
+    state_hash_payload["sender_id"] = our_pubkey
+    state_hash_payload["timestamp"] = int(time.time())
+
+    # Sign the payload
+    signing_payload = get_state_hash_signing_payload(state_hash_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        state_hash_payload["signature"] = sig_result["zbase"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign STATE_HASH: {e}", level='error')
+        return None
+
+    return serialize(HiveMessageType.STATE_HASH, state_hash_payload)
+
+
+def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
+                               fee_policy: Dict, topology: list) -> Optional[bytes]:
+    """
+    Create a signed GOSSIP message for broadcast.
+
+    SECURITY: All GOSSIP messages must be cryptographically signed
+    to prevent data tampering attacks where attackers modify fee
+    policies, topology, or capacity data.
+
+    Args:
+        capacity_sats: Total Hive channel capacity
+        available_sats: Available outbound liquidity
+        fee_policy: Current fee policy dict
+        topology: List of external peer connections
+
+    Returns:
+        Serialized and signed GOSSIP message, or None if signing fails
+    """
+    if not gossip_mgr or not safe_plugin or not our_pubkey:
+        return None
+
+    # Create gossip payload using GossipManager
+    gossip_payload = gossip_mgr.create_gossip_payload(
+        our_pubkey=our_pubkey,
+        capacity_sats=capacity_sats,
+        available_sats=available_sats,
+        fee_policy=fee_policy,
+        topology=topology
+    )
+
+    # Add sender identification for signature verification
+    gossip_payload["sender_id"] = our_pubkey
+
+    # Sign the payload (includes data hash for integrity)
+    signing_payload = get_gossip_signing_payload(gossip_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        gossip_payload["signature"] = sig_result["zbase"]
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign GOSSIP: {e}", level='error')
+        return None
+
+    return serialize(HiveMessageType.GOSSIP, gossip_payload)
+
+
 def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
     """
-    Broadcast FULL_SYNC with membership to all existing members.
+    Broadcast signed FULL_SYNC with membership to all existing members.
 
     Called after adding a new member to ensure all nodes sync.
+    SECURITY: All FULL_SYNC messages are cryptographically signed.
     """
     if not database or not gossip_mgr or not safe_plugin:
-        plugin.log(f"cl-hive: _broadcast_full_sync_to_members: missing deps - db={database is not None}, gossip={gossip_mgr is not None}, plugin={safe_plugin is not None}", level='debug')
+        plugin.log(f"cl-hive: _broadcast_full_sync_to_members: missing deps", level='debug')
         return
 
     members = database.get_all_members()
     plugin.log(f"cl-hive: Broadcasting membership to {len(members)} known members")
 
-    # Create FULL_SYNC payload with membership
-    full_sync_payload = gossip_mgr.create_full_sync_payload()
-    full_sync_payload["members"] = _create_membership_payload()
-
-    full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+    # Create signed FULL_SYNC payload with membership
+    full_sync_msg = _create_signed_full_sync_msg()
+    if not full_sync_msg:
+        plugin.log("cl-hive: Failed to create signed FULL_SYNC", level='error')
+        return
 
     sent_count = 0
     for member in members:
@@ -1643,18 +1938,17 @@ def on_peer_connected(**kwargs):
     if safe_plugin:
         safe_plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
 
-    # Send STATE_HASH for anti-entropy check
-    state_hash_payload = gossip_mgr.create_state_hash_payload()
-    state_hash_msg = serialize(HiveMessageType.STATE_HASH, state_hash_payload)
-
-    try:
-        safe_plugin.rpc.call("sendcustommsg", {
-            "node_id": peer_id,
-            "msg": state_hash_msg.hex()
-        })
-    except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+    # Send signed STATE_HASH for anti-entropy check
+    state_hash_msg = _create_signed_state_hash_msg()
+    if state_hash_msg:
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": state_hash_msg.hex()
+            })
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
 
 @plugin.subscribe("disconnect")
@@ -1761,49 +2055,92 @@ def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 def handle_intent_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle HIVE_INTENT_ABORT message (remote node yielding).
-    
+
     Update our record to show the remote node aborted their intent.
+
+    SECURITY: Requires cryptographic signature verification.
+    Only the intent owner can abort their own intent.
     """
     if not intent_mgr:
         return {"result": "continue"}
-    
+
+    # SECURITY: Validate payload structure including signature field
+    if not validate_intent_abort(payload):
+        plugin.log(
+            f"cl-hive: INTENT_ABORT rejected from {peer_id[:16]}...: invalid payload",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     intent_type = payload.get('intent_type')
     target = payload.get('target')
     initiator = payload.get('initiator')
+    signature = payload.get('signature')
 
-    if not intent_type or not target or not initiator:
-        plugin.log(f"cl-hive: INTENT_ABORT from {peer_id[:16]}... missing fields", level='warn')
+    # SECURITY: Verify cryptographic signature
+    signing_payload = get_intent_abort_signing_payload(payload)
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != initiator:
+            plugin.log(
+                f"cl-hive: INTENT_ABORT signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: INTENT_ABORT signature check failed: {e}", level='warn')
         return {"result": "continue"}
-    
+
+    # SECURITY: Verify initiator matches peer_id (only abort your own intents)
+    if initiator != peer_id:
+        plugin.log(
+            f"cl-hive: INTENT_ABORT initiator mismatch: claimed {initiator[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     intent_mgr.record_remote_abort(intent_type, target, initiator)
     plugin.log(f"cl-hive: INTENT_ABORT from {peer_id[:16]}... for {target[:16]}...")
-    
+
     return {"result": "continue"}
 
 
 def broadcast_intent_abort(target: str, intent_type: str) -> None:
     """
-    Broadcast HIVE_INTENT_ABORT to all Hive members.
-    
+    Broadcast signed HIVE_INTENT_ABORT to all Hive members.
+
     Called when we lose a tie-breaker and need to yield.
+
+    SECURITY: All INTENT_ABORT messages are cryptographically signed.
     """
     if not database or not safe_plugin or not intent_mgr:
         return
-    
+
     members = database.get_all_members()
     abort_payload = {
         'intent_type': intent_type,
         'target': target,
         'initiator': intent_mgr.our_pubkey,
+        'timestamp': int(time.time()),
         'reason': 'tie_breaker_loss'
     }
+
+    # Sign the payload
+    signing_payload = get_intent_abort_signing_payload(abort_payload)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        abort_payload['signature'] = sig_result['zbase']
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign INTENT_ABORT: {e}", level='error')
+        return
+
     abort_msg = serialize(HiveMessageType.INTENT_ABORT, abort_payload)
-    
+
     for member in members:
         member_id = member['peer_id']
         if member_id == intent_mgr.our_pubkey:
             continue  # Skip self
-        
+
         try:
             safe_plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
@@ -1901,10 +2238,12 @@ def _sync_member_policies(plugin: Plugin) -> None:
 
 def _sync_membership_on_startup(plugin: Plugin) -> None:
     """
-    Broadcast membership list to all known peers on startup.
+    Broadcast signed membership list to all known peers on startup.
 
     This ensures all nodes converge to the same membership state
     when the plugin restarts.
+
+    SECURITY: All FULL_SYNC messages are cryptographically signed.
     """
     if not database or not gossip_mgr or not safe_plugin:
         return
@@ -1913,10 +2252,11 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
     if len(members) <= 1:
         return  # Just us, nothing to sync
 
-    # Create FULL_SYNC with membership
-    full_sync_payload = gossip_mgr.create_full_sync_payload()
-    full_sync_payload["members"] = _create_membership_payload()
-    full_sync_msg = serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+    # Create signed FULL_SYNC with membership
+    full_sync_msg = _create_signed_full_sync_msg()
+    if not full_sync_msg:
+        plugin.log("cl-hive: Failed to create signed FULL_SYNC for startup sync", level='error')
+        return
 
     sent_count = 0
     for member in members:
@@ -2419,12 +2759,39 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Phase 6.1: ALL events are stored in peer_events table for topology intelligence.
     The receiving node uses this data to make informed expansion decisions.
+
+    SECURITY: Requires cryptographic signature verification.
     """
     if not config or not database:
         return {"result": "continue"}
 
     if not validate_peer_available(payload):
         plugin.log(f"cl-hive: PEER_AVAILABLE from {peer_id[:16]}... invalid payload", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
+    reporter_peer_id = payload.get("reporter_peer_id")
+    signature = payload.get("signature")
+    signing_payload = get_peer_available_signing_payload(payload)
+
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != reporter_peer_id:
+            plugin.log(
+                f"cl-hive: PEER_AVAILABLE signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: PEER_AVAILABLE signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify reporter matches peer_id (prevent relay attacks)
+    if reporter_peer_id != peer_id:
+        plugin.log(
+            f"cl-hive: PEER_AVAILABLE reporter mismatch: claimed {reporter_peer_id[:16]}... but peer is {peer_id[:16]}...",
+            level='warn'
+        )
         return {"result": "continue"}
 
     # Verify sender is a hive member and not banned
@@ -2661,7 +3028,9 @@ def broadcast_peer_available(target_peer_id: str, event_type: str,
                               their_funding_sats: int = 0,
                               opener: str = "") -> int:
     """
-    Broadcast PEER_AVAILABLE to all hive members.
+    Broadcast signed PEER_AVAILABLE to all hive members.
+
+    SECURITY: All PEER_AVAILABLE messages are cryptographically signed.
 
     Args:
         target_peer_id: The external peer involved
@@ -2691,12 +3060,32 @@ def broadcast_peer_available(target_peer_id: str, event_type: str,
     except Exception:
         return 0
 
-    import time
+    timestamp = int(time.time())
+
+    # Build payload for signing
+    signing_payload_dict = {
+        "target_peer_id": target_peer_id,
+        "reporter_peer_id": our_id,
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "capacity_sats": capacity_sats,
+    }
+
+    # Sign the payload
+    signing_str = get_peer_available_signing_payload(signing_payload_dict)
+    try:
+        sig_result = safe_plugin.rpc.signmessage(signing_str)
+        signature = sig_result['zbase']
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign PEER_AVAILABLE: {e}", level='error')
+        return 0
+
     msg = create_peer_available(
         target_peer_id=target_peer_id,
         reporter_peer_id=our_id,
         event_type=event_type,
-        timestamp=int(time.time()),
+        timestamp=timestamp,
+        signature=signature,
         channel_id=channel_id,
         capacity_sats=capacity_sats,
         routing_score=routing_score,
@@ -3896,29 +4285,7 @@ def hive_status(plugin: Plugin):
     Returns:
         Dict with hive state, member count, governance mode, etc.
     """
-    if not database:
-        return {"error": "Hive not initialized"}
-
-    members = database.get_all_members()
-    member_count = len([m for m in members if m['tier'] == 'member'])
-    neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
-    admin_count = len([m for m in members if m['tier'] == 'admin'])
-
-    return {
-        "status": "active" if members else "genesis_required",
-        "governance_mode": config.governance_mode if config else "unknown",
-        "members": {
-            "total": len(members),
-            "admin": admin_count,
-            "member": member_count,
-            "neophyte": neophyte_count,
-        },
-        "limits": {
-            "max_members": config.max_members if config else 50,
-            "market_share_cap": config.market_share_cap_pct if config else 0.20,
-        },
-        "version": "0.1.0-dev",
-    }
+    return rpc_status(_get_hive_context())
 
 
 @plugin.method("hive-config")
@@ -3935,50 +4302,7 @@ def hive_config(plugin: Plugin):
     Returns:
         Dict with all current config values and metadata.
     """
-    if not config:
-        return {"error": "Hive not initialized"}
-
-    return {
-        "config_version": config._version,
-        "hot_reload_enabled": True,
-        "immutable": {
-            "db_path": config.db_path,
-        },
-        "governance": {
-            "governance_mode": config.governance_mode,
-            "autonomous_budget_per_day": config.autonomous_budget_per_day,
-            "autonomous_actions_per_hour": config.autonomous_actions_per_hour,
-            "oracle_url": config.oracle_url,
-            "oracle_timeout_seconds": config.oracle_timeout_seconds,
-        },
-        "membership": {
-            "membership_enabled": config.membership_enabled,
-            "auto_vouch_enabled": config.auto_vouch_enabled,
-            "auto_promote_enabled": config.auto_promote_enabled,
-            "ban_autotrigger_enabled": config.ban_autotrigger_enabled,
-            "neophyte_fee_discount_pct": config.neophyte_fee_discount_pct,
-            "member_fee_ppm": config.member_fee_ppm,
-            "probation_days": config.probation_days,
-            "vouch_threshold_pct": config.vouch_threshold_pct,
-            "min_vouch_count": config.min_vouch_count,
-            "max_members": config.max_members,
-        },
-        "protocol": {
-            "market_share_cap_pct": config.market_share_cap_pct,
-            "intent_hold_seconds": config.intent_hold_seconds,
-            "intent_expire_seconds": config.intent_expire_seconds,
-            "gossip_threshold_pct": config.gossip_threshold_pct,
-            "heartbeat_interval": config.heartbeat_interval,
-        },
-        "planner": {
-            "planner_interval": config.planner_interval,
-            "planner_enable_expansions": config.planner_enable_expansions,
-            "planner_min_channel_sats": config.planner_min_channel_sats,
-            "planner_max_channel_sats": config.planner_max_channel_sats,
-            "planner_default_channel_sats": config.planner_default_channel_sats,
-        },
-        "vpn": vpn_transport.get_status() if vpn_transport else {"enabled": False},
-    }
+    return rpc_get_config(_get_hive_context())
 
 
 @plugin.method("hive-reinit-bridge")
@@ -3986,36 +4310,12 @@ def hive_reinit_bridge(plugin: Plugin):
     """
     Re-attempt bridge initialization if it failed at startup.
 
-    Useful for recovering from startup race conditions where cl-revenue-ops
-    wasn't ready when cl-hive initialized. Also useful after cl-revenue-ops
-    is installed or restarted.
-
     Returns:
         Dict with bridge status and details.
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not bridge:
-        return {"error": "Bridge module not initialized"}
-
-    previous_status = bridge.status.value
-    new_status = bridge.reinitialize()
-
-    return {
-        "previous_status": previous_status,
-        "new_status": new_status.value,
-        "revenue_ops_version": bridge._revenue_ops_version,
-        "clboss_available": bridge._clboss_available,
-        "message": (
-            "Bridge enabled successfully" if new_status == BridgeStatus.ENABLED
-            else "Bridge still disabled - check cl-revenue-ops installation"
-        )
-    }
+    return rpc_reinit_bridge(_get_hive_context())
 
 
 @plugin.method("hive-vpn-status")
@@ -4034,24 +4334,7 @@ def hive_vpn_status(plugin: Plugin, peer_id: str = None):
 
     Permission: Member (read-only status)
     """
-    if not vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    if peer_id:
-        # Get info for specific peer
-        peer_info = vpn_transport.get_peer_vpn_info(peer_id)
-        if peer_info:
-            return {
-                "peer_id": peer_id,
-                **peer_info
-            }
-        return {
-            "peer_id": peer_id,
-            "message": "No VPN info for this peer"
-        }
-
-    # Return full status
-    return vpn_transport.get_status()
+    return rpc_vpn_status(_get_hive_context(), peer_id)
 
 
 @plugin.method("hive-vpn-add-peer")
@@ -4070,34 +4353,7 @@ def hive_vpn_add_peer(plugin: Plugin, pubkey: str, vpn_address: str):
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    # Parse address
-    if ':' in vpn_address:
-        ip, port = vpn_address.rsplit(':', 1)
-        port = int(port)
-    else:
-        ip = vpn_address
-        port = 9735
-
-    success = vpn_transport.add_vpn_peer(pubkey, ip, port)
-    if success:
-        return {
-            "success": True,
-            "pubkey": pubkey,
-            "vpn_address": f"{ip}:{port}",
-            "message": "VPN peer mapping added"
-        }
-    return {
-        "success": False,
-        "error": "Failed to add peer - max peers may be reached"
-    }
+    return rpc_vpn_add_peer(_get_hive_context(), pubkey, vpn_address)
 
 
 @plugin.method("hive-vpn-remove-peer")
@@ -4113,26 +4369,7 @@ def hive_vpn_remove_peer(plugin: Plugin, pubkey: str):
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    success = vpn_transport.remove_vpn_peer(pubkey)
-    if success:
-        return {
-            "success": True,
-            "pubkey": pubkey,
-            "message": "VPN peer mapping removed"
-        }
-    return {
-        "success": False,
-        "pubkey": pubkey,
-        "message": "Peer not found in VPN mappings"
-    }
+    return rpc_vpn_remove_peer(_get_hive_context(), pubkey)
 
 
 @plugin.method("hive-members")
@@ -4143,14 +4380,7 @@ def hive_members(plugin: Plugin):
     Returns:
         List of member records with tier, contribution ratio, uptime, etc.
     """
-    if not database:
-        return {"error": "Hive not initialized"}
-
-    members = database.get_all_members()
-    return {
-        "count": len(members),
-        "members": members,
-    }
+    return rpc_members(_get_hive_context())
 
 
 @plugin.method("hive-topology")
@@ -4161,47 +4391,7 @@ def hive_topology(plugin: Plugin):
     Returns:
         Dict with saturated targets, planner stats, and config.
     """
-    if not planner:
-        return {"error": "Planner not initialized"}
-    if not config:
-        return {"error": "Config not initialized"}
-
-    # Take config snapshot
-    cfg = config.snapshot()
-
-    # Refresh network cache before analysis
-    planner._refresh_network_cache(force=True)
-
-    # Get saturated targets
-    saturated = planner.get_saturated_targets(cfg)
-    saturated_list = [
-        {
-            "target": r.target[:16] + "...",
-            "target_full": r.target,
-            "hive_capacity_sats": r.hive_capacity_sats,
-            "public_capacity_sats": r.public_capacity_sats,
-            "hive_share_pct": round(r.hive_share_pct * 100, 2),
-        }
-        for r in saturated
-    ]
-
-    # Get planner stats
-    stats = planner.get_planner_stats()
-
-    return {
-        "saturated_targets": saturated_list,
-        "saturated_count": len(saturated_list),
-        "ignored_peers": stats.get("ignored_peers", []),
-        "ignored_count": stats.get("ignored_peers_count", 0),
-        "network_cache_size": stats.get("network_cache_size", 0),
-        "network_cache_age_seconds": stats.get("network_cache_age_seconds", 0),
-        "config": {
-            "market_share_cap_pct": cfg.market_share_cap_pct,
-            "planner_interval_seconds": cfg.planner_interval,
-            "expansions_enabled": cfg.planner_enable_expansions,
-            "governance_mode": cfg.governance_mode,
-        }
-    }
+    return rpc_topology(_get_hive_context())
 
 
 @plugin.method("hive-channel-closed")
@@ -4723,10 +4913,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
 def hive_expansion_status(plugin: Plugin, round_id: str = None,
                           target_peer_id: str = None):
     """
-    Get status of cooperative expansion rounds (Phase 6.4).
-
-    The cooperative expansion system coordinates channel opening decisions
-    across hive members to avoid redundant connections and optimize topology.
+    Get status of cooperative expansion rounds.
 
     Args:
         round_id: Get status of a specific round (optional)
@@ -4734,51 +4921,9 @@ def hive_expansion_status(plugin: Plugin, round_id: str = None,
 
     Returns:
         Dict with expansion round status and statistics.
-
-    Examples:
-        # Get overall status
-        hive-expansion-status
-
-        # Get specific round
-        hive-expansion-status round_id=abc12345
-
-        # Get rounds for a target
-        hive-expansion-status target_peer_id=02abc123...
     """
-    if not coop_expansion:
-        return {"error": "Cooperative expansion not initialized"}
-
-    if round_id:
-        # Get specific round
-        round_obj = coop_expansion.get_round(round_id)
-        if not round_obj:
-            return {"error": f"Round {round_id} not found"}
-        return {
-            "round_id": round_id,
-            "round": round_obj.to_dict(),
-            "nominations": [
-                {
-                    "nominator": n.nominator_id[:16] + "...",
-                    "liquidity": n.available_liquidity_sats,
-                    "quality_score": round(n.quality_score, 3),
-                    "channel_count": n.channel_count,
-                    "has_existing": n.has_existing_channel,
-                }
-                for n in round_obj.nominations.values()
-            ]
-        }
-
-    if target_peer_id:
-        # Get rounds for target
-        rounds = coop_expansion.get_rounds_for_target(target_peer_id)
-        return {
-            "target_peer_id": target_peer_id,
-            "count": len(rounds),
-            "rounds": [r.to_dict() for r in rounds],
-        }
-
-    # Get overall status
-    return coop_expansion.get_status()
+    return rpc_expansion_status(_get_hive_context(), round_id=round_id,
+                                target_peer_id=target_peer_id)
 
 
 @plugin.method("hive-expansion-nominate")
@@ -4938,18 +5083,7 @@ def hive_planner_log(plugin: Plugin, limit: int = 50):
     Returns:
         Dict with log entries and count.
     """
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Bound limit to prevent excessive queries
-    limit = min(max(1, limit), 500)
-
-    logs = database.get_planner_logs(limit=limit)
-    return {
-        "count": len(logs),
-        "limit": limit,
-        "logs": logs,
-    }
+    return rpc_planner_log(_get_hive_context(), limit=limit)
 
 
 @plugin.method("hive-test-intent")
@@ -5021,25 +5155,7 @@ def hive_intent_status(plugin: Plugin):
     Returns:
         Dict with pending intents and stats.
     """
-    if not planner or not planner.intent_manager:
-        return {"error": "Intent manager not initialized"}
-
-    intent_mgr = planner.intent_manager
-    stats = intent_mgr.get_intent_stats()
-
-    # Get pending local intents from DB
-    pending = database.get_pending_intents() if database else []
-
-    # Get remote intents from cache
-    remote = intent_mgr.get_remote_intents()
-
-    return {
-        "local_pending": len(pending),
-        "local_intents": pending,
-        "remote_cached": len(remote),
-        "remote_intents": [r.to_dict() for r in remote],
-        "stats": stats
-    }
+    return rpc_intent_status(_get_hive_context())
 
 
 @plugin.method("hive-test-pending-action")
@@ -5154,14 +5270,7 @@ def hive_pending_actions(plugin: Plugin):
     Returns:
         Dict with list of pending actions.
     """
-    if not database:
-        return {"error": "Database not initialized"}
-
-    actions = database.get_pending_actions()
-    return {
-        "count": len(actions),
-        "actions": actions,
-    }
+    return rpc_pending_actions(_get_hive_context())
 
 
 @plugin.method("hive-approve-action")
@@ -5180,267 +5289,7 @@ def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None)
 
     Permission: Member or Admin only
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Get the action
-    action = database.get_pending_action_by_id(action_id)
-    if not action:
-        return {"error": "Action not found", "action_id": action_id}
-
-    if action['status'] != 'pending':
-        return {"error": f"Action already {action['status']}", "action_id": action_id}
-
-    # Check if expired
-    now = int(time.time())
-    if action.get('expires_at') and now > action['expires_at']:
-        database.update_action_status(action_id, 'expired')
-        return {"error": "Action has expired", "action_id": action_id}
-
-    action_type = action['action_type']
-    payload = action['payload']
-
-    # Execute based on action type
-    if action_type == 'channel_open':
-        # Extract channel details from payload
-        target = payload.get('target')
-        context = payload.get('context', {})
-        intent_id = context.get('intent_id') or payload.get('intent_id')
-
-        # Get channel size from context (planner) or top-level (cooperative expansion)
-        proposed_size = (
-            context.get('channel_size_sats') or
-            context.get('amount_sats') or
-            payload.get('amount_sats') or
-            payload.get('channel_size_sats') or
-            1_000_000  # Default 1M sats
-        )
-
-        # Apply member override if provided
-        if amount_sats is not None:
-            channel_size_sats = amount_sats
-            override_applied = True
-        else:
-            channel_size_sats = proposed_size
-            override_applied = False
-
-        if not target:
-            return {"error": "Missing target in action payload", "action_id": action_id}
-
-        # Calculate intelligent budget limits
-        cfg = config.snapshot() if config else None
-        budget_info = {}
-        if cfg:
-            # Get onchain balance for reserve calculation
-            try:
-                funds = safe_plugin.rpc.listfunds()
-                onchain_sats = sum(o.get('amount_msat', 0) // 1000 for o in funds.get('outputs', [])
-                                   if o.get('status') == 'confirmed')
-            except Exception:
-                onchain_sats = 0
-
-            # Calculate budget components:
-            # 1. Daily budget remaining
-            daily_remaining = database.get_available_budget(cfg.autonomous_budget_per_day)
-
-            # 2. Onchain reserve limit (keep reserve_pct for future expansion)
-            spendable_onchain = int(onchain_sats * (1.0 - cfg.budget_reserve_pct))
-
-            # 3. Max per-channel limit (percentage of daily budget)
-            max_per_channel = int(cfg.autonomous_budget_per_day * cfg.budget_max_per_channel_pct)
-
-            # Effective budget is the minimum of all constraints
-            effective_budget = min(daily_remaining, spendable_onchain, max_per_channel)
-
-            budget_info = {
-                "onchain_sats": onchain_sats,
-                "reserve_pct": cfg.budget_reserve_pct,
-                "spendable_onchain": spendable_onchain,
-                "daily_budget": cfg.autonomous_budget_per_day,
-                "daily_remaining": daily_remaining,
-                "max_per_channel_pct": cfg.budget_max_per_channel_pct,
-                "max_per_channel": max_per_channel,
-                "effective_budget": effective_budget,
-            }
-
-            if channel_size_sats > effective_budget:
-                # Reduce to effective budget if it's above minimum
-                if effective_budget >= cfg.planner_min_channel_sats:
-                    plugin.log(
-                        f"cl-hive: Reducing channel size from {channel_size_sats:,} to {effective_budget:,} "
-                        f"due to budget constraints (daily={daily_remaining:,}, reserve={spendable_onchain:,}, "
-                        f"per-channel={max_per_channel:,})",
-                        level='info'
-                    )
-                    channel_size_sats = effective_budget
-                else:
-                    limiting_factor = "daily budget" if daily_remaining == effective_budget else \
-                                     "reserve limit" if spendable_onchain == effective_budget else \
-                                     "per-channel limit"
-                    return {
-                        "error": f"Insufficient budget for channel open ({limiting_factor})",
-                        "action_id": action_id,
-                        "requested_sats": channel_size_sats,
-                        "effective_budget_sats": effective_budget,
-                        "min_channel_sats": cfg.planner_min_channel_sats,
-                        "budget_info": budget_info,
-                    }
-
-            # Validate member override is within bounds
-            if override_applied and channel_size_sats < cfg.planner_min_channel_sats:
-                return {
-                    "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
-                    "action_id": action_id,
-                    "min_channel_sats": cfg.planner_min_channel_sats,
-                }
-
-        # Get intent from database (if available)
-        intent_record = None
-        if intent_id and database:
-            intent_record = database.get_intent_by_id(intent_id)
-
-        # Step 1: Broadcast the intent to all hive members (coordination)
-        broadcast_count = 0
-        if intent_mgr and intent_record:
-            try:
-                from modules.intent_manager import Intent
-                intent = Intent(
-                    intent_id=intent_record['id'],
-                    intent_type=intent_record['intent_type'],
-                    target=intent_record['target'],
-                    initiator=intent_record['initiator'],
-                    timestamp=intent_record['timestamp'],
-                    expires_at=intent_record['expires_at'],
-                    status=intent_record['status']
-                )
-
-                # Broadcast to all members
-                intent_payload = intent_mgr.create_intent_message(intent)
-                msg = serialize(HiveMessageType.INTENT, intent_payload)
-                members = database.get_all_members()
-
-                for member in members:
-                    member_id = member.get('peer_id')
-                    if not member_id or member_id == our_pubkey:
-                        continue
-                    try:
-                        safe_plugin.rpc.call("sendcustommsg", {
-                            "node_id": member_id,
-                            "msg": msg.hex()
-                        })
-                        broadcast_count += 1
-                    except Exception:
-                        pass
-
-                plugin.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members")
-
-            except Exception as e:
-                plugin.log(f"cl-hive: Intent broadcast failed: {e}", level='warn')
-
-        # Step 2: Connect to target if not already connected
-        try:
-            # Check if already connected
-            peers = safe_plugin.rpc.listpeers(target)
-            if not peers.get('peers'):
-                # Try to connect (will fail if no address known, but that's OK)
-                try:
-                    safe_plugin.rpc.connect(target)
-                    plugin.log(f"cl-hive: Connected to {target[:16]}...")
-                except Exception as conn_err:
-                    plugin.log(f"cl-hive: Could not connect to {target[:16]}...: {conn_err}", level='warn')
-                    # Continue anyway - fundchannel might still work if peer connects to us
-        except Exception:
-            pass
-
-        # Step 3: Execute fundchannel to actually open the channel
-        try:
-            plugin.log(
-                f"cl-hive: Opening channel to {target[:16]}... "
-                f"for {channel_size_sats:,} sats"
-            )
-
-            # fundchannel with the calculated size
-            # Use rpc.call() for explicit control over parameter names
-            result = safe_plugin.rpc.call("fundchannel", {
-                "id": target,
-                "amount": channel_size_sats,
-                "announce": True  # Public channel
-            })
-
-            channel_id = result.get('channel_id', 'unknown')
-            txid = result.get('txid', 'unknown')
-
-            plugin.log(
-                f"cl-hive: Channel opened! txid={txid[:16]}... "
-                f"channel_id={channel_id}"
-            )
-
-            # Update intent status if we have one
-            if intent_id and database:
-                database.update_intent_status(intent_id, 'committed')
-
-            # Update action status
-            database.update_action_status(action_id, 'executed')
-
-            # Record budget spending
-            database.record_budget_spend(
-                action_type='channel_open',
-                amount_sats=channel_size_sats,
-                target=target,
-                action_id=action_id
-            )
-            plugin.log(f"cl-hive: Recorded budget spend of {channel_size_sats:,} sats", level='debug')
-
-            result = {
-                "status": "executed",
-                "action_id": action_id,
-                "action_type": action_type,
-                "target": target,
-                "channel_size_sats": channel_size_sats,
-                "proposed_size_sats": proposed_size,
-                "channel_id": channel_id,
-                "txid": txid,
-                "broadcast_count": broadcast_count,
-                "sizing_reasoning": context.get('sizing_reasoning', 'N/A'),
-            }
-            if override_applied:
-                result["override_applied"] = True
-                result["override_amount"] = amount_sats
-            if budget_info:
-                result["budget_info"] = budget_info
-            return result
-
-        except Exception as e:
-            error_msg = str(e)
-            plugin.log(f"cl-hive: fundchannel failed: {error_msg}", level='error')
-
-            # Update action status to failed
-            database.update_action_status(action_id, 'failed')
-
-            return {
-                "status": "failed",
-                "action_id": action_id,
-                "action_type": action_type,
-                "target": target,
-                "channel_size_sats": channel_size_sats,
-                "error": error_msg,
-                "broadcast_count": broadcast_count,
-            }
-
-    else:
-        # Unknown action type - just mark as approved
-        database.update_action_status(action_id, 'approved')
-        return {
-            "status": "approved",
-            "action_id": action_id,
-            "action_type": action_type,
-            "note": "Unknown action type, marked as approved only"
-        }
+    return rpc_approve_action(_get_hive_context(), action_id, amount_sats)
 
 
 @plugin.method("hive-reject-action")
@@ -5456,38 +5305,7 @@ def hive_reject_action(plugin: Plugin, action_id: int):
 
     Permission: Member or Admin only
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Get the action
-    action = database.get_pending_action_by_id(action_id)
-    if not action:
-        return {"error": "Action not found", "action_id": action_id}
-
-    if action['status'] != 'pending':
-        return {"error": f"Action already {action['status']}", "action_id": action_id}
-
-    # Also abort the associated intent if it exists
-    payload = action['payload']
-    intent_id = payload.get('intent_id')
-    if intent_id:
-        database.update_intent_status(intent_id, 'aborted')
-
-    # Update action status
-    database.update_action_status(action_id, 'rejected')
-
-    plugin.log(f"cl-hive: Rejected action {action_id}")
-
-    return {
-        "status": "rejected",
-        "action_id": action_id,
-        "action_type": action['action_type'],
-    }
+    return rpc_reject_action(_get_hive_context(), action_id)
 
 
 @plugin.method("hive-budget-summary")
@@ -5503,26 +5321,7 @@ def hive_budget_summary(plugin: Plugin, days: int = 7):
 
     Permission: Member or Admin only
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    cfg = config.snapshot() if config else None
-    if not cfg:
-        return {"error": "Config not initialized"}
-
-    daily_budget = cfg.autonomous_budget_per_day
-    summary = database.get_budget_summary(daily_budget, days)
-
-    return {
-        "daily_budget_sats": daily_budget,
-        "governance_mode": cfg.governance_mode,
-        **summary
-    }
+    return rpc_budget_summary(_get_hive_context(), days)
 
 
 # =============================================================================
@@ -6037,45 +5836,7 @@ def hive_set_mode(plugin: Plugin, mode: str):
 
     Permission: Admin only
     """
-    from modules.config import VALID_GOVERNANCE_MODES
-
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not config:
-        return {"error": "Config not initialized"}
-
-    # Validate mode
-    mode_lower = mode.lower()
-    if mode_lower not in VALID_GOVERNANCE_MODES:
-        return {
-            "error": f"Invalid mode: {mode}",
-            "valid_modes": list(VALID_GOVERNANCE_MODES)
-        }
-
-    # Check for oracle URL if switching to oracle mode
-    if mode_lower == 'oracle' and not config.oracle_url:
-        return {
-            "error": "Cannot switch to oracle mode: oracle_url not configured",
-            "hint": "Set hive-oracle-url option or configure oracle_url"
-        }
-
-    # Store previous mode
-    previous_mode = config.governance_mode
-
-    # Update config
-    config.governance_mode = mode_lower
-    config._version += 1
-
-    plugin.log(f"cl-hive: Governance mode changed from {previous_mode} to {mode_lower}")
-
-    return {
-        "status": "ok",
-        "previous_mode": previous_mode,
-        "current_mode": mode_lower,
-    }
+    return rpc_set_mode(_get_hive_context(), mode)
 
 
 @plugin.method("hive-enable-expansions")
@@ -6091,25 +5852,7 @@ def hive_enable_expansions(plugin: Plugin, enabled: bool = True):
 
     Permission: Admin only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not config:
-        return {"error": "Config not initialized"}
-
-    previous = config.planner_enable_expansions
-    config.planner_enable_expansions = enabled
-    config._version += 1
-
-    plugin.log(f"cl-hive: Expansion proposals {'enabled' if enabled else 'disabled'}")
-
-    return {
-        "status": "ok",
-        "previous_setting": previous,
-        "expansions_enabled": enabled,
-    }
+    return rpc_enable_expansions(_get_hive_context(), enabled)
 
 
 @plugin.method("hive-vouch")
@@ -6478,42 +6221,7 @@ def hive_pending_admin_promotions(plugin: Plugin):
 
     Permission: Admin only
     """
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Get all current admins
-    all_members = database.get_all_members()
-    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
-    admin_pubkeys = set(m["peer_id"] for m in admins)
-
-    pending = database.get_pending_admin_promotions()
-    result = []
-
-    for p in pending:
-        target = p["target_peer_id"]
-        approvals = database.get_admin_promotion_approvals(target)
-        approval_pubkeys = set(a["approver_peer_id"] for a in approvals)
-        valid_approvals = approval_pubkeys & admin_pubkeys
-
-        result.append({
-            "peer_id": target,
-            "proposed_by": p["proposed_by"],
-            "proposed_at": p["proposed_at"],
-            "approvals_received": len(valid_approvals),
-            "approvals_needed": len(admins),
-            "approved_by": [pk[:16] + "..." for pk in valid_approvals],
-            "waiting_for": [pk[:16] + "..." for pk in (admin_pubkeys - valid_approvals)]
-        })
-
-    return {
-        "count": len(result),
-        "admin_count": len(admins),
-        "pending_promotions": result
-    }
+    return rpc_pending_admin_promotions(_get_hive_context())
 
 
 @plugin.method("hive-resign-admin")
@@ -6882,58 +6590,7 @@ def hive_pending_bans(plugin: Plugin):
 
     Permission: Any member
     """
-    if not database:
-        return {"error": "Database not initialized"}
-
-    # Clean up expired proposals
-    now = int(time.time())
-    database.cleanup_expired_ban_proposals(now)
-
-    # Get pending proposals
-    proposals = database.get_pending_ban_proposals()
-
-    # Get eligible voters info
-    all_members = database.get_all_members()
-
-    result = []
-    for p in proposals:
-        target_id = p["target_peer_id"]
-        eligible = [m for m in all_members
-                    if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
-                    and m["peer_id"] != target_id]
-        eligible_ids = set(m["peer_id"] for m in eligible)
-        quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
-
-        votes = database.get_ban_votes(p["proposal_id"])
-        approve_count = sum(1 for v in votes if v["vote"] == "approve" and v["voter_peer_id"] in eligible_ids)
-        reject_count = sum(1 for v in votes if v["vote"] == "reject" and v["voter_peer_id"] in eligible_ids)
-
-        # Check if we've voted
-        my_vote = None
-        if our_pubkey:
-            for v in votes:
-                if v["voter_peer_id"] == our_pubkey:
-                    my_vote = v["vote"]
-                    break
-
-        result.append({
-            "proposal_id": p["proposal_id"],
-            "target_peer_id": target_id,
-            "target_tier": database.get_member(target_id).get("tier") if database.get_member(target_id) else "unknown",
-            "proposer": p["proposer_peer_id"][:16] + "...",
-            "reason": p["reason"],
-            "proposed_at": p["proposed_at"],
-            "expires_at": p["expires_at"],
-            "approve_count": approve_count,
-            "reject_count": reject_count,
-            "quorum_needed": quorum_needed,
-            "my_vote": my_vote
-        })
-
-    return {
-        "count": len(result),
-        "proposals": result
-    }
+    return rpc_pending_bans(_get_hive_context())
 
 
 @plugin.method("hive-contribution")
@@ -6947,35 +6604,7 @@ def hive_contribution(plugin: Plugin, peer_id: str = None):
     Returns:
         Dict with contribution statistics.
     """
-    if not contribution_mgr or not database:
-        return {"error": "Contribution tracking not available"}
-
-    target_id = peer_id or our_pubkey
-    if not target_id:
-        return {"error": "No peer specified and our_pubkey not available"}
-
-    # Get contribution stats
-    stats = contribution_mgr.get_contribution_stats(target_id)
-
-    # Get member info
-    member = database.get_member(target_id)
-
-    # Get leech status
-    leech_status = contribution_mgr.check_leech_status(target_id)
-
-    result = {
-        "peer_id": target_id,
-        "forwarded_msat": stats["forwarded"],
-        "received_msat": stats["received"],
-        "contribution_ratio": round(stats["ratio"], 4),
-        "is_leech": leech_status["is_leech"],
-    }
-
-    if member:
-        result["tier"] = member.get("tier")
-        result["uptime_pct"] = member.get("uptime_pct")
-
-    return result
+    return rpc_contribution(_get_hive_context(), peer_id=peer_id)
 
 
 @plugin.method("hive-request-promotion")
