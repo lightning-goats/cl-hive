@@ -757,9 +757,256 @@ def process_pending_action(action: Dict, rpc: Any, provider: AIProvider) -> Opti
     4. Creates attestation
     5. Returns decision
     """
-    # TODO: Implement with proper prompt engineering
-    log.debug(f"process_pending_action: {action.get('action_type', 'unknown')}")
-    return None
+    action_id = action.get("id", 0)
+    action_type = action.get("action_type", "unknown")
+    payload = action.get("payload", {})
+
+    log.info(f"Processing pending action {action_id}: {action_type}")
+
+    # Build system prompt based on action type
+    system_prompt = _build_decision_system_prompt(action_type)
+
+    # Build user message with action context
+    user_message = _build_decision_user_message(action, rpc)
+
+    # Call AI provider
+    response, error = provider.complete(
+        [{"role": "user", "content": user_message}],
+        system_prompt
+    )
+
+    if error:
+        log.error(f"AI provider error for action {action_id}: {error}")
+        update_stats_api_call(0, False)
+        return None
+
+    latency_ms = response.get("_latency_ms", 0)
+    update_stats_api_call(latency_ms, True)
+
+    # Parse the response
+    decision_result = _parse_decision_response(response)
+    if not decision_result:
+        log.warning(f"Failed to parse AI response for action {action_id}")
+        return None
+
+    decision_type, confidence, reasoning_factors = decision_result
+
+    # Create attestation
+    attestation = create_attestation(response, our_pubkey, rpc, config.provider if config else "anthropic")
+
+    # Build AIDecision
+    decision = AIDecision(
+        decision_id=f"dec_{action_id}_{int(time.time())}",
+        timestamp=int(time.time()),
+        action_type=action_type,
+        decision=decision_type,
+        confidence=confidence,
+        reasoning_factors=reasoning_factors,
+        attestation=attestation,
+        executed=False,
+        result=""
+    )
+
+    # Execute the decision via cl-hive RPC
+    try:
+        if decision_type == "approve":
+            result = rpc.call("hive-action-execute", {"action_id": action_id})
+            decision.executed = True
+            decision.result = "executed"
+            log.info(f"Action {action_id} approved and executed")
+        elif decision_type == "reject":
+            result = rpc.call("hive-action-reject", {
+                "action_id": action_id,
+                "reason": "ai_oracle_rejected",
+                "factors": reasoning_factors
+            })
+            decision.result = "rejected"
+            log.info(f"Action {action_id} rejected: {reasoning_factors}")
+        elif decision_type == "defer":
+            # Keep pending for next cycle
+            decision.result = "deferred"
+            log.info(f"Action {action_id} deferred for later")
+        elif decision_type == "modify":
+            # Modify would need to update the action - keep pending
+            decision.result = "needs_modification"
+            log.info(f"Action {action_id} needs modification")
+    except Exception as e:
+        log.error(f"Failed to execute decision for action {action_id}: {e}")
+        decision.result = f"execution_error: {str(e)[:100]}"
+
+    return decision
+
+
+def _build_decision_system_prompt(action_type: str) -> str:
+    """Build system prompt for decision making based on action type."""
+    base_prompt = """You are an AI oracle managing a Lightning Network node as part of a coordinated fleet (Hive).
+Your role is to make prudent decisions about node operations while maintaining safety and profitability.
+
+DECISION FRAMEWORK:
+- Approve actions that benefit the node and fleet
+- Reject actions that are risky, unprofitable, or violate safety constraints
+- Defer when more information is needed or timing is not optimal
+- Always consider: liquidity impact, fee revenue, network position, risk
+
+RESPONSE FORMAT (JSON only, no other text):
+{
+  "decision": "approve" | "reject" | "defer" | "modify",
+  "confidence": 0.0-1.0,
+  "reasoning_factors": ["factor1", "factor2", ...],
+  "modifications": null | {...}
+}
+
+ALLOWED REASONING FACTORS:
+- volume_elasticity, competitor_response, market_timing, alternative_available
+- fee_trend, capacity_constraint, liquidity_need, reputation_score
+- position_advantage, cost_benefit, risk_assessment, strategic_alignment
+"""
+
+    action_specific = {
+        "channel_open": """
+ACTION TYPE: Channel Open
+Consider: target node quality, capacity allocation, fee potential, existing connectivity, on-chain fee cost.
+Approve if: target is well-connected, good ROI expected, we have capacity.
+Reject if: poor target, insufficient funds, already well-connected to target's region.""",
+
+        "channel_close": """
+ACTION TYPE: Channel Close
+Consider: channel profitability, peer reliability, liquidity needs, on-chain fee cost.
+Approve if: channel is consistently unprofitable or peer is unreliable.
+Reject if: channel is profitable or closure timing is poor (high on-chain fees).""",
+
+        "fee_adjustment": """
+ACTION TYPE: Fee Adjustment
+Consider: current market rates, volume elasticity, competitor fees, corridor demand.
+Approve if: adjustment aligns with market and maintains competitiveness.
+Reject if: change would price us out of market or undercut profitability.""",
+
+        "rebalance": """
+ACTION TYPE: Rebalance
+Consider: cost vs benefit, liquidity distribution, expected routing volume.
+Approve if: cost is reasonable and improves routing capacity.
+Reject if: cost exceeds expected revenue improvement.""",
+
+        "expansion": """
+ACTION TYPE: Expansion (coordinated channel open)
+Consider: fleet strategy, target importance, coordination benefits.
+Approve if: improves fleet coverage and expected to be profitable.
+Reject if: duplicates existing fleet coverage or poor target.""",
+    }
+
+    specific = action_specific.get(action_type, f"""
+ACTION TYPE: {action_type}
+Evaluate based on general safety and profitability criteria.""")
+
+    return base_prompt + specific
+
+
+def _build_decision_user_message(action: Dict, rpc: Any) -> str:
+    """Build user message with action context for AI decision."""
+    action_id = action.get("id", 0)
+    action_type = action.get("action_type", "unknown")
+    payload = action.get("payload", {})
+    proposed_at = action.get("proposed_at", 0)
+
+    # Get node context
+    node_context = {}
+    try:
+        # Get basic node info
+        info = rpc.call("getinfo")
+        node_context["our_alias"] = info.get("alias", "")
+        node_context["blockheight"] = info.get("blockheight", 0)
+
+        # Get funds summary
+        funds = rpc.call("listfunds")
+        outputs = funds.get("outputs", [])
+        channels = funds.get("channels", [])
+
+        node_context["onchain_balance_sats"] = sum(o.get("amount_msat", 0) // 1000 for o in outputs if o.get("status") == "confirmed")
+        node_context["channel_count"] = len(channels)
+        node_context["total_channel_capacity_sats"] = sum(c.get("amount_msat", 0) // 1000 for c in channels)
+
+    except Exception as e:
+        log.warning(f"Failed to get node context: {e}")
+
+    message = f"""PENDING ACTION FOR REVIEW:
+
+Action ID: {action_id}
+Action Type: {action_type}
+Proposed At: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(proposed_at))}
+
+Payload:
+{json.dumps(payload, indent=2)}
+
+Node Context:
+- Alias: {node_context.get('our_alias', 'unknown')}
+- Block Height: {node_context.get('blockheight', 0)}
+- On-chain Balance: {node_context.get('onchain_balance_sats', 0):,} sats
+- Channel Count: {node_context.get('channel_count', 0)}
+- Total Channel Capacity: {node_context.get('total_channel_capacity_sats', 0):,} sats
+
+Please evaluate this action and provide your decision in the required JSON format."""
+
+    return message
+
+
+def _parse_decision_response(response: Dict) -> Optional[Tuple[str, float, List[str]]]:
+    """Parse AI response to extract decision, confidence, and factors."""
+    try:
+        # Get text content from response
+        content = response.get("content", [])
+        if not content:
+            return None
+
+        text = ""
+        for block in content:
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                break
+
+        if not text:
+            return None
+
+        # Try to parse JSON from response
+        # Handle case where JSON is embedded in markdown code block
+        if "```json" in text:
+            start = text.find("```json") + 7
+            end = text.find("```", start)
+            text = text[start:end].strip()
+        elif "```" in text:
+            start = text.find("```") + 3
+            end = text.find("```", start)
+            text = text[start:end].strip()
+
+        # Parse JSON
+        parsed = json.loads(text)
+
+        decision = parsed.get("decision", "defer")
+        if decision not in ["approve", "reject", "defer", "modify"]:
+            decision = "defer"
+
+        confidence = float(parsed.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))
+
+        reasoning_factors = parsed.get("reasoning_factors", [])
+        if not isinstance(reasoning_factors, list):
+            reasoning_factors = []
+
+        # Validate factors against allowed list
+        allowed_factors = {
+            "volume_elasticity", "competitor_response", "market_timing", "alternative_available",
+            "fee_trend", "capacity_constraint", "liquidity_need", "reputation_score",
+            "position_advantage", "cost_benefit", "risk_assessment", "strategic_alignment"
+        }
+        reasoning_factors = [f for f in reasoning_factors if f in allowed_factors]
+
+        return decision, confidence, reasoning_factors
+
+    except json.JSONDecodeError as e:
+        log.warning(f"Failed to parse JSON from AI response: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"Error parsing AI response: {e}")
+        return None
 
 
 def process_incoming_message(msg_type: str, payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
@@ -767,10 +1014,471 @@ def process_incoming_message(msg_type: str, payload: Dict, sender: str, rpc: Any
     Process an incoming AI Oracle message.
 
     This determines the appropriate response (if any) to incoming messages.
+    Handlers are organized by message category per spec section 3.1.
     """
-    # TODO: Implement message type handlers
     log.debug(f"process_incoming_message: {msg_type} from {sender[:16]}...")
     update_stats_message_received()
+
+    # Route to appropriate handler based on message type
+    handlers = {
+        # Information Sharing (32800-32809)
+        "ai_state_summary": _handle_state_summary,
+        "ai_opportunity_signal": _handle_opportunity_signal,
+        "ai_market_assessment": _handle_market_assessment,
+
+        # Task Coordination (32810-32819)
+        "ai_task_request": _handle_task_request,
+        "ai_task_response": _handle_task_response,
+        "ai_task_complete": _handle_task_complete,
+        "ai_task_cancel": _handle_task_cancel,
+
+        # Strategy Coordination (32820-32829)
+        "ai_strategy_proposal": _handle_strategy_proposal,
+        "ai_strategy_vote": _handle_strategy_vote,
+        "ai_strategy_result": _handle_strategy_result,
+        "ai_strategy_update": _handle_strategy_update,
+
+        # Reasoning Exchange (32830-32839)
+        "ai_reasoning_request": _handle_reasoning_request,
+        "ai_reasoning_response": _handle_reasoning_response,
+
+        # Health & Alerts (32840-32849)
+        "ai_heartbeat": _handle_heartbeat,
+        "ai_alert": _handle_alert,
+    }
+
+    handler = handlers.get(msg_type)
+    if handler:
+        try:
+            handler(payload, sender, rpc, provider)
+        except Exception as e:
+            log.error(f"Error in handler for {msg_type}: {e}")
+    else:
+        log.warning(f"Unknown AI message type: {msg_type}")
+
+
+# ============================================================================
+# Message Handlers - Information Sharing
+# ============================================================================
+
+def _handle_state_summary(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_STATE_SUMMARY - periodic state broadcast from peer AI."""
+    # Just log for now - could be used for fleet awareness
+    liquidity = payload.get("liquidity", {})
+    priorities = payload.get("priorities", {})
+    ai_meta = payload.get("ai_meta", {})
+
+    log.debug(
+        f"State summary from {sender[:16]}: "
+        f"status={liquidity.get('status', 'unknown')}, "
+        f"focus={priorities.get('current_focus', 'unknown')}, "
+        f"confidence={ai_meta.get('confidence', 0):.2f}"
+    )
+
+
+def _handle_opportunity_signal(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_OPPORTUNITY_SIGNAL - peer identified an opportunity."""
+    opportunity = payload.get("opportunity", {})
+    recommendation = payload.get("recommendation", {})
+    volunteer = payload.get("volunteer", {})
+
+    target = opportunity.get("target_node", "")[:16]
+    opp_type = opportunity.get("opportunity_type", "unknown")
+    action = recommendation.get("action", "unknown")
+    confidence = recommendation.get("confidence", 0)
+
+    log.info(
+        f"Opportunity signal from {sender[:16]}: "
+        f"target={target}..., type={opp_type}, action={action}, confidence={confidence:.2f}"
+    )
+
+    # If sender is volunteering and we have capacity, we might delegate
+    # For now, just log and let decision loop handle if relevant
+
+
+def _handle_market_assessment(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_MARKET_ASSESSMENT - market analysis from peer."""
+    assessment_type = payload.get("assessment_type", "unknown")
+    recommendation = payload.get("recommendation", {})
+    confidence = payload.get("confidence", 0)
+
+    log.debug(
+        f"Market assessment from {sender[:16]}: "
+        f"type={assessment_type}, stance={recommendation.get('overall_stance', 'unknown')}, "
+        f"confidence={confidence:.2f}"
+    )
+
+
+# ============================================================================
+# Message Handlers - Task Coordination
+# ============================================================================
+
+def _handle_task_request(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_TASK_REQUEST - peer requesting us to perform a task."""
+    request_id = payload.get("request_id", "")
+    task = payload.get("task", {})
+    compensation = payload.get("compensation", {})
+
+    task_type = task.get("task_type", "unknown")
+    target = task.get("target", "")[:16] if task.get("target") else ""
+    priority = task.get("priority", "normal")
+
+    log.info(f"Task request from {sender[:16]}: {task_type} (priority={priority})")
+
+    # Check reciprocity before accepting
+    can_accept, reason = can_accept_task(sender)
+    if not can_accept:
+        log.info(f"Rejecting task from {sender[:16]}: {reason}")
+        _send_task_response(rpc, sender, request_id, "reject", reason)
+        return
+
+    # Check rate limits
+    can_send, rate_reason = check_outgoing_rate("ai_task_response")
+    if not can_send:
+        log.warning(f"Rate limited, cannot respond to task request: {rate_reason}")
+        return
+
+    # Evaluate task using AI
+    response = _evaluate_task_request(task, sender, rpc, provider)
+
+    if response == "accept":
+        # Record that sender has an outstanding task
+        ledger = get_reciprocity_ledger(sender)
+        ledger.outstanding_tasks += 1
+        log.info(f"Accepting task {request_id} from {sender[:16]}")
+    else:
+        log.info(f"Declining task {request_id} from {sender[:16]}: {response}")
+
+    _send_task_response(rpc, sender, request_id, response, "")
+
+
+def _evaluate_task_request(task: Dict, sender: str, rpc: Any, provider: AIProvider) -> str:
+    """Use AI to evaluate whether to accept a task request."""
+    task_type = task.get("task_type", "unknown")
+    parameters = task.get("parameters", {})
+
+    # Simple evaluation - could be enhanced with full AI call
+    supported_tasks = ["expand_to", "rebalance_toward", "adjust_fees", "probe_route"]
+    if task_type not in supported_tasks:
+        return "reject"
+
+    # Check if we have capacity for expand_to
+    if task_type == "expand_to":
+        amount = parameters.get("amount_sats", 0)
+        try:
+            funds = rpc.call("listfunds")
+            outputs = funds.get("outputs", [])
+            onchain = sum(o.get("amount_msat", 0) // 1000 for o in outputs if o.get("status") == "confirmed")
+            if onchain < amount + 50000:  # Need buffer for fees
+                return "reject"
+        except Exception:
+            return "defer"
+
+    return "accept"
+
+
+def _send_task_response(rpc: Any, target: str, request_id: str, response: str, reason: str) -> None:
+    """Send task response to peer via cl-hive RPC."""
+    try:
+        result = rpc.call("hive-ai-send-task-response", {
+            "target_node": target,
+            "request_id": request_id,
+            "response": response,
+            "reason": reason
+        })
+        if result.get("error"):
+            log.warning(f"Failed to send task response: {result['error']}")
+        else:
+            record_outgoing_message("ai_task_response")
+            update_stats_message_sent()
+    except Exception as e:
+        log.error(f"Error sending task response: {e}")
+
+
+def _handle_task_response(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_TASK_RESPONSE - response to our task request."""
+    request_id = payload.get("request_id", "")
+    response = payload.get("response", "reject")
+    acceptance = payload.get("acceptance", {})
+
+    log.info(f"Task response from {sender[:16]}: {response} for {request_id}")
+
+    if response == "accept":
+        # They accepted our task - track it
+        record_task_requested(sender)
+        log.info(f"Task {request_id} accepted by {sender[:16]}")
+    elif response == "reject":
+        rejection = payload.get("rejection", {})
+        reason = rejection.get("reason", "unknown")
+        log.info(f"Task {request_id} rejected by {sender[:16]}: {reason}")
+
+
+def _handle_task_complete(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_TASK_COMPLETE - notification that delegated task is done."""
+    request_id = payload.get("request_id", "")
+    status = payload.get("status", "unknown")
+    result = payload.get("result", {})
+
+    log.info(f"Task complete from {sender[:16]}: {request_id} status={status}")
+
+    if status == "success":
+        # Credit them for completing the task
+        record_task_fulfilled(sender)
+        log.info(f"Task {request_id} completed successfully by {sender[:16]}")
+
+        # Log learnings if provided
+        learnings = payload.get("learnings", {})
+        if learnings.get("recommended_for_future"):
+            log.debug(f"Peer {sender[:16]} recommended for future tasks")
+
+
+def _handle_task_cancel(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_TASK_CANCEL - requester canceling a task."""
+    request_id = payload.get("request_id", "")
+    reason = payload.get("reason", "unknown")
+
+    log.info(f"Task cancel from {sender[:16]}: {request_id} reason={reason}")
+
+    # Decrement outstanding tasks if we had one pending
+    ledger = get_reciprocity_ledger(sender)
+    if ledger.outstanding_tasks > 0:
+        ledger.outstanding_tasks -= 1
+
+
+# ============================================================================
+# Message Handlers - Strategy Coordination
+# ============================================================================
+
+def _handle_strategy_proposal(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_STRATEGY_PROPOSAL - fleet strategy proposal."""
+    proposal_id = payload.get("proposal_id", "")
+    strategy = payload.get("strategy", {})
+    voting = payload.get("voting", {})
+
+    strategy_type = strategy.get("strategy_type", "unknown")
+    name = strategy.get("name", "unnamed")
+    deadline = voting.get("voting_deadline_timestamp", 0)
+
+    log.info(
+        f"Strategy proposal from {sender[:16]}: "
+        f"{strategy_type} - {name} (proposal_id={proposal_id})"
+    )
+
+    # Evaluate the proposal using AI
+    vote = _evaluate_strategy_proposal(strategy, voting, sender, rpc, provider)
+
+    # Send our vote
+    if vote:
+        _send_strategy_vote(rpc, proposal_id, vote, sender)
+
+
+def _evaluate_strategy_proposal(
+    strategy: Dict,
+    voting: Dict,
+    proposer: str,
+    rpc: Any,
+    provider: AIProvider
+) -> Optional[str]:
+    """Use AI to evaluate a strategy proposal and decide vote."""
+    strategy_type = strategy.get("strategy_type", "unknown")
+    expected_outcomes = strategy.get("expected_outcomes", {})
+    risks = strategy.get("risks", [])
+
+    # Simple heuristic evaluation - could use full AI
+    # Approve if expected positive outcome with reasonable confidence
+    revenue_change = expected_outcomes.get("revenue_change_pct", 0)
+    confidence = expected_outcomes.get("confidence", 0)
+    opt_out_allowed = strategy.get("opt_out_allowed", False)
+
+    if revenue_change > 0 and confidence > 0.5:
+        if opt_out_allowed or len(risks) == 0:
+            return "approve"
+        elif len(risks) <= 2:
+            return "approve"
+
+    # Abstain if uncertain
+    if confidence < 0.3:
+        return "abstain"
+
+    return "reject"
+
+
+def _send_strategy_vote(rpc: Any, proposal_id: str, vote: str, proposer: str) -> None:
+    """Send strategy vote via cl-hive RPC."""
+    try:
+        # Check rate limit
+        can_send, reason = check_outgoing_rate("ai_strategy_vote")
+        if not can_send:
+            log.warning(f"Rate limited, cannot send strategy vote: {reason}")
+            return
+
+        result = rpc.call("hive-ai-send-strategy-vote", {
+            "proposal_id": proposal_id,
+            "vote": vote,
+            "rationale": {
+                "factors": ["cost_benefit", "risk_assessment"],
+                "confidence_in_proposal": 0.6
+            }
+        })
+
+        if result.get("error"):
+            log.warning(f"Failed to send strategy vote: {result['error']}")
+        else:
+            record_outgoing_message("ai_strategy_vote")
+            update_stats_message_sent()
+            log.info(f"Voted {vote} on proposal {proposal_id}")
+
+    except Exception as e:
+        log.error(f"Error sending strategy vote: {e}")
+
+
+def _handle_strategy_vote(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_STRATEGY_VOTE - peer's vote on a proposal."""
+    proposal_id = payload.get("proposal_id", "")
+    vote = payload.get("vote", "abstain")
+
+    log.debug(f"Strategy vote from {sender[:16]}: {vote} on {proposal_id}")
+
+
+def _handle_strategy_result(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_STRATEGY_RESULT - outcome of strategy vote."""
+    proposal_id = payload.get("proposal_id", "")
+    result = payload.get("result", "unknown")
+    voting_summary = payload.get("voting_summary", {})
+
+    votes_for = voting_summary.get("votes_for", 0)
+    votes_against = voting_summary.get("votes_against", 0)
+    approval_pct = voting_summary.get("approval_pct", 0)
+
+    log.info(
+        f"Strategy result for {proposal_id}: {result} "
+        f"({votes_for} for, {votes_against} against, {approval_pct:.1f}% approval)"
+    )
+
+
+def _handle_strategy_update(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_STRATEGY_UPDATE - progress on active strategy."""
+    proposal_id = payload.get("proposal_id", "")
+    progress = payload.get("progress", {})
+    metrics = payload.get("metrics", {})
+
+    phase = progress.get("phase", "unknown")
+    completion = progress.get("completion_pct", 0)
+    on_track = metrics.get("on_track", False)
+
+    log.debug(
+        f"Strategy update for {proposal_id}: "
+        f"phase={phase}, {completion:.1f}% complete, on_track={on_track}"
+    )
+
+
+# ============================================================================
+# Message Handlers - Reasoning Exchange
+# ============================================================================
+
+def _handle_reasoning_request(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_REASONING_REQUEST - peer asking for our reasoning."""
+    request_id = payload.get("request_id", "")
+    context = payload.get("context", {})
+    detail_level = payload.get("detail_level", "summary")
+
+    reference_type = context.get("reference_type", "unknown")
+    reference_id = context.get("reference_id", "")
+
+    log.info(f"Reasoning request from {sender[:16]}: {reference_type} ({reference_id})")
+
+    # Check reciprocity
+    can_accept, reason = can_accept_task(sender)
+    if not can_accept:
+        log.info(f"Rejecting reasoning request from {sender[:16]}: {reason}")
+        return
+
+    # For now, send a simple response
+    # Could be enhanced to use AI for detailed reasoning
+    _send_reasoning_response(rpc, sender, request_id, reference_type)
+
+
+def _send_reasoning_response(rpc: Any, target: str, request_id: str, reference_type: str) -> None:
+    """Send reasoning response to peer."""
+    try:
+        result = rpc.call("hive-ai-send-reasoning-response", {
+            "target_node": target,
+            "request_id": request_id,
+            "reasoning": {
+                "conclusion": "neutral",
+                "decision_factors": [
+                    {
+                        "factor_type": "cost_benefit",
+                        "weight": 0.5,
+                        "assessment": "neutral",
+                        "confidence": 0.6
+                    }
+                ],
+                "overall_confidence": 0.6,
+                "data_sources": ["local_state"]
+            }
+        })
+
+        if result.get("error"):
+            log.warning(f"Failed to send reasoning response: {result['error']}")
+        else:
+            record_outgoing_message("ai_reasoning_response")
+            update_stats_message_sent()
+
+    except Exception as e:
+        log.error(f"Error sending reasoning response: {e}")
+
+
+def _handle_reasoning_response(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_REASONING_RESPONSE - peer's reasoning explanation."""
+    request_id = payload.get("request_id", "")
+    reasoning = payload.get("reasoning", {})
+
+    conclusion = reasoning.get("conclusion", "unknown")
+    confidence = reasoning.get("overall_confidence", 0)
+
+    log.debug(f"Reasoning response from {sender[:16]}: {conclusion} (confidence={confidence:.2f})")
+
+
+# ============================================================================
+# Message Handlers - Health & Alerts
+# ============================================================================
+
+def _handle_heartbeat(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_HEARTBEAT - peer AI health status."""
+    ai_status = payload.get("ai_status", {})
+    health_metrics = payload.get("health_metrics", {})
+
+    op_state = ai_status.get("operational_state", "unknown")
+    model = ai_status.get("model", "unknown")
+    decisions_24h = ai_status.get("decisions_24h", 0)
+
+    log.debug(
+        f"Heartbeat from {sender[:16]}: "
+        f"state={op_state}, model={model}, decisions_24h={decisions_24h}"
+    )
+
+
+def _handle_alert(payload: Dict, sender: str, rpc: Any, provider: AIProvider) -> None:
+    """Handle AI_ALERT - important alert from peer AI."""
+    alert = payload.get("alert", {})
+    recommendation = payload.get("recommendation", {})
+
+    severity = alert.get("severity", "info")
+    category = alert.get("category", "unknown")
+    alert_type = alert.get("alert_type", "unknown")
+    summary = alert.get("summary", "")
+
+    # Log alerts appropriately based on severity
+    if severity == "critical":
+        log.warning(f"ALERT from {sender[:16]}: [{category}] {alert_type} - {summary}")
+    elif severity == "warning":
+        log.warning(f"Alert from {sender[:16]}: [{category}] {alert_type}")
+    else:
+        log.info(f"Alert from {sender[:16]}: [{category}] {alert_type}")
+
+    # Could trigger automatic response based on alert type
+    # For now, just log
 
 
 # ============================================================================
