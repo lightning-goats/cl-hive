@@ -200,6 +200,10 @@ class HiveRoutingMap:
 
         reporter_id = payload.get("reporter_id")
 
+        # Identity binding: sender must match reporter (prevent relay attacks)
+        if peer_id != reporter_id:
+            return {"error": "identity binding failed"}
+
         # Verify sender is a hive member
         member = self.database.get_member(reporter_id)
         if not member:

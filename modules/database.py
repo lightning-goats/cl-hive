@@ -2176,17 +2176,20 @@ class HiveDatabase:
         """, (peer_id,)).fetchone()
         return dict(row) if row else None
 
-    def get_all_peer_fee_profiles(self) -> List[Dict[str, Any]]:
+    def get_all_peer_fee_profiles(self, limit: int = 500) -> List[Dict[str, Any]]:
         """
         Get all aggregated fee profiles.
+
+        Args:
+            limit: Maximum number of profiles to return (default 500)
 
         Returns:
             List of fee profile dicts
         """
         conn = self._get_connection()
         rows = conn.execute("""
-            SELECT * FROM peer_fee_profiles ORDER BY reporter_count DESC
-        """).fetchall()
+            SELECT * FROM peer_fee_profiles ORDER BY reporter_count DESC LIMIT ?
+        """, (limit,)).fetchall()
         return [dict(row) for row in rows]
 
     # =========================================================================

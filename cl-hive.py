@@ -237,6 +237,8 @@ vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
+routing_map: Optional[HiveRoutingMap] = None
+peer_reputation_mgr: Optional[PeerReputationManager] = None
 our_pubkey: Optional[str] = None
 
 

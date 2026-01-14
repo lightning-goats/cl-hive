@@ -177,8 +177,28 @@ class LiquidityCoordinator:
             Serialized and signed message bytes, or None on error
         """
         try:
+            timestamp = int(time.time())
+
+            # Build payload for signing
+            payload = {
+                "reporter_id": self.our_pubkey,
+                "timestamp": timestamp,
+                "need_type": need_type,
+                "target_peer_id": target_peer_id,
+                "amount_sats": amount_sats,
+                "urgency": urgency,
+                "max_fee_ppm": max_fee_ppm,
+            }
+
+            # Sign the payload
+            signing_msg = get_liquidity_need_signing_payload(payload)
+            sig_result = rpc.signmessage(signing_msg)
+            signature = sig_result['zbase']
+
             return create_liquidity_need(
                 reporter_id=self.our_pubkey,
+                timestamp=timestamp,
+                signature=signature,
                 need_type=need_type,
                 target_peer_id=target_peer_id,
                 amount_sats=amount_sats,
@@ -188,7 +208,6 @@ class LiquidityCoordinator:
                 current_balance_pct=current_balance_pct,
                 can_provide_inbound=can_provide_inbound,
                 can_provide_outbound=can_provide_outbound,
-                rpc=rpc
             )
         except Exception as e:
             if self.plugin:
@@ -220,6 +239,10 @@ class LiquidityCoordinator:
             return {"error": "invalid payload"}
 
         reporter_id = payload.get("reporter_id")
+
+        # Identity binding: sender must match reporter (prevent relay attacks)
+        if peer_id != reporter_id:
+            return {"error": "identity binding failed"}
 
         # Verify sender is a hive member
         member = self.database.get_member(reporter_id)
