@@ -43,7 +43,7 @@ Core Lightning
 
 | Module | Purpose |
 |--------|---------|
-| `protocol.py` | BOLT 8 custom messages (magic: "HIVE" = 0x48495645, types 32769-32795) |
+| `protocol.py` | BOLT 8 custom messages (magic: "HIVE" = 0x48495645, types 32769-32843) |
 | `handshake.py` | PKI auth using CLN signmessage/checkmessage |
 | `state_manager.py` | HiveMap distributed state + anti-entropy sync |
 | `gossip.py` | Threshold-based gossip (10% capacity change) with 5-min heartbeat |
@@ -55,6 +55,7 @@ Core Lightning
 | `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
 | `database.py` | SQLite with WAL mode, thread-local connections |
+| `ai_oracle_store.py` | AI Oracle message storage, validation, and rate limiting |
 
 ### Key Patterns
 

@@ -7513,13 +7513,15 @@ def hive_ai_active_proposals(plugin: Plugin):
 
 # Global sequence number for AI messages
 _ai_message_sequence = 0
+_ai_sequence_lock = threading.Lock()
 
 
 def _get_next_ai_sequence() -> int:
-    """Get next AI message sequence number."""
+    """Get next AI message sequence number (thread-safe)."""
     global _ai_message_sequence
-    _ai_message_sequence += 1
-    return _ai_message_sequence
+    with _ai_sequence_lock:
+        _ai_message_sequence += 1
+        return _ai_message_sequence
 
 
 def _determine_capacity_tier(total_capacity_sats: int) -> str:

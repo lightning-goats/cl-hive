@@ -44,6 +44,59 @@ logging.basicConfig(
 log = logging.getLogger("cl-hive-oracle")
 
 # ============================================================================
+# Thread Safety
+# ============================================================================
+
+# RPC lock for thread-safe RPC calls
+RPC_LOCK = threading.RLock()
+RPC_LOCK_TIMEOUT = 10  # seconds
+
+
+class ThreadSafeRpcProxy:
+    """
+    Thread-safe wrapper for plugin.rpc.
+
+    All RPC calls are serialized through RPC_LOCK to prevent race conditions
+    when multiple background threads access the RPC interface.
+    """
+
+    def __init__(self, rpc):
+        self._rpc = rpc
+
+    def call(self, method: str, payload: dict = None) -> dict:
+        """Make a thread-safe RPC call."""
+        acquired = RPC_LOCK.acquire(timeout=RPC_LOCK_TIMEOUT)
+        if not acquired:
+            log.error(f"RPC lock timeout for {method}")
+            return {"error": "RPC lock timeout"}
+        try:
+            if payload is None:
+                return self._rpc.call(method)
+            return self._rpc.call(method, payload)
+        finally:
+            RPC_LOCK.release()
+
+    def __getattr__(self, name: str):
+        """Proxy attribute access to underlying RPC with locking."""
+        attr = getattr(self._rpc, name)
+        if callable(attr):
+            def wrapped(*args, **kwargs):
+                acquired = RPC_LOCK.acquire(timeout=RPC_LOCK_TIMEOUT)
+                if not acquired:
+                    log.error(f"RPC lock timeout for {name}")
+                    raise TimeoutError(f"RPC lock timeout for {name}")
+                try:
+                    return attr(*args, **kwargs)
+                finally:
+                    RPC_LOCK.release()
+            return wrapped
+        return attr
+
+
+# Thread-safe RPC proxy (initialized in init())
+safe_rpc: Optional[ThreadSafeRpcProxy] = None
+
+# ============================================================================
 # Plugin Options
 # ============================================================================
 
@@ -833,20 +886,13 @@ def state_broadcast_loop(rpc: Any, provider: AIProvider, state_interval: int) ->
                 shutdown_event.wait(state_interval)
                 continue
 
-            # Generate and send state summary
-            summary = generate_state_summary(rpc, provider)
-            if summary:
-                try:
-                    # Broadcast via cl-hive
-                    rpc.call("hive-broadcast", {
-                        "msg_type": "ai_state_summary",
-                        "payload": summary
-                    })
-                    record_outgoing_message("ai_state_summary")
-                    update_stats_message_sent()
-                    log.debug("Broadcast AI_STATE_SUMMARY")
-                except Exception as e:
-                    log.warning(f"Failed to broadcast state summary: {e}")
+            # Generate and broadcast state summary
+            # Note: generate_state_summary() handles the full broadcast via
+            # hive-ai-broadcast-state-summary RPC call
+            result = generate_state_summary(rpc, provider)
+            if result:
+                record_outgoing_message("ai_state_summary")
+                update_stats_message_sent()
 
         except Exception as e:
             log.error(f"Error in state broadcast loop: {e}")
@@ -1035,13 +1081,16 @@ def oracle_reciprocity(plugin: Plugin, peer_id: str = "") -> Dict[str, Any]:
 @plugin.init()
 def init(options: Dict, configuration: Dict, plugin: Plugin) -> None:
     """Initialize the oracle plugin."""
-    global our_pubkey, config, state, start_time
+    global our_pubkey, config, state, start_time, safe_rpc
 
     log.info("Initializing cl-hive-oracle...")
 
+    # Initialize thread-safe RPC wrapper
+    safe_rpc = ThreadSafeRpcProxy(plugin.rpc)
+
     # Get node info
     try:
-        info = plugin.rpc.getinfo()
+        info = safe_rpc.getinfo()
         our_pubkey = info.get("id", "")
         log.info(f"Node pubkey: {our_pubkey[:16]}...")
     except Exception as e:
@@ -1091,25 +1140,25 @@ def init(options: Dict, configuration: Dict, plugin: Plugin) -> None:
 
     start_time = time.time()
 
-    # Start background threads
+    # Start background threads (using safe_rpc for thread safety)
     if state == OracleState.ACTIVE:
         threading.Thread(
             target=message_poll_loop,
-            args=(plugin.rpc, provider, config.poll_interval),
+            args=(safe_rpc, provider, config.poll_interval),
             daemon=True,
             name="oracle-poll"
         ).start()
 
         threading.Thread(
             target=decision_loop,
-            args=(plugin.rpc, provider, config.decision_interval),
+            args=(safe_rpc, provider, config.decision_interval),
             daemon=True,
             name="oracle-decision"
         ).start()
 
         threading.Thread(
             target=state_broadcast_loop,
-            args=(plugin.rpc, provider, config.state_interval),
+            args=(safe_rpc, provider, config.state_interval),
             daemon=True,
             name="oracle-broadcast"
         ).start()
