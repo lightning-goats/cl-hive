@@ -54,14 +54,14 @@ cat > "$MCP_CONFIG_TMP" << MCPEOF
 MCPEOF
 
 # Run Claude with MCP server
+# Note: prompt must come immediately after -p flag
 # --allowedTools restricts to only hive/revenue tools for safety
-claude -p \
+claude -p "Review all pending actions using hive_pending_actions. For each action, evaluate against the approval criteria and either approve or reject with clear reasoning. Then check revenue_dashboard for fleet health and report any issues." \
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
     --max-budget-usd 0.50 \
     --allowedTools "mcp__hive__*" \
-    "Review all pending actions using hive_pending_actions. For each action, evaluate against the approval criteria and either approve or reject with clear reasoning. Then check revenue_dashboard for fleet health and report any issues." \
     2>&1 | tee -a "$LOG_FILE"
 
 echo "=== Run completed: $(date) ===" | tee -a "$LOG_FILE"
