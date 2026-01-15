@@ -56,7 +56,7 @@ MCPEOF
 # Run Claude with MCP server
 # Note: prompt must come immediately after -p flag
 # --allowedTools restricts to only hive/revenue tools for safety
-claude -p "Review all pending actions using hive_pending_actions. For each action, evaluate against the approval criteria and either approve or reject with clear reasoning. Then check revenue_dashboard for fleet health and report any issues." \
+claude -p "Check the mainnet node: 1) Use hive_status to verify node is online 2) Use hive_pending_actions to check for pending actions - approve or reject each with reasoning 3) Use revenue_dashboard to check financial health 4) Report summary of actions taken and any warnings" \
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
