@@ -527,7 +527,14 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="revenue_policy",
-            description="Manage peer-level fee and rebalance policies. Actions: list, get, set, delete.",
+            description="""Manage peer-level fee and rebalance policies. Actions: list, get, set, delete.
+
+Use static policies to lock in fees for problem channels that Hill Climbing can't fix:
+- Stagnant (100% local, no flow): strategy=static, fee_ppm=50, rebalance=disabled
+- Depleted (<10% local): strategy=static, fee_ppm=200, rebalance=sink_only
+- Zombie (offline/inactive): strategy=static, fee_ppm=2000, rebalance=disabled
+
+Remove policies with action=delete when channels recover.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -564,7 +571,12 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="revenue_set_fee",
-            description="Manually set fee for a channel with clboss coordination. Use force=true to override bounds.",
+            description="""Manually set fee for a channel with clboss coordination. Use force=true to override bounds.
+
+Use this for underwater bleeders with active flow where you want to adjust fees but keep Hill Climbing active.
+For stagnant/depleted/zombie channels, prefer revenue_policy with strategy=static instead.
+
+Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, zombie=2000+ppm.""",
             inputSchema={
                 "type": "object",
                 "properties": {
