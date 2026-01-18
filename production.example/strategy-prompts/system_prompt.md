@@ -315,6 +315,38 @@ Run splice analysis when:
 - **Reserve**: Maintain 500k on-chain after any splice operation
 - **Frequency**: Don't recommend splicing same channel within 30 days
 
+### Splice Compatibility
+
+**IMPORTANT**: Splicing requires mutual support. Both peers must:
+- Be running CLN (LND, Eclair, LDK do NOT support splicing)
+- Have splicing enabled in their configuration
+
+Before recommending splices, note that compatibility must be verified. Always provide a **fallback action** for non-splice-compatible peers:
+
+| Splice Action | Fallback for Non-Compatible Peers |
+|---------------|-----------------------------------|
+| Splice-in (add capacity) | Open a 2nd channel to the peer |
+| Splice-out (reduce capacity) | Close channel, reopen smaller (if peer valuable) |
+| Splice-out (remove dead capacity) | Close channel entirely |
+
+**Fallback costs**:
+- Close + reopen = 2 on-chain transactions (vs 1 for splice)
+- Channel downtime during close confirmation (~6 blocks)
+- Loss of channel routing history/reputation
+
+### Splice Recommendation Output
+
+Always include both splice and fallback actions:
+
+```
+### Splice Opportunities
+
+| Channel | Peer | Current | Action | Fallback (if no splice) | Reason |
+|---------|------|---------|--------|------------------------|--------|
+| 931199x1231x0 | HighVolume | 10M | +5M splice-in | Open 2nd 5M channel | 244 fwds, top performer |
+| 931308x1256x2 | DeadPeer | 13.7M | -10M splice-out | Close entirely | 0 fwds, 100% local |
+```
+
 **Note:** Always consider current feerate before recommending splice operations. Splices are on-chain transactions and should wait for favorable fee conditions.
 
 ## Safety Constraints (NEVER EXCEED)
