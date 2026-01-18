@@ -472,6 +472,24 @@ async def list_tools() -> List[Tool]:
                 "required": ["node"]
             }
         ),
+        Tool(
+            name="hive_expansion_mode",
+            description="Get or set the expansion mode for a node. When enabled, the planner can propose channel opens to improve topology.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Enable or disable expansions (optional, omit to just get current status)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
         # =====================================================================
         # cl-revenue-ops Tools
         # =====================================================================
@@ -1058,6 +1076,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_topology_analysis(arguments)
         elif name == "hive_governance_mode":
             result = await handle_governance_mode(arguments)
+        elif name == "hive_expansion_mode":
+            result = await handle_expansion_mode(arguments)
         # cl-revenue-ops tools
         elif name == "revenue_status":
             result = await handle_revenue_status(arguments)
@@ -1351,6 +1371,28 @@ async def handle_governance_mode(args: Dict) -> Dict:
     else:
         status = await node.call("hive-status")
         return {"mode": status.get("governance_mode", "unknown")}
+
+
+async def handle_expansion_mode(args: Dict) -> Dict:
+    """Get or set expansion mode."""
+    node_name = args.get("node")
+    enabled = args.get("enabled")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if enabled is not None:
+        result = await node.call("hive-enable-expansions", {"enabled": enabled})
+        return result
+    else:
+        # Get current status
+        status = await node.call("hive-status")
+        planner = status.get("planner", {})
+        return {
+            "expansions_enabled": planner.get("expansions_enabled", False),
+            "max_feerate_perkb": planner.get("max_expansion_feerate_perkb", 5000)
+        }
 
 
 # =============================================================================
