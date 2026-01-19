@@ -40,6 +40,7 @@ class HiveContext:
     yield_metrics_mgr: Any = None  # YieldMetricsManager (Phase 1 - Metrics)
     liquidity_coordinator: Any = None  # LiquidityCoordinator (for competition detection)
     fee_coordination_mgr: Any = None  # FeeCoordinationManager (Phase 2 - Fee Coordination)
+    cost_reduction_mgr: Any = None  # CostReductionManager (Phase 3 - Cost Reduction)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
@@ -2365,3 +2366,189 @@ def fee_coordination_status(ctx: HiveContext) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get coordination status: {e}"}
+
+
+# =============================================================================
+# YIELD OPTIMIZATION PHASE 3: COST REDUCTION
+# =============================================================================
+# Reduce rebalancing costs by 50% through:
+# - Predictive rebalancing (low urgency = low fees)
+# - Fleet rebalance routing (internal paths cheaper)
+# - Circular flow detection (eliminate waste)
+
+def rebalance_recommendations(
+    ctx: HiveContext,
+    prediction_hours: int = 24
+) -> Dict[str, Any]:
+    """
+    Get predictive rebalance recommendations.
+
+    Analyzes channels to find those predicted to deplete or saturate,
+    with recommendations for preemptive rebalancing at lower fees.
+
+    Args:
+        ctx: HiveContext
+        prediction_hours: How far ahead to predict (default: 24)
+
+    Returns:
+        Dict with rebalance recommendations sorted by urgency.
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        recommendations = ctx.cost_reduction_mgr.get_rebalance_recommendations(
+            prediction_hours=prediction_hours
+        )
+
+        # Summarize by urgency
+        by_urgency = {
+            "critical": [],
+            "high": [],
+            "medium": [],
+            "low": []
+        }
+
+        for rec in recommendations:
+            urgency = rec.get("urgency", "low")
+            if urgency in by_urgency:
+                by_urgency[urgency].append(rec)
+
+        return {
+            "recommendations": recommendations,
+            "by_urgency": by_urgency,
+            "total_count": len(recommendations),
+            "critical_count": len(by_urgency["critical"]),
+            "prediction_hours": prediction_hours
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get rebalance recommendations: {e}"}
+
+
+def fleet_rebalance_path(
+    ctx: HiveContext,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int
+) -> Dict[str, Any]:
+    """
+    Get fleet rebalance path recommendation.
+
+    Checks if rebalancing through fleet members is cheaper than
+    external routing. Fleet members have coordinated fees and
+    can offer internal "friendship" rates.
+
+    Args:
+        ctx: HiveContext
+        from_channel: Source channel SCID
+        to_channel: Destination channel SCID
+        amount_sats: Amount to rebalance
+
+    Returns:
+        Dict with path recommendation and savings estimate.
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        return ctx.cost_reduction_mgr.get_fleet_rebalance_path(
+            from_channel=from_channel,
+            to_channel=to_channel,
+            amount_sats=amount_sats
+        )
+
+    except Exception as e:
+        return {"error": f"Failed to get fleet path: {e}"}
+
+
+def record_rebalance_outcome(
+    ctx: HiveContext,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int,
+    cost_sats: int,
+    success: bool,
+    via_fleet: bool = False
+) -> Dict[str, Any]:
+    """
+    Record a rebalance outcome for tracking and circular flow detection.
+
+    Should be called after each rebalance attempt (success or failure).
+    Enables detection of wasteful circular flows like A→B→C→A.
+
+    Args:
+        ctx: HiveContext
+        from_channel: Source channel SCID
+        to_channel: Destination channel SCID
+        amount_sats: Amount rebalanced
+        cost_sats: Cost paid
+        success: Whether rebalance succeeded
+        via_fleet: Whether routed through fleet members
+
+    Returns:
+        Dict with recording result and any circular flow warnings.
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        return ctx.cost_reduction_mgr.record_rebalance_outcome(
+            from_channel=from_channel,
+            to_channel=to_channel,
+            amount_sats=amount_sats,
+            cost_sats=cost_sats,
+            success=success,
+            via_fleet=via_fleet
+        )
+
+    except Exception as e:
+        return {"error": f"Failed to record rebalance outcome: {e}"}
+
+
+def circular_flow_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get circular flow detection status.
+
+    Shows any detected circular flows (e.g., A→B→C→A) that waste
+    fees moving liquidity in circles.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with circular flow status and detected patterns.
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        return ctx.cost_reduction_mgr.circular_detector.get_circular_flow_status()
+
+    except Exception as e:
+        return {"error": f"Failed to get circular flow status: {e}"}
+
+
+def cost_reduction_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get overall cost reduction status.
+
+    Comprehensive view of all Phase 3 cost reduction systems:
+    - Predictive rebalancing
+    - Fleet routing
+    - Circular flow detection
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with cost reduction status.
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        return ctx.cost_reduction_mgr.get_cost_reduction_status()
+
+    except Exception as e:
+        return {"error": f"Failed to get cost reduction status: {e}"}

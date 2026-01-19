@@ -1457,6 +1457,79 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node"]
             }
+        ),
+        # Phase 3: Cost Reduction tools
+        Tool(
+            name="rebalance_recommendations",
+            description="Get predictive rebalance recommendations. Uses velocity prediction to identify channels that will need rebalancing soon and recommends proactive actions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "prediction_hours": {
+                        "type": "integer",
+                        "description": "Hours to predict ahead (default: 24)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="fleet_rebalance_path",
+            description="Find internal fleet rebalance paths. Checks if rebalancing can be done through other fleet members at lower cost than market routes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "from_channel": {
+                        "type": "string",
+                        "description": "Source channel SCID"
+                    },
+                    "to_channel": {
+                        "type": "string",
+                        "description": "Destination channel SCID"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount to rebalance in satoshis"
+                    }
+                },
+                "required": ["node", "from_channel", "to_channel", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="circular_flow_status",
+            description="Get circular flow detection status. Shows detected wasteful circular patterns (A→B→C→A) and their cost impact.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="cost_reduction_status",
+            description="Get overall cost reduction status. Comprehensive view of Phase 3 systems including predictive rebalancing, fleet routing, and circular flow detection.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -1587,6 +1660,15 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_pheromone_levels(arguments)
         elif name == "fee_coordination_status":
             result = await handle_fee_coordination_status(arguments)
+        # Phase 3: Cost Reduction tools
+        elif name == "rebalance_recommendations":
+            result = await handle_rebalance_recommendations(arguments)
+        elif name == "fleet_rebalance_path":
+            result = await handle_fleet_rebalance_path(arguments)
+        elif name == "circular_flow_status":
+            result = await handle_circular_flow_status(arguments)
+        elif name == "cost_reduction_status":
+            result = await handle_cost_reduction_status(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -3590,6 +3672,64 @@ async def handle_fee_coordination_status(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-fee-coordination-status", {})
+
+
+# =============================================================================
+# Phase 3: Cost Reduction Handlers
+# =============================================================================
+
+async def handle_rebalance_recommendations(args: Dict) -> Dict:
+    """Get predictive rebalance recommendations."""
+    node_name = args.get("node")
+    prediction_hours = args.get("prediction_hours", 24)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-rebalance-recommendations", {
+        "prediction_hours": prediction_hours
+    })
+
+
+async def handle_fleet_rebalance_path(args: Dict) -> Dict:
+    """Find internal fleet rebalance paths."""
+    node_name = args.get("node")
+    from_channel = args.get("from_channel")
+    to_channel = args.get("to_channel")
+    amount_sats = args.get("amount_sats")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-fleet-rebalance-path", {
+        "from_channel": from_channel,
+        "to_channel": to_channel,
+        "amount_sats": amount_sats
+    })
+
+
+async def handle_circular_flow_status(args: Dict) -> Dict:
+    """Get circular flow detection status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-circular-flow-status", {})
+
+
+async def handle_cost_reduction_status(args: Dict) -> Dict:
+    """Get overall cost reduction status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-cost-reduction-status", {})
 
 
 # =============================================================================

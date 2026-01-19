@@ -84,6 +84,7 @@ from modules.peer_reputation import PeerReputationManager
 from modules.routing_pool import RoutingPool
 from modules.yield_metrics import YieldMetricsManager
 from modules.fee_coordination import FeeCoordinationManager
+from modules.cost_reduction import CostReductionManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -130,6 +131,12 @@ from modules.rpc_commands import (
     broadcast_warning as rpc_broadcast_warning,
     pheromone_levels as rpc_pheromone_levels,
     fee_coordination_status as rpc_fee_coordination_status,
+    # Phase 3 - Cost Reduction
+    rebalance_recommendations as rpc_rebalance_recommendations,
+    fleet_rebalance_path as rpc_fleet_rebalance_path,
+    record_rebalance_outcome as rpc_record_rebalance_outcome,
+    circular_flow_status as rpc_circular_flow_status,
+    cost_reduction_status as rpc_cost_reduction_status,
 )
 
 # Initialize the plugin
@@ -273,6 +280,7 @@ peer_reputation_mgr: Optional[PeerReputationManager] = None
 routing_pool: Optional[RoutingPool] = None
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
+cost_reduction_mgr: Optional[CostReductionManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -460,6 +468,7 @@ def _get_hive_context() -> HiveContext:
     _yield_metrics_mgr = yield_metrics_mgr if 'yield_metrics_mgr' in globals() else None
     _liquidity_coord = liquidity_coord if 'liquidity_coord' in globals() else None
     _fee_coordination_mgr = fee_coordination_mgr if 'fee_coordination_mgr' in globals() else None
+    _cost_reduction_mgr = cost_reduction_mgr if 'cost_reduction_mgr' in globals() else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -482,6 +491,7 @@ def _get_hive_context() -> HiveContext:
         yield_metrics_mgr=_yield_metrics_mgr,
         liquidity_coordinator=_liquidity_coord,
         fee_coordination_mgr=_fee_coordination_mgr,
+        cost_reduction_mgr=_cost_reduction_mgr,
         log=_log,
     )
 
@@ -1130,6 +1140,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     fee_coordination_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Fee coordination manager initialized (Phase 2)")
+
+    # Initialize Cost Reduction Manager (Phase 3 - Cost Reduction)
+    global cost_reduction_mgr
+    cost_reduction_mgr = CostReductionManager(
+        plugin=safe_plugin,
+        database=database,
+        state_manager=state_manager,
+        yield_metrics_mgr=yield_metrics_mgr,
+        liquidity_coordinator=liquidity_coord
+    )
+    cost_reduction_mgr.set_our_pubkey(our_pubkey)
+    plugin.log("cl-hive: Cost reduction manager initialized (Phase 3)")
 
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
@@ -8142,6 +8164,124 @@ def hive_fee_coordination_status(plugin: Plugin):
         Dict with comprehensive fee coordination status.
     """
     return rpc_fee_coordination_status(_get_hive_context())
+
+
+# =============================================================================
+# YIELD OPTIMIZATION PHASE 3: COST REDUCTION
+# =============================================================================
+
+@plugin.method("hive-rebalance-recommendations")
+def hive_rebalance_recommendations(
+    plugin: Plugin,
+    prediction_hours: int = 24
+):
+    """
+    Get predictive rebalance recommendations.
+
+    Analyzes channels to find those predicted to deplete or saturate,
+    with recommendations for preemptive rebalancing at lower fees.
+
+    Args:
+        prediction_hours: How far ahead to predict (default: 24)
+
+    Returns:
+        Dict with rebalance recommendations sorted by urgency.
+    """
+    return rpc_rebalance_recommendations(
+        _get_hive_context(),
+        prediction_hours=prediction_hours
+    )
+
+
+@plugin.method("hive-fleet-rebalance-path")
+def hive_fleet_rebalance_path(
+    plugin: Plugin,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int
+):
+    """
+    Get fleet rebalance path recommendation.
+
+    Checks if rebalancing through fleet members is cheaper than
+    external routing.
+
+    Args:
+        from_channel: Source channel SCID
+        to_channel: Destination channel SCID
+        amount_sats: Amount to rebalance
+
+    Returns:
+        Dict with path recommendation and savings estimate.
+    """
+    return rpc_fleet_rebalance_path(
+        _get_hive_context(),
+        from_channel=from_channel,
+        to_channel=to_channel,
+        amount_sats=amount_sats
+    )
+
+
+@plugin.method("hive-report-rebalance-outcome")
+def hive_report_rebalance_outcome(
+    plugin: Plugin,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int,
+    cost_sats: int,
+    success: bool,
+    via_fleet: bool = False
+):
+    """
+    Record a rebalance outcome for tracking and circular flow detection.
+
+    Args:
+        from_channel: Source channel SCID
+        to_channel: Destination channel SCID
+        amount_sats: Amount rebalanced
+        cost_sats: Cost paid
+        success: Whether rebalance succeeded
+        via_fleet: Whether routed through fleet members
+
+    Returns:
+        Dict with recording result and any circular flow warnings.
+    """
+    return rpc_record_rebalance_outcome(
+        _get_hive_context(),
+        from_channel=from_channel,
+        to_channel=to_channel,
+        amount_sats=amount_sats,
+        cost_sats=cost_sats,
+        success=success,
+        via_fleet=via_fleet
+    )
+
+
+@plugin.method("hive-circular-flow-status")
+def hive_circular_flow_status(plugin: Plugin):
+    """
+    Get circular flow detection status.
+
+    Shows any detected circular flows (e.g., A→B→C→A) that waste
+    fees moving liquidity in circles.
+
+    Returns:
+        Dict with circular flow status and detected patterns.
+    """
+    return rpc_circular_flow_status(_get_hive_context())
+
+
+@plugin.method("hive-cost-reduction-status")
+def hive_cost_reduction_status(plugin: Plugin):
+    """
+    Get overall cost reduction status.
+
+    Comprehensive view of all Phase 3 cost reduction systems.
+
+    Returns:
+        Dict with cost reduction status.
+    """
+    return rpc_cost_reduction_status(_get_hive_context())
 
 
 @plugin.method("hive-request-promotion")
