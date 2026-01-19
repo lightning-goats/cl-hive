@@ -41,6 +41,8 @@ class HiveContext:
     liquidity_coordinator: Any = None  # LiquidityCoordinator (for competition detection)
     fee_coordination_mgr: Any = None  # FeeCoordinationManager (Phase 2 - Fee Coordination)
     cost_reduction_mgr: Any = None  # CostReductionManager (Phase 3 - Cost Reduction)
+    rationalization_mgr: Any = None  # RationalizationManager (Channel Rationalization)
+    strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
@@ -2552,3 +2554,400 @@ def cost_reduction_status(ctx: HiveContext) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get cost reduction status: {e}"}
+
+
+# =============================================================================
+# CHANNEL RATIONALIZATION COMMANDS
+# =============================================================================
+
+def coverage_analysis(
+    ctx: HiveContext,
+    peer_id: str = None
+) -> Dict[str, Any]:
+    """
+    Analyze fleet coverage for redundant channels.
+
+    Shows which fleet members have channels to the same peers
+    and determines ownership based on routing activity.
+
+    Args:
+        ctx: HiveContext
+        peer_id: Specific peer to analyze, or None for all redundant peers
+
+    Returns:
+        Dict with coverage analysis showing ownership and redundancy.
+    """
+    if not ctx.rationalization_mgr:
+        return {"error": "Rationalization not initialized"}
+
+    try:
+        return ctx.rationalization_mgr.analyze_coverage(peer_id=peer_id)
+
+    except Exception as e:
+        return {"error": f"Failed to analyze coverage: {e}"}
+
+
+def close_recommendations(
+    ctx: HiveContext,
+    our_node_only: bool = False
+) -> Dict[str, Any]:
+    """
+    Get channel close recommendations for underperforming redundant channels.
+
+    Uses stigmergic markers (routing success) to determine which member
+    "owns" each peer relationship. Recommends closes for members with
+    <10% of the owner's routing activity.
+
+    Args:
+        ctx: HiveContext
+        our_node_only: If True, only return recommendations for our node
+
+    Returns:
+        Dict with close recommendations sorted by urgency.
+    """
+    if not ctx.rationalization_mgr:
+        return {"error": "Rationalization not initialized"}
+
+    try:
+        recommendations = ctx.rationalization_mgr.get_close_recommendations(
+            for_our_node_only=our_node_only
+        )
+
+        # Summarize
+        by_urgency = {"high": 0, "medium": 0, "low": 0}
+        total_freed = 0
+        for rec in recommendations:
+            by_urgency[rec.get("urgency", "low")] += 1
+            total_freed += rec.get("freed_capital_sats", 0)
+
+        return {
+            "recommendations": recommendations,
+            "count": len(recommendations),
+            "by_urgency": by_urgency,
+            "potential_freed_capital_sats": total_freed,
+            "potential_freed_btc": round(total_freed / 100_000_000, 4)
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get close recommendations: {e}"}
+
+
+def create_close_actions(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Create pending_actions for close recommendations.
+
+    Puts high-confidence close recommendations into the pending_actions
+    queue for AI/human approval.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with number of actions created.
+    """
+    if not ctx.rationalization_mgr:
+        return {"error": "Rationalization not initialized"}
+
+    try:
+        return ctx.rationalization_mgr.create_close_actions()
+
+    except Exception as e:
+        return {"error": f"Failed to create close actions: {e}"}
+
+
+def rationalization_summary(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get summary of channel rationalization analysis.
+
+    Shows fleet coverage health: well-owned peers, contested peers,
+    orphan peers, and recommended closes.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with rationalization summary.
+    """
+    if not ctx.rationalization_mgr:
+        return {"error": "Rationalization not initialized"}
+
+    try:
+        return ctx.rationalization_mgr.get_summary()
+
+    except Exception as e:
+        return {"error": f"Failed to get rationalization summary: {e}"}
+
+
+def rationalization_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get channel rationalization status.
+
+    Shows overall health metrics and configuration thresholds.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with rationalization status.
+    """
+    if not ctx.rationalization_mgr:
+        return {"error": "Rationalization not initialized"}
+
+    try:
+        return ctx.rationalization_mgr.get_status()
+
+    except Exception as e:
+        return {"error": f"Failed to get rationalization status: {e}"}
+
+
+# =============================================================================
+# YIELD OPTIMIZATION PHASE 5: STRATEGIC POSITIONING
+# =============================================================================
+# Position fleet on critical network paths:
+# - RouteValueAnalyzer: High-value corridors with limited competition
+# - FleetPositioningStrategy: Coordinated channel opens (max 2 per target)
+# - PhysarumChannelManager: Flow-based channel lifecycle (strengthen/atrophy)
+
+def valuable_corridors(
+    ctx: HiveContext,
+    min_score: float = 0.05
+) -> Dict[str, Any]:
+    """
+    Get high-value routing corridors for strategic positioning.
+
+    Corridors are scored by: Volume × Margin × (1/Competition)
+    Higher scores indicate better positioning opportunities.
+
+    Args:
+        ctx: HiveContext
+        min_score: Minimum value score to include (default: 0.05)
+
+    Returns:
+        Dict with valuable corridors sorted by score.
+    """
+    if not ctx.strategic_positioning_mgr:
+        return {"error": "Strategic positioning not initialized"}
+
+    try:
+        corridors = ctx.strategic_positioning_mgr.get_valuable_corridors(
+            min_score=min_score
+        )
+
+        # Categorize by value tier
+        by_tier = {"high": [], "medium": [], "low": []}
+        for c in corridors:
+            tier = c.get("value_tier", "low")
+            if tier in by_tier:
+                by_tier[tier].append(c)
+
+        return {
+            "corridors": corridors,
+            "total_count": len(corridors),
+            "by_value_tier": {
+                tier: len(items) for tier, items in by_tier.items()
+            },
+            "min_score_filter": min_score
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get valuable corridors: {e}"}
+
+
+def exchange_coverage(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get priority exchange connectivity status.
+
+    Shows which major Lightning exchanges the fleet is connected to
+    and which still need channels.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with exchange coverage analysis.
+    """
+    if not ctx.strategic_positioning_mgr:
+        return {"error": "Strategic positioning not initialized"}
+
+    try:
+        return ctx.strategic_positioning_mgr.get_exchange_coverage()
+
+    except Exception as e:
+        return {"error": f"Failed to get exchange coverage: {e}"}
+
+
+def positioning_recommendations(
+    ctx: HiveContext,
+    count: int = 5
+) -> Dict[str, Any]:
+    """
+    Get channel open recommendations for strategic positioning.
+
+    Recommends where to open channels for maximum routing value,
+    considering existing fleet coverage and competition.
+
+    Args:
+        ctx: HiveContext
+        count: Number of recommendations to return (default: 5)
+
+    Returns:
+        Dict with positioning recommendations sorted by priority.
+    """
+    if not ctx.strategic_positioning_mgr:
+        return {"error": "Strategic positioning not initialized"}
+
+    try:
+        recommendations = ctx.strategic_positioning_mgr.get_positioning_recommendations(
+            count=count
+        )
+
+        # Summarize by priority tier
+        by_tier = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for rec in recommendations:
+            tier = rec.get("priority_tier", "low")
+            if tier in by_tier:
+                by_tier[tier] += 1
+
+        return {
+            "recommendations": recommendations,
+            "count": len(recommendations),
+            "by_priority": by_tier
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get positioning recommendations: {e}"}
+
+
+def flow_recommendations(
+    ctx: HiveContext,
+    channel_id: str = None
+) -> Dict[str, Any]:
+    """
+    Get Physarum-inspired flow recommendations for channel lifecycle.
+
+    Channels evolve based on flow like slime mold tubes:
+    - High flow (>2% daily) → strengthen (splice in)
+    - Low flow (<0.1% daily) → atrophy (recommend close)
+    - Young + low flow → stimulate (fee reduction)
+
+    Args:
+        ctx: HiveContext
+        channel_id: Specific channel, or None for all non-hold recommendations
+
+    Returns:
+        Dict with flow recommendations.
+    """
+    if not ctx.strategic_positioning_mgr:
+        return {"error": "Strategic positioning not initialized"}
+
+    try:
+        recommendations = ctx.strategic_positioning_mgr.get_flow_recommendations(
+            channel_id=channel_id
+        )
+
+        # Summarize by action
+        by_action = {
+            "strengthen": 0,
+            "stimulate": 0,
+            "atrophy": 0,
+            "hold": 0
+        }
+        total_redeploy = 0
+        total_splice = 0
+
+        for rec in recommendations:
+            action = rec.get("action", "hold")
+            if action in by_action:
+                by_action[action] += 1
+            total_redeploy += rec.get("capital_to_redeploy_sats", 0)
+            total_splice += rec.get("splice_amount_sats", 0)
+
+        return {
+            "recommendations": recommendations,
+            "count": len(recommendations),
+            "by_action": by_action,
+            "capital_to_redeploy_sats": total_redeploy,
+            "recommended_splice_sats": total_splice
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get flow recommendations: {e}"}
+
+
+def report_flow_intensity(
+    ctx: HiveContext,
+    channel_id: str,
+    peer_id: str,
+    intensity: float
+) -> Dict[str, Any]:
+    """
+    Report flow intensity for a channel to the Physarum model.
+
+    Flow intensity = Daily volume / Capacity
+    This updates the slime-mold model that drives channel lifecycle decisions.
+
+    Args:
+        ctx: HiveContext
+        channel_id: Channel ID (SCID format)
+        peer_id: Peer public key
+        intensity: Observed flow intensity (0.0 to 1.0+)
+
+    Returns:
+        Dict with acknowledgment.
+    """
+    if not ctx.strategic_positioning_mgr:
+        return {"error": "Strategic positioning not initialized"}
+
+    try:
+        return ctx.strategic_positioning_mgr.report_flow_intensity(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            intensity=intensity
+        )
+
+    except Exception as e:
+        return {"error": f"Failed to report flow intensity: {e}"}
+
+
+def positioning_summary(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get summary of strategic positioning analysis.
+
+    Shows high-value corridors, exchange coverage, and recommended actions.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with positioning summary.
+    """
+    if not ctx.strategic_positioning_mgr:
+        return {"error": "Strategic positioning not initialized"}
+
+    try:
+        return ctx.strategic_positioning_mgr.get_positioning_summary()
+
+    except Exception as e:
+        return {"error": f"Failed to get positioning summary: {e}"}
+
+
+def positioning_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get strategic positioning status.
+
+    Shows overall status, thresholds, and priority exchanges.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with positioning status.
+    """
+    if not ctx.strategic_positioning_mgr:
+        return {"error": "Strategic positioning not initialized"}
+
+    try:
+        return ctx.strategic_positioning_mgr.get_status()
+
+    except Exception as e:
+        return {"error": f"Failed to get positioning status: {e}"}

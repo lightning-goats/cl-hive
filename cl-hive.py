@@ -85,6 +85,8 @@ from modules.routing_pool import RoutingPool
 from modules.yield_metrics import YieldMetricsManager
 from modules.fee_coordination import FeeCoordinationManager
 from modules.cost_reduction import CostReductionManager
+from modules.channel_rationalization import RationalizationManager
+from modules.strategic_positioning import StrategicPositioningManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -137,6 +139,20 @@ from modules.rpc_commands import (
     record_rebalance_outcome as rpc_record_rebalance_outcome,
     circular_flow_status as rpc_circular_flow_status,
     cost_reduction_status as rpc_cost_reduction_status,
+    # Channel Rationalization
+    coverage_analysis as rpc_coverage_analysis,
+    close_recommendations as rpc_close_recommendations,
+    create_close_actions as rpc_create_close_actions,
+    rationalization_summary as rpc_rationalization_summary,
+    rationalization_status as rpc_rationalization_status,
+    # Phase 5 - Strategic Positioning
+    valuable_corridors as rpc_valuable_corridors,
+    exchange_coverage as rpc_exchange_coverage,
+    positioning_recommendations as rpc_positioning_recommendations,
+    flow_recommendations as rpc_flow_recommendations,
+    report_flow_intensity as rpc_report_flow_intensity,
+    positioning_summary as rpc_positioning_summary,
+    positioning_status as rpc_positioning_status,
 )
 
 # Initialize the plugin
@@ -281,6 +297,8 @@ routing_pool: Optional[RoutingPool] = None
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
 cost_reduction_mgr: Optional[CostReductionManager] = None
+rationalization_mgr: Optional[RationalizationManager] = None
+strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -469,6 +487,8 @@ def _get_hive_context() -> HiveContext:
     _liquidity_coord = liquidity_coord if 'liquidity_coord' in globals() else None
     _fee_coordination_mgr = fee_coordination_mgr if 'fee_coordination_mgr' in globals() else None
     _cost_reduction_mgr = cost_reduction_mgr if 'cost_reduction_mgr' in globals() else None
+    _rationalization_mgr = rationalization_mgr if 'rationalization_mgr' in globals() else None
+    _strategic_positioning_mgr = strategic_positioning_mgr if 'strategic_positioning_mgr' in globals() else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -492,6 +512,8 @@ def _get_hive_context() -> HiveContext:
         liquidity_coordinator=_liquidity_coord,
         fee_coordination_mgr=_fee_coordination_mgr,
         cost_reduction_mgr=_cost_reduction_mgr,
+        rationalization_mgr=_rationalization_mgr,
+        strategic_positioning_mgr=_strategic_positioning_mgr,
         log=_log,
     )
 
@@ -1152,6 +1174,31 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     cost_reduction_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Cost reduction manager initialized (Phase 3)")
+
+    # Initialize Rationalization Manager (Channel Rationalization)
+    global rationalization_mgr
+    rationalization_mgr = RationalizationManager(
+        plugin=safe_plugin,
+        database=database,
+        state_manager=state_manager,
+        fee_coordination_mgr=fee_coordination_mgr,
+        governance=governance
+    )
+    rationalization_mgr.set_our_pubkey(our_pubkey)
+    plugin.log("cl-hive: Rationalization manager initialized")
+
+    # Initialize Strategic Positioning Manager (Phase 5 - Strategic Positioning)
+    global strategic_positioning_mgr
+    strategic_positioning_mgr = StrategicPositioningManager(
+        plugin=safe_plugin,
+        database=database,
+        state_manager=state_manager,
+        fee_coordination_mgr=fee_coordination_mgr,
+        yield_metrics_mgr=yield_metrics_mgr,
+        planner=planner
+    )
+    strategic_positioning_mgr.set_our_pubkey(our_pubkey)
+    plugin.log("cl-hive: Strategic positioning manager initialized (Phase 5)")
 
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
@@ -8282,6 +8329,209 @@ def hive_cost_reduction_status(plugin: Plugin):
         Dict with cost reduction status.
     """
     return rpc_cost_reduction_status(_get_hive_context())
+
+
+# =============================================================================
+# CHANNEL RATIONALIZATION RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-coverage-analysis")
+def hive_coverage_analysis(plugin: Plugin, peer_id: str = None):
+    """
+    Analyze fleet coverage for redundant channels.
+
+    Shows which fleet members have channels to the same peers
+    and determines ownership based on routing activity (stigmergic markers).
+
+    Args:
+        peer_id: Specific peer to analyze, or omit for all redundant peers
+
+    Returns:
+        Dict with coverage analysis showing ownership and redundancy.
+    """
+    return rpc_coverage_analysis(_get_hive_context(), peer_id=peer_id)
+
+
+@plugin.method("hive-close-recommendations")
+def hive_close_recommendations(plugin: Plugin, our_node_only: bool = False):
+    """
+    Get channel close recommendations for underperforming redundant channels.
+
+    Uses stigmergic markers (routing success) to determine which member
+    "owns" each peer relationship. Recommends closes for members with
+    <10% of the owner's routing activity.
+
+    Part of the Hive covenant: members follow swarm intelligence.
+
+    Args:
+        our_node_only: If True, only return recommendations for our node
+
+    Returns:
+        Dict with close recommendations sorted by urgency.
+    """
+    return rpc_close_recommendations(_get_hive_context(), our_node_only=our_node_only)
+
+
+@plugin.method("hive-create-close-actions")
+def hive_create_close_actions(plugin: Plugin):
+    """
+    Create pending_actions for close recommendations.
+
+    Puts high-confidence close recommendations into the pending_actions
+    queue for AI/human approval.
+
+    Returns:
+        Dict with number of actions created.
+    """
+    return rpc_create_close_actions(_get_hive_context())
+
+
+@plugin.method("hive-rationalization-summary")
+def hive_rationalization_summary(plugin: Plugin):
+    """
+    Get summary of channel rationalization analysis.
+
+    Shows fleet coverage health: well-owned peers, contested peers,
+    orphan peers (channels with no routing activity), and close recommendations.
+
+    Returns:
+        Dict with rationalization summary.
+    """
+    return rpc_rationalization_summary(_get_hive_context())
+
+
+@plugin.method("hive-rationalization-status")
+def hive_rationalization_status(plugin: Plugin):
+    """
+    Get channel rationalization status.
+
+    Shows overall coverage health metrics and configuration thresholds.
+
+    Returns:
+        Dict with rationalization status.
+    """
+    return rpc_rationalization_status(_get_hive_context())
+
+
+# =============================================================================
+# PHASE 5: STRATEGIC POSITIONING COMMANDS
+# =============================================================================
+
+@plugin.method("hive-valuable-corridors")
+def hive_valuable_corridors(plugin: Plugin, min_score: float = 0.05):
+    """
+    Get high-value routing corridors for strategic positioning.
+
+    Corridors are scored by: Volume × Margin × (1/Competition)
+    Higher scores indicate better positioning opportunities.
+
+    Args:
+        min_score: Minimum value score to include (default: 0.05)
+
+    Returns:
+        Dict with valuable corridors sorted by score.
+    """
+    return rpc_valuable_corridors(_get_hive_context(), min_score=min_score)
+
+
+@plugin.method("hive-exchange-coverage")
+def hive_exchange_coverage(plugin: Plugin):
+    """
+    Get priority exchange connectivity status.
+
+    Shows which major Lightning exchanges the fleet is connected to
+    (ACINQ, Kraken, Bitfinex, etc.) and which still need channels.
+
+    Returns:
+        Dict with exchange coverage analysis.
+    """
+    return rpc_exchange_coverage(_get_hive_context())
+
+
+@plugin.method("hive-positioning-recommendations")
+def hive_positioning_recommendations(plugin: Plugin, count: int = 5):
+    """
+    Get channel open recommendations for strategic positioning.
+
+    Recommends where to open channels for maximum routing value,
+    considering existing fleet coverage and competition.
+
+    Args:
+        count: Number of recommendations to return (default: 5)
+
+    Returns:
+        Dict with positioning recommendations sorted by priority.
+    """
+    return rpc_positioning_recommendations(_get_hive_context(), count=count)
+
+
+@plugin.method("hive-flow-recommendations")
+def hive_flow_recommendations(plugin: Plugin, channel_id: str = None):
+    """
+    Get Physarum-inspired flow recommendations for channel lifecycle.
+
+    Channels evolve based on flow like slime mold tubes:
+    - High flow (>2% daily) → strengthen (splice in capacity)
+    - Low flow (<0.1% daily) → atrophy (recommend close)
+    - Young + low flow → stimulate (fee reduction)
+
+    Args:
+        channel_id: Specific channel, or None for all non-hold recommendations
+
+    Returns:
+        Dict with flow recommendations.
+    """
+    return rpc_flow_recommendations(_get_hive_context(), channel_id=channel_id)
+
+
+@plugin.method("hive-report-flow-intensity")
+def hive_report_flow_intensity(plugin: Plugin, channel_id: str, peer_id: str, intensity: float):
+    """
+    Report flow intensity for a channel to the Physarum model.
+
+    Flow intensity = Daily volume / Capacity
+    This updates the slime-mold model that drives channel lifecycle decisions.
+
+    Args:
+        channel_id: Channel ID (SCID format)
+        peer_id: Peer public key
+        intensity: Observed flow intensity (0.0 to 1.0+)
+
+    Returns:
+        Dict with acknowledgment.
+    """
+    return rpc_report_flow_intensity(
+        _get_hive_context(),
+        channel_id=channel_id,
+        peer_id=peer_id,
+        intensity=intensity
+    )
+
+
+@plugin.method("hive-positioning-summary")
+def hive_positioning_summary(plugin: Plugin):
+    """
+    Get summary of strategic positioning analysis.
+
+    Shows high-value corridors, exchange coverage, and recommended actions.
+
+    Returns:
+        Dict with positioning summary.
+    """
+    return rpc_positioning_summary(_get_hive_context())
+
+
+@plugin.method("hive-positioning-status")
+def hive_positioning_status(plugin: Plugin):
+    """
+    Get strategic positioning status.
+
+    Shows overall status, thresholds, and priority exchanges.
+
+    Returns:
+        Dict with positioning status.
+    """
+    return rpc_positioning_status(_get_hive_context())
 
 
 @plugin.method("hive-request-promotion")

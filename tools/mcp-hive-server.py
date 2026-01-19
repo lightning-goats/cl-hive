@@ -1530,6 +1530,170 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node"]
             }
+        ),
+        # Channel Rationalization tools
+        Tool(
+            name="coverage_analysis",
+            description="Analyze fleet coverage for redundant channels. Shows which fleet members have channels to the same peers and determines ownership based on routing activity (stigmergic markers).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Specific peer to analyze (optional, omit for all redundant peers)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="close_recommendations",
+            description="Get channel close recommendations for underperforming redundant channels. Uses stigmergic markers to determine ownership - recommends closes for members with <10% of the owner's routing activity. Part of the Hive covenant: members follow swarm intelligence.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "our_node_only": {
+                        "type": "boolean",
+                        "description": "If true, only return recommendations for this node"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="rationalization_summary",
+            description="Get summary of channel rationalization analysis. Shows fleet coverage health: well-owned peers, contested peers, orphan peers (no routing activity), and close recommendations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="rationalization_status",
+            description="Get channel rationalization status. Shows overall coverage health metrics and configuration thresholds.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =============================================================================
+        # Phase 5: Strategic Positioning Tools
+        # =============================================================================
+        Tool(
+            name="valuable_corridors",
+            description="Get high-value routing corridors for strategic positioning. Corridors are scored by: Volume × Margin × (1/Competition). Use this to identify where to position for maximum routing revenue.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum value score to include (default: 0.05)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="exchange_coverage",
+            description="Get priority exchange connectivity status. Shows which major Lightning exchanges (ACINQ, Kraken, Bitfinex, etc.) the fleet is connected to and which still need channels.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="positioning_recommendations",
+            description="Get channel open recommendations for strategic positioning. Recommends where to open channels for maximum routing value, considering existing fleet coverage and competition.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of recommendations to return (default: 5)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="flow_recommendations",
+            description="Get Physarum-inspired flow recommendations for channel lifecycle. Channels evolve based on flow like slime mold tubes: high flow → strengthen (splice in), low flow → atrophy (recommend close), young + low flow → stimulate (fee reduction).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Specific channel, or omit for all non-hold recommendations"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="positioning_summary",
+            description="Get summary of strategic positioning analysis. Shows high-value corridors, exchange coverage, and recommended actions for optimal fleet positioning.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="positioning_status",
+            description="Get strategic positioning status. Shows overall status, thresholds (strengthen/atrophy flow thresholds), and list of priority exchanges.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -1669,6 +1833,28 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_circular_flow_status(arguments)
         elif name == "cost_reduction_status":
             result = await handle_cost_reduction_status(arguments)
+        # Channel Rationalization tools
+        elif name == "coverage_analysis":
+            result = await handle_coverage_analysis(arguments)
+        elif name == "close_recommendations":
+            result = await handle_close_recommendations(arguments)
+        elif name == "rationalization_summary":
+            result = await handle_rationalization_summary(arguments)
+        elif name == "rationalization_status":
+            result = await handle_rationalization_status(arguments)
+        # Phase 5: Strategic Positioning
+        elif name == "valuable_corridors":
+            result = await handle_valuable_corridors(arguments)
+        elif name == "exchange_coverage":
+            result = await handle_exchange_coverage(arguments)
+        elif name == "positioning_recommendations":
+            result = await handle_positioning_recommendations(arguments)
+        elif name == "flow_recommendations":
+            result = await handle_flow_recommendations(arguments)
+        elif name == "positioning_summary":
+            result = await handle_positioning_summary(arguments)
+        elif name == "positioning_status":
+            result = await handle_positioning_status(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -3730,6 +3916,139 @@ async def handle_cost_reduction_status(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-cost-reduction-status", {})
+
+
+# =============================================================================
+# Channel Rationalization Handlers
+# =============================================================================
+
+async def handle_coverage_analysis(args: Dict) -> Dict:
+    """Analyze fleet coverage for redundant channels."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if peer_id:
+        params["peer_id"] = peer_id
+
+    return await node.call("hive-coverage-analysis", params)
+
+
+async def handle_close_recommendations(args: Dict) -> Dict:
+    """Get channel close recommendations for underperforming redundant channels."""
+    node_name = args.get("node")
+    our_node_only = args.get("our_node_only", False)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-close-recommendations", {
+        "our_node_only": our_node_only
+    })
+
+
+async def handle_rationalization_summary(args: Dict) -> Dict:
+    """Get summary of channel rationalization analysis."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-rationalization-summary", {})
+
+
+async def handle_rationalization_status(args: Dict) -> Dict:
+    """Get channel rationalization status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-rationalization-status", {})
+
+
+# =============================================================================
+# Phase 5: Strategic Positioning Handlers
+# =============================================================================
+
+async def handle_valuable_corridors(args: Dict) -> Dict:
+    """Get high-value routing corridors for strategic positioning."""
+    node_name = args.get("node")
+    min_score = args.get("min_score", 0.05)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-valuable-corridors", {"min_score": min_score})
+
+
+async def handle_exchange_coverage(args: Dict) -> Dict:
+    """Get priority exchange connectivity status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-exchange-coverage", {})
+
+
+async def handle_positioning_recommendations(args: Dict) -> Dict:
+    """Get channel open recommendations for strategic positioning."""
+    node_name = args.get("node")
+    count = args.get("count", 5)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-positioning-recommendations", {"count": count})
+
+
+async def handle_flow_recommendations(args: Dict) -> Dict:
+    """Get Physarum-inspired flow recommendations for channel lifecycle."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if channel_id:
+        params["channel_id"] = channel_id
+
+    return await node.call("hive-flow-recommendations", params)
+
+
+async def handle_positioning_summary(args: Dict) -> Dict:
+    """Get summary of strategic positioning analysis."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-positioning-summary", {})
+
+
+async def handle_positioning_status(args: Dict) -> Dict:
+    """Get strategic positioning status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-positioning-status", {})
 
 
 # =============================================================================

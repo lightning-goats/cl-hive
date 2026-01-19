@@ -1,0 +1,887 @@
+"""
+Channel Rationalization Module - Swarm Intelligence for Fleet Efficiency
+
+When multiple fleet members have channels to the same peer (redundant coverage),
+this module determines which member(s) "own" those routes based on stigmergic
+markers (routing success patterns) and recommends channel closes for
+non-performing members.
+
+Part of the Hive covenant: members follow swarm intelligence recommendations
+to maximize collective efficiency.
+
+Key concepts:
+- Ownership: Determined by cumulative marker strength (successful routing)
+- Redundancy: Multiple members → same peer without proportional routing
+- Rationalization: Recommending closes for underperforming redundant channels
+
+Author: Lightning Goats Team
+"""
+
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# Ownership thresholds
+OWNERSHIP_DOMINANT_RATIO = 0.6      # Member with >60% markers owns the route
+OWNERSHIP_MIN_MARKERS = 3           # Need at least 3 markers to claim ownership
+OWNERSHIP_MIN_STRENGTH = 1.0        # Minimum total marker strength to claim
+
+# Redundancy thresholds
+REDUNDANCY_MIN_MEMBERS = 2          # At least 2 members = potential redundancy
+MAX_HEALTHY_REDUNDANCY = 2          # Up to 2 members per peer is healthy
+
+# Performance thresholds for close recommendations
+UNDERPERFORMER_MARKER_RATIO = 0.1   # <10% of leader's markers = underperformer
+UNDERPERFORMER_MIN_AGE_DAYS = 30    # Channel must be >30 days old to recommend close
+UNDERPERFORMER_MIN_CAPACITY = 1_000_000  # Only consider channels >1M sats
+
+# Grace periods
+NEW_CHANNEL_GRACE_DAYS = 14         # Don't recommend close for channels <14 days
+CLOSE_RECOMMENDATION_COOLDOWN_HOURS = 72  # Don't repeat recommendation within 72h
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class PeerCoverage:
+    """
+    Coverage analysis for a single external peer.
+
+    Shows which fleet members have channels to this peer and their
+    routing performance (marker strength).
+    """
+    peer_id: str
+    peer_alias: Optional[str] = None
+
+    # Fleet members with channels to this peer
+    members_with_channels: List[str] = field(default_factory=list)
+
+    # Marker strength by member (sum of all routing markers)
+    member_marker_strength: Dict[str, float] = field(default_factory=dict)
+
+    # Marker count by member
+    member_marker_count: Dict[str, int] = field(default_factory=dict)
+
+    # Channel capacity by member
+    member_capacity_sats: Dict[str, int] = field(default_factory=dict)
+
+    # Determined owner (None if no clear owner)
+    owner_member: Optional[str] = None
+    ownership_confidence: float = 0.0
+
+    # Redundancy level
+    redundancy_count: int = 0
+    is_over_redundant: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "peer_id": self.peer_id,
+            "peer_alias": self.peer_alias,
+            "members_with_channels": self.members_with_channels,
+            "member_marker_strength": {k: round(v, 3) for k, v in self.member_marker_strength.items()},
+            "member_marker_count": self.member_marker_count,
+            "member_capacity_sats": self.member_capacity_sats,
+            "owner_member": self.owner_member,
+            "ownership_confidence": round(self.ownership_confidence, 2),
+            "redundancy_count": self.redundancy_count,
+            "is_over_redundant": self.is_over_redundant
+        }
+
+
+@dataclass
+class CloseRecommendation:
+    """
+    Recommendation to close an underperforming redundant channel.
+    """
+    member_id: str
+    peer_id: str
+    channel_id: str
+
+    # Context
+    peer_alias: Optional[str] = None
+    member_alias: Optional[str] = None
+
+    # Performance metrics
+    member_marker_strength: float = 0.0
+    owner_marker_strength: float = 0.0
+    owner_member: str = ""
+
+    # Channel details
+    capacity_sats: int = 0
+    channel_age_days: int = 0
+    local_balance_pct: float = 0.0
+
+    # Recommendation details
+    reason: str = ""
+    confidence: float = 0.0
+    urgency: str = "low"  # "low", "medium", "high"
+
+    # Estimated impact
+    freed_capital_sats: int = 0
+
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "member_id": self.member_id,
+            "peer_id": self.peer_id,
+            "channel_id": self.channel_id,
+            "peer_alias": self.peer_alias,
+            "member_alias": self.member_alias,
+            "member_marker_strength": round(self.member_marker_strength, 3),
+            "owner_marker_strength": round(self.owner_marker_strength, 3),
+            "owner_member": self.owner_member,
+            "capacity_sats": self.capacity_sats,
+            "channel_age_days": self.channel_age_days,
+            "local_balance_pct": round(self.local_balance_pct, 2),
+            "reason": self.reason,
+            "confidence": round(self.confidence, 2),
+            "urgency": self.urgency,
+            "freed_capital_sats": self.freed_capital_sats,
+            "timestamp": self.timestamp
+        }
+
+
+@dataclass
+class RationalizationSummary:
+    """
+    Summary of channel rationalization analysis.
+    """
+    total_peers_analyzed: int = 0
+    redundant_peers: int = 0
+    over_redundant_peers: int = 0
+    close_recommendations: int = 0
+    potential_freed_capital_sats: int = 0
+
+    # Top recommendations
+    top_recommendations: List[Dict] = field(default_factory=list)
+
+    # Coverage health
+    well_owned_peers: int = 0      # Clear owner with strong markers
+    contested_peers: int = 0       # Multiple members, no clear owner
+    orphan_peers: int = 0          # No routing activity despite channels
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_peers_analyzed": self.total_peers_analyzed,
+            "redundant_peers": self.redundant_peers,
+            "over_redundant_peers": self.over_redundant_peers,
+            "close_recommendations": self.close_recommendations,
+            "potential_freed_capital_sats": self.potential_freed_capital_sats,
+            "top_recommendations": self.top_recommendations,
+            "well_owned_peers": self.well_owned_peers,
+            "contested_peers": self.contested_peers,
+            "orphan_peers": self.orphan_peers
+        }
+
+
+# =============================================================================
+# REDUNDANCY ANALYZER
+# =============================================================================
+
+class RedundancyAnalyzer:
+    """
+    Analyzes fleet coverage redundancy.
+
+    Identifies peers that multiple fleet members have channels to
+    and calculates the distribution of routing activity.
+    """
+
+    def __init__(self, plugin, state_manager=None, fee_coordination_mgr=None):
+        """
+        Initialize the redundancy analyzer.
+
+        Args:
+            plugin: Plugin reference for RPC calls
+            state_manager: StateManager for fleet topology
+            fee_coordination_mgr: FeeCoordinationManager for marker access
+        """
+        self.plugin = plugin
+        self.state_manager = state_manager
+        self.fee_coordination_mgr = fee_coordination_mgr
+        self._our_pubkey: Optional[str] = None
+
+        # Cache
+        self._coverage_cache: Dict[str, PeerCoverage] = {}
+        self._cache_time: float = 0
+        self._cache_ttl: float = 300  # 5 minutes
+
+    def set_our_pubkey(self, pubkey: str) -> None:
+        """Set our node's pubkey."""
+        self._our_pubkey = pubkey
+
+    def _log(self, message: str, level: str = "debug") -> None:
+        """Log a message if plugin is available."""
+        if self.plugin:
+            self.plugin.log(f"REDUNDANCY: {message}", level=level)
+
+    def _get_fleet_members(self) -> List[str]:
+        """Get list of fleet member pubkeys."""
+        if not self.state_manager:
+            return []
+
+        try:
+            all_states = self.state_manager.get_all_peer_states()
+            return [s.peer_id for s in all_states]
+        except Exception:
+            return []
+
+    def _get_member_topology(self, member_id: str) -> Set[str]:
+        """Get the set of peers a member has channels with."""
+        if not self.state_manager:
+            return set()
+
+        try:
+            state = self.state_manager.get_peer_state(member_id)
+            if state:
+                return set(getattr(state, 'topology', []) or [])
+            return set()
+        except Exception:
+            return set()
+
+    def _get_markers_for_peer(self, peer_id: str) -> List[Any]:
+        """
+        Get all stigmergic markers involving this peer.
+
+        Markers where peer is either source or destination.
+        """
+        if not self.fee_coordination_mgr:
+            return []
+
+        try:
+            stigmergy = self.fee_coordination_mgr.stigmergy
+            if not stigmergy:
+                return []
+
+            all_markers = stigmergy.get_all_markers()
+            return [
+                m for m in all_markers
+                if m.source_peer_id == peer_id or m.destination_peer_id == peer_id
+            ]
+        except Exception as e:
+            self._log(f"Error getting markers for peer: {e}", level="debug")
+            return []
+
+    def analyze_peer_coverage(self, peer_id: str) -> PeerCoverage:
+        """
+        Analyze coverage for a single external peer.
+
+        Args:
+            peer_id: External peer to analyze
+
+        Returns:
+            PeerCoverage with ownership and redundancy analysis
+        """
+        coverage = PeerCoverage(peer_id=peer_id)
+
+        fleet_members = self._get_fleet_members()
+        if not fleet_members:
+            return coverage
+
+        # Find which members have channels to this peer
+        for member_id in fleet_members:
+            topology = self._get_member_topology(member_id)
+            if peer_id in topology:
+                coverage.members_with_channels.append(member_id)
+                coverage.member_marker_strength[member_id] = 0.0
+                coverage.member_marker_count[member_id] = 0
+
+        coverage.redundancy_count = len(coverage.members_with_channels)
+        coverage.is_over_redundant = coverage.redundancy_count > MAX_HEALTHY_REDUNDANCY
+
+        if not coverage.members_with_channels:
+            return coverage
+
+        # Analyze markers to determine ownership
+        markers = self._get_markers_for_peer(peer_id)
+
+        for marker in markers:
+            depositor = marker.depositor
+            if depositor in coverage.member_marker_strength:
+                coverage.member_marker_strength[depositor] += marker.strength
+                coverage.member_marker_count[depositor] += 1
+
+        # Determine owner
+        self._determine_ownership(coverage)
+
+        return coverage
+
+    def _determine_ownership(self, coverage: PeerCoverage) -> None:
+        """
+        Determine which member owns this peer relationship.
+
+        Owner is the member with dominant marker strength.
+        """
+        if not coverage.member_marker_strength:
+            return
+
+        total_strength = sum(coverage.member_marker_strength.values())
+        if total_strength < OWNERSHIP_MIN_STRENGTH:
+            # Not enough routing activity to determine ownership
+            return
+
+        # Find strongest member
+        strongest_member = max(
+            coverage.member_marker_strength.items(),
+            key=lambda x: x[1]
+        )
+        member_id, strength = strongest_member
+
+        # Check if dominant
+        strength_ratio = strength / total_strength if total_strength > 0 else 0
+        marker_count = coverage.member_marker_count.get(member_id, 0)
+
+        if strength_ratio >= OWNERSHIP_DOMINANT_RATIO and marker_count >= OWNERSHIP_MIN_MARKERS:
+            coverage.owner_member = member_id
+            coverage.ownership_confidence = min(0.95, strength_ratio)
+        elif strength_ratio >= 0.4:  # Plurality but not dominant
+            coverage.owner_member = member_id
+            coverage.ownership_confidence = strength_ratio * 0.7  # Lower confidence
+
+    def analyze_all_coverage(self) -> Dict[str, PeerCoverage]:
+        """
+        Analyze coverage for all external peers with fleet channels.
+
+        Returns:
+            Dict mapping peer_id -> PeerCoverage
+        """
+        now = time.time()
+
+        # Return cached if fresh
+        if self._coverage_cache and now - self._cache_time < self._cache_ttl:
+            return self._coverage_cache
+
+        coverage_map = {}
+
+        fleet_members = self._get_fleet_members()
+        if not fleet_members:
+            return coverage_map
+
+        # Collect all external peers
+        all_peers: Set[str] = set()
+        for member_id in fleet_members:
+            topology = self._get_member_topology(member_id)
+            # Exclude other fleet members
+            external_peers = topology - set(fleet_members)
+            all_peers.update(external_peers)
+
+        # Analyze each peer
+        for peer_id in all_peers:
+            coverage = self.analyze_peer_coverage(peer_id)
+            if coverage.redundancy_count >= REDUNDANCY_MIN_MEMBERS:
+                coverage_map[peer_id] = coverage
+
+        self._coverage_cache = coverage_map
+        self._cache_time = now
+
+        return coverage_map
+
+    def get_redundant_peers(self) -> List[PeerCoverage]:
+        """
+        Get list of peers with redundant coverage (multiple members).
+        """
+        all_coverage = self.analyze_all_coverage()
+        return list(all_coverage.values())
+
+    def get_over_redundant_peers(self) -> List[PeerCoverage]:
+        """
+        Get list of peers with excessive redundancy (>2 members).
+        """
+        all_coverage = self.analyze_all_coverage()
+        return [c for c in all_coverage.values() if c.is_over_redundant]
+
+
+# =============================================================================
+# CHANNEL RATIONALIZER
+# =============================================================================
+
+class ChannelRationalizer:
+    """
+    Generates close recommendations for underperforming redundant channels.
+
+    Uses stigmergic markers to determine ownership and identifies
+    channels that should be closed to free capital.
+    """
+
+    def __init__(
+        self,
+        plugin,
+        database=None,
+        state_manager=None,
+        fee_coordination_mgr=None,
+        governance=None
+    ):
+        """
+        Initialize the channel rationalizer.
+
+        Args:
+            plugin: Plugin reference
+            database: Database for persistence
+            state_manager: StateManager for fleet state
+            fee_coordination_mgr: FeeCoordinationManager for markers
+            governance: Governance module for pending_actions
+        """
+        self.plugin = plugin
+        self.database = database
+        self.state_manager = state_manager
+        self.governance = governance
+
+        # Initialize redundancy analyzer
+        self.redundancy_analyzer = RedundancyAnalyzer(
+            plugin=plugin,
+            state_manager=state_manager,
+            fee_coordination_mgr=fee_coordination_mgr
+        )
+
+        self._our_pubkey: Optional[str] = None
+
+        # Track recent recommendations to avoid spam
+        self._recent_recommendations: Dict[str, float] = {}
+
+    def set_our_pubkey(self, pubkey: str) -> None:
+        """Set our node's pubkey."""
+        self._our_pubkey = pubkey
+        self.redundancy_analyzer.set_our_pubkey(pubkey)
+
+    def _log(self, message: str, level: str = "debug") -> None:
+        """Log a message if plugin is available."""
+        if self.plugin:
+            self.plugin.log(f"RATIONALIZE: {message}", level=level)
+
+    def _get_channel_info(self, member_id: str, peer_id: str) -> Optional[Dict]:
+        """
+        Get channel information for a member's channel to a peer.
+
+        Returns channel details if this is our node, otherwise returns
+        estimated data from state.
+        """
+        if member_id == self._our_pubkey and self.plugin:
+            try:
+                channels = self.plugin.rpc.listpeerchannels()
+                for ch in channels.get("channels", []):
+                    if ch.get("peer_id") == peer_id:
+                        return {
+                            "channel_id": ch.get("short_channel_id", "").replace(":", "x"),
+                            "capacity_sats": ch.get("total_msat", 0) // 1000,
+                            "local_balance_sats": ch.get("to_us_msat", 0) // 1000,
+                            "state": ch.get("state"),
+                            "funding_tx": ch.get("funding_txid"),
+                            # Estimate age from funding blockheight if available
+                            "opened_at": ch.get("open_confirm_time")
+                        }
+            except Exception:
+                pass
+
+        # For remote members, use state manager data
+        if self.state_manager:
+            try:
+                state = self.state_manager.get_peer_state(member_id)
+                if state:
+                    # Return estimated data
+                    return {
+                        "channel_id": "unknown",
+                        "capacity_sats": getattr(state, 'capacity_sats', 0) // len(getattr(state, 'topology', [1])),
+                        "local_balance_sats": 0,
+                        "state": "CHANNELD_NORMAL"
+                    }
+            except Exception:
+                pass
+
+        return None
+
+    def _should_recommend_close(
+        self,
+        coverage: PeerCoverage,
+        member_id: str
+    ) -> Tuple[bool, str, float, str]:
+        """
+        Determine if we should recommend closing member's channel to this peer.
+
+        Returns:
+            (should_close, reason, confidence, urgency)
+        """
+        # Skip if this member is the owner
+        if member_id == coverage.owner_member:
+            return False, "", 0.0, "none"
+
+        # Skip if no clear owner
+        if not coverage.owner_member:
+            return False, "no_clear_owner", 0.0, "none"
+
+        # Check cooldown
+        cooldown_key = f"{member_id}:{coverage.peer_id}"
+        last_rec = self._recent_recommendations.get(cooldown_key, 0)
+        if time.time() - last_rec < CLOSE_RECOMMENDATION_COOLDOWN_HOURS * 3600:
+            return False, "cooldown", 0.0, "none"
+
+        # Get member's marker strength
+        member_strength = coverage.member_marker_strength.get(member_id, 0)
+        owner_strength = coverage.member_marker_strength.get(coverage.owner_member, 0)
+
+        # Calculate performance ratio
+        if owner_strength > 0:
+            performance_ratio = member_strength / owner_strength
+        else:
+            performance_ratio = 0.0
+
+        # Check if underperformer
+        if performance_ratio < UNDERPERFORMER_MARKER_RATIO:
+            # Member has <10% of owner's routing activity
+
+            # Determine urgency based on redundancy level and performance
+            if coverage.redundancy_count > 3 and performance_ratio < 0.05:
+                urgency = "high"
+                confidence = min(0.9, coverage.ownership_confidence)
+            elif coverage.is_over_redundant:
+                urgency = "medium"
+                confidence = min(0.8, coverage.ownership_confidence * 0.9)
+            else:
+                urgency = "low"
+                confidence = min(0.7, coverage.ownership_confidence * 0.8)
+
+            reason = (
+                f"Underperforming: {performance_ratio:.1%} of owner's routing activity; "
+                f"{coverage.redundancy_count} members serve this peer"
+            )
+
+            return True, reason, confidence, urgency
+
+        return False, "", 0.0, "none"
+
+    def generate_close_recommendations(self) -> List[CloseRecommendation]:
+        """
+        Generate close recommendations for underperforming redundant channels.
+
+        Returns:
+            List of CloseRecommendation
+        """
+        recommendations = []
+
+        # Get all redundant peer coverage
+        redundant_peers = self.redundancy_analyzer.get_redundant_peers()
+
+        for coverage in redundant_peers:
+            # Skip if no clear owner
+            if not coverage.owner_member:
+                continue
+
+            # Check each non-owner member
+            for member_id in coverage.members_with_channels:
+                should_close, reason, confidence, urgency = self._should_recommend_close(
+                    coverage, member_id
+                )
+
+                if not should_close:
+                    continue
+
+                # Get channel info
+                channel_info = self._get_channel_info(member_id, coverage.peer_id)
+
+                # Create recommendation
+                rec = CloseRecommendation(
+                    member_id=member_id,
+                    peer_id=coverage.peer_id,
+                    channel_id=channel_info.get("channel_id", "unknown") if channel_info else "unknown",
+                    peer_alias=coverage.peer_alias,
+                    member_marker_strength=coverage.member_marker_strength.get(member_id, 0),
+                    owner_marker_strength=coverage.member_marker_strength.get(coverage.owner_member, 0),
+                    owner_member=coverage.owner_member,
+                    capacity_sats=channel_info.get("capacity_sats", 0) if channel_info else 0,
+                    local_balance_pct=(
+                        channel_info.get("local_balance_sats", 0) /
+                        channel_info.get("capacity_sats", 1)
+                        if channel_info and channel_info.get("capacity_sats", 0) > 0
+                        else 0
+                    ),
+                    reason=reason,
+                    confidence=confidence,
+                    urgency=urgency,
+                    freed_capital_sats=channel_info.get("capacity_sats", 0) if channel_info else 0
+                )
+
+                recommendations.append(rec)
+
+                # Record recommendation time
+                cooldown_key = f"{member_id}:{coverage.peer_id}"
+                self._recent_recommendations[cooldown_key] = time.time()
+
+        # Sort by urgency then confidence
+        urgency_order = {"high": 0, "medium": 1, "low": 2}
+        recommendations.sort(
+            key=lambda r: (urgency_order.get(r.urgency, 3), -r.confidence)
+        )
+
+        return recommendations
+
+    def get_my_close_recommendations(self) -> List[CloseRecommendation]:
+        """
+        Get close recommendations specifically for our node.
+
+        Returns:
+            List of recommendations where we should close channels
+        """
+        all_recs = self.generate_close_recommendations()
+        return [r for r in all_recs if r.member_id == self._our_pubkey]
+
+    def create_pending_actions(self, recommendations: List[CloseRecommendation]) -> int:
+        """
+        Create pending_actions for close recommendations.
+
+        Args:
+            recommendations: List of close recommendations
+
+        Returns:
+            Number of pending_actions created
+        """
+        if not self.governance:
+            self._log("Governance not available, cannot create pending_actions", level="warn")
+            return 0
+
+        created = 0
+
+        for rec in recommendations:
+            # Only create actions for high confidence recommendations
+            if rec.confidence < 0.5:
+                continue
+
+            try:
+                action_data = {
+                    "action_type": "close_channel",
+                    "member_id": rec.member_id,
+                    "peer_id": rec.peer_id,
+                    "channel_id": rec.channel_id,
+                    "reason": rec.reason,
+                    "urgency": rec.urgency,
+                    "confidence": rec.confidence,
+                    "freed_capital_sats": rec.freed_capital_sats,
+                    "owner_member": rec.owner_member,
+                    "recommendation_type": "rationalization"
+                }
+
+                self.governance.create_pending_action(
+                    action_type="close_recommendation",
+                    data=action_data,
+                    source="channel_rationalization"
+                )
+                created += 1
+
+                self._log(
+                    f"Created pending action: close {rec.channel_id} "
+                    f"({rec.member_id[:8]}... → {rec.peer_id[:8]}...)",
+                    level="info"
+                )
+
+            except Exception as e:
+                self._log(f"Error creating pending action: {e}", level="warn")
+
+        return created
+
+    def get_rationalization_summary(self) -> RationalizationSummary:
+        """
+        Get summary of channel rationalization analysis.
+
+        Returns:
+            RationalizationSummary with coverage health and recommendations
+        """
+        summary = RationalizationSummary()
+
+        # Analyze all coverage
+        all_coverage = self.redundancy_analyzer.analyze_all_coverage()
+
+        summary.total_peers_analyzed = len(all_coverage)
+
+        for coverage in all_coverage.values():
+            if coverage.redundancy_count >= REDUNDANCY_MIN_MEMBERS:
+                summary.redundant_peers += 1
+
+            if coverage.is_over_redundant:
+                summary.over_redundant_peers += 1
+
+            # Categorize coverage health
+            total_strength = sum(coverage.member_marker_strength.values())
+
+            if coverage.owner_member and coverage.ownership_confidence >= 0.6:
+                summary.well_owned_peers += 1
+            elif total_strength > 0 and not coverage.owner_member:
+                summary.contested_peers += 1
+            elif total_strength == 0 and coverage.redundancy_count > 0:
+                summary.orphan_peers += 1
+
+        # Get recommendations
+        recommendations = self.generate_close_recommendations()
+        summary.close_recommendations = len(recommendations)
+
+        # Calculate potential freed capital
+        summary.potential_freed_capital_sats = sum(
+            r.freed_capital_sats for r in recommendations
+        )
+
+        # Top 5 recommendations
+        summary.top_recommendations = [
+            r.to_dict() for r in recommendations[:5]
+        ]
+
+        return summary
+
+
+# =============================================================================
+# RATIONALIZATION MANAGER
+# =============================================================================
+
+class RationalizationManager:
+    """
+    Main interface for channel rationalization.
+
+    Coordinates redundancy analysis, ownership determination,
+    and close recommendations.
+    """
+
+    def __init__(
+        self,
+        plugin,
+        database=None,
+        state_manager=None,
+        fee_coordination_mgr=None,
+        governance=None
+    ):
+        """
+        Initialize the rationalization manager.
+
+        Args:
+            plugin: Plugin reference
+            database: Database for persistence
+            state_manager: StateManager for fleet state
+            fee_coordination_mgr: FeeCoordinationManager for markers
+            governance: Governance module for pending_actions
+        """
+        self.plugin = plugin
+        self.database = database
+
+        # Initialize rationalizer
+        self.rationalizer = ChannelRationalizer(
+            plugin=plugin,
+            database=database,
+            state_manager=state_manager,
+            fee_coordination_mgr=fee_coordination_mgr,
+            governance=governance
+        )
+
+        self._our_pubkey: Optional[str] = None
+
+    def set_our_pubkey(self, pubkey: str) -> None:
+        """Set our node's pubkey."""
+        self._our_pubkey = pubkey
+        self.rationalizer.set_our_pubkey(pubkey)
+
+    def _log(self, message: str, level: str = "debug") -> None:
+        """Log a message if plugin is available."""
+        if self.plugin:
+            self.plugin.log(f"RATIONALIZATION_MGR: {message}", level=level)
+
+    def analyze_coverage(self, peer_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Analyze fleet coverage for a peer or all redundant peers.
+
+        Args:
+            peer_id: Specific peer to analyze, or None for all
+
+        Returns:
+            Coverage analysis results
+        """
+        if peer_id:
+            coverage = self.rationalizer.redundancy_analyzer.analyze_peer_coverage(peer_id)
+            return {
+                "peer_id": peer_id,
+                "coverage": coverage.to_dict()
+            }
+        else:
+            redundant = self.rationalizer.redundancy_analyzer.get_redundant_peers()
+            return {
+                "redundant_peers": len(redundant),
+                "peers": [c.to_dict() for c in redundant]
+            }
+
+    def get_close_recommendations(
+        self,
+        for_our_node_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Get channel close recommendations.
+
+        Args:
+            for_our_node_only: If True, only return recommendations for our node
+
+        Returns:
+            List of close recommendations
+        """
+        if for_our_node_only:
+            recs = self.rationalizer.get_my_close_recommendations()
+        else:
+            recs = self.rationalizer.generate_close_recommendations()
+
+        return [r.to_dict() for r in recs]
+
+    def create_close_actions(self) -> Dict[str, Any]:
+        """
+        Create pending_actions for close recommendations.
+
+        Returns:
+            Dict with creation results
+        """
+        recommendations = self.rationalizer.generate_close_recommendations()
+        created = self.rationalizer.create_pending_actions(recommendations)
+
+        return {
+            "recommendations_analyzed": len(recommendations),
+            "pending_actions_created": created
+        }
+
+    def get_summary(self) -> Dict[str, Any]:
+        """
+        Get rationalization summary.
+
+        Returns:
+            Summary dict
+        """
+        summary = self.rationalizer.get_rationalization_summary()
+        return summary.to_dict()
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get overall rationalization status.
+
+        Returns:
+            Status dict with health metrics
+        """
+        summary = self.rationalizer.get_rationalization_summary()
+
+        return {
+            "enabled": True,
+            "summary": summary.to_dict(),
+            "health": {
+                "well_owned_ratio": (
+                    summary.well_owned_peers / summary.total_peers_analyzed
+                    if summary.total_peers_analyzed > 0 else 0
+                ),
+                "redundancy_ratio": (
+                    summary.redundant_peers / summary.total_peers_analyzed
+                    if summary.total_peers_analyzed > 0 else 0
+                ),
+                "orphan_ratio": (
+                    summary.orphan_peers / summary.total_peers_analyzed
+                    if summary.total_peers_analyzed > 0 else 0
+                )
+            },
+            "thresholds": {
+                "ownership_dominant_ratio": OWNERSHIP_DOMINANT_RATIO,
+                "max_healthy_redundancy": MAX_HEALTHY_REDUNDANCY,
+                "underperformer_marker_ratio": UNDERPERFORMER_MARKER_RATIO
+            }
+        }
