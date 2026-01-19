@@ -645,6 +645,81 @@ async def list_tools() -> List[Tool]:
             }
         ),
         # =====================================================================
+        # Time-Based Fee Tools (Phase 7.4)
+        # =====================================================================
+        Tool(
+            name="hive_time_fee_status",
+            description="Get time-based fee adjustment status. Shows current time context, active adjustments across channels, and configuration for temporal fee optimization.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_time_fee_adjustment",
+            description="Get time-based fee adjustment for a specific channel. Analyzes temporal patterns to determine optimal fee for current time (higher during peak, lower during quiet periods).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel short ID (e.g., '123x456x0')"
+                    },
+                    "base_fee": {
+                        "type": "integer",
+                        "description": "Current/base fee in ppm (default: 250)"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="hive_time_peak_hours",
+            description="Get detected peak routing hours for a channel. Shows hours with above-average volume where fee increases may capture premium.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel short ID"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="hive_time_low_hours",
+            description="Get detected low-activity hours for a channel. Shows hours with below-average volume where fee decreases may attract flow.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel short ID"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        # =====================================================================
         # cl-revenue-ops Tools
         # =====================================================================
         Tool(
@@ -1855,6 +1930,15 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_predict_liquidity(arguments)
         elif name == "hive_anticipatory_predictions":
             result = await handle_anticipatory_predictions(arguments)
+        # Time-Based Fee tools (Phase 7.4)
+        elif name == "hive_time_fee_status":
+            result = await handle_time_fee_status(arguments)
+        elif name == "hive_time_fee_adjustment":
+            result = await handle_time_fee_adjustment(arguments)
+        elif name == "hive_time_peak_hours":
+            result = await handle_time_peak_hours(arguments)
+        elif name == "hive_time_low_hours":
+            result = await handle_time_low_hours(arguments)
         # cl-revenue-ops tools
         elif name == "revenue_status":
             result = await handle_revenue_status(arguments)
@@ -2498,6 +2582,170 @@ async def handle_anticipatory_predictions(args: Dict) -> Dict:
             )
         else:
             result["ai_summary"] = "All channels stable. No anticipatory action needed."
+
+    return result
+
+
+# =============================================================================
+# Time-Based Fee Handlers (Phase 7.4)
+# =============================================================================
+
+async def handle_time_fee_status(args: Dict) -> Dict:
+    """
+    Get time-based fee adjustment status.
+
+    Shows current time context, active adjustments, and configuration.
+    """
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-time-fee-status", {})
+
+    # Add AI summary
+    if result.get("active_adjustments", 0) > 0:
+        adjustments = result.get("adjustments", [])
+        increases = [a for a in adjustments if a.get("adjustment_type") == "peak_increase"]
+        decreases = [a for a in adjustments if a.get("adjustment_type") == "low_decrease"]
+        result["ai_summary"] = (
+            f"Time-based fees active: {len(increases)} peak increases, "
+            f"{len(decreases)} low-activity decreases. "
+            f"Current time: {result.get('current_hour', 0):02d}:00 UTC {result.get('current_day_name', '')}"
+        )
+    else:
+        result["ai_summary"] = (
+            f"No time-based adjustments active at "
+            f"{result.get('current_hour', 0):02d}:00 UTC {result.get('current_day_name', '')}. "
+            f"System {'enabled' if result.get('enabled') else 'disabled'}."
+        )
+
+    return result
+
+
+async def handle_time_fee_adjustment(args: Dict) -> Dict:
+    """
+    Get time-based fee adjustment for a specific channel.
+
+    Analyzes temporal patterns to determine optimal fee for current time.
+    """
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    base_fee = args.get("base_fee", 250)
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-time-fee-adjustment", {
+        "channel_id": channel_id,
+        "base_fee": base_fee
+    })
+
+    # Add AI summary
+    if result.get("adjustment_type") == "peak_increase":
+        result["ai_summary"] = (
+            f"Peak hour detected: fee increased from {result.get('base_fee_ppm')} to "
+            f"{result.get('adjusted_fee_ppm')} ppm (+{result.get('adjustment_pct', 0):.1f}%). "
+            f"Intensity: {result.get('pattern_intensity', 0):.0%}"
+        )
+    elif result.get("adjustment_type") == "low_decrease":
+        result["ai_summary"] = (
+            f"Low activity detected: fee decreased from {result.get('base_fee_ppm')} to "
+            f"{result.get('adjusted_fee_ppm')} ppm ({result.get('adjustment_pct', 0):.1f}%). "
+            f"May attract flow."
+        )
+    else:
+        result["ai_summary"] = (
+            f"No time adjustment for channel {channel_id} at current time. "
+            f"Base fee {base_fee} ppm unchanged."
+        )
+
+    return result
+
+
+async def handle_time_peak_hours(args: Dict) -> Dict:
+    """
+    Get detected peak routing hours for a channel.
+
+    Shows hours with above-average volume where fee increases capture premium.
+    """
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-time-peak-hours", {"channel_id": channel_id})
+
+    # Add AI summary
+    count = result.get("count", 0)
+    if count > 0:
+        hours = result.get("peak_hours", [])
+        top_hours = hours[:3]
+        hour_strs = [
+            f"{h.get('hour', 0):02d}:00 {h.get('day_name', 'Any')} ({h.get('direction', 'both')})"
+            for h in top_hours
+        ]
+        result["ai_summary"] = (
+            f"Detected {count} peak hours for channel {channel_id}. "
+            f"Top periods: {', '.join(hour_strs)}. "
+            "Consider fee increases during these times."
+        )
+    else:
+        result["ai_summary"] = (
+            f"No peak hours detected for channel {channel_id}. "
+            "Need more flow history for pattern detection."
+        )
+
+    return result
+
+
+async def handle_time_low_hours(args: Dict) -> Dict:
+    """
+    Get detected low-activity hours for a channel.
+
+    Shows hours with below-average volume where fee decreases may help.
+    """
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-time-low-hours", {"channel_id": channel_id})
+
+    # Add AI summary
+    count = result.get("count", 0)
+    if count > 0:
+        hours = result.get("low_hours", [])
+        top_hours = hours[:3]
+        hour_strs = [
+            f"{h.get('hour', 0):02d}:00 {h.get('day_name', 'Any')}"
+            for h in top_hours
+        ]
+        result["ai_summary"] = (
+            f"Detected {count} low-activity periods for channel {channel_id}. "
+            f"Quietest: {', '.join(hour_strs)}. "
+            "Consider fee decreases to attract flow."
+        )
+    else:
+        result["ai_summary"] = (
+            f"No low-activity patterns detected for channel {channel_id}. "
+            "Channel may have consistent activity or need more history."
+        )
 
     return result
 

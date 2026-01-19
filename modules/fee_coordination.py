@@ -48,6 +48,28 @@ FAILURE_RATE_THRESHOLD = 0.5      # >50% failures = unreliable peer
 WARNING_TTL_HOURS = 24            # Warnings expire after 24 hours
 DEFENSIVE_FEE_MAX_MULTIPLIER = 3.0  # Max 3x fee increase for defense
 
+# =============================================================================
+# TIME-BASED FEE ADJUSTMENT (Phase 7.4)
+# =============================================================================
+
+# Enable time-based fee adjustments
+TIME_FEE_ADJUSTMENT_ENABLED = True   # Config: hive-time-fee-enabled
+
+# Maximum adjustment bounds (applied to base fee)
+TIME_FEE_MAX_INCREASE_PCT = 0.25     # +25% during peak hours
+TIME_FEE_MAX_DECREASE_PCT = 0.15     # -15% during low-activity hours
+
+# Intensity thresholds for triggering adjustments
+TIME_FEE_PEAK_INTENSITY = 0.7        # Flow intensity > 70% = peak
+TIME_FEE_LOW_INTENSITY = 0.3         # Flow intensity < 30% = low activity
+
+# Minimum pattern confidence to apply adjustment
+TIME_FEE_MIN_CONFIDENCE = 0.5        # Require 50% confidence
+
+# Transition smoothing (avoid sudden jumps)
+TIME_FEE_TRANSITION_PERIODS = 2      # Smooth over 2 hours
+TIME_FEE_CACHE_TTL_HOURS = 1         # Cache adjustments for 1 hour
+
 
 # =============================================================================
 # DATA CLASSES
@@ -201,6 +223,7 @@ class FeeRecommendation:
     ceiling_applied: bool = False
     stigmergic_influence: float = 0.0
     defensive_multiplier: float = 1.0
+    time_adjustment_pct: float = 0.0    # Phase 7.4: Time-based adjustment
 
     # Confidence
     confidence: float = 0.5
@@ -218,6 +241,7 @@ class FeeRecommendation:
             "ceiling_applied": self.ceiling_applied,
             "stigmergic_influence": round(self.stigmergic_influence, 2),
             "defensive_multiplier": round(self.defensive_multiplier, 2),
+            "time_adjustment_pct": round(self.time_adjustment_pct * 100, 1),
             "confidence": round(self.confidence, 2),
             "reason": self.reason
         }
@@ -1010,6 +1034,375 @@ class MyceliumDefenseSystem:
 
 
 # =============================================================================
+# TIME-BASED FEE ADJUSTER (Phase 7.4)
+# =============================================================================
+
+@dataclass
+class TimeFeeAdjustment:
+    """Result of time-based fee calculation."""
+    channel_id: str
+    base_fee_ppm: int
+    adjusted_fee_ppm: int
+    adjustment_pct: float
+    adjustment_type: str        # "peak_increase" | "low_decrease" | "none"
+    current_hour: int           # 0-23
+    current_day: int            # 0-6 (Mon-Sun)
+    pattern_intensity: float    # Detected flow intensity 0.0-1.0
+    confidence: float           # Pattern confidence
+    reason: str                 # Human-readable explanation
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "channel_id": self.channel_id,
+            "base_fee_ppm": self.base_fee_ppm,
+            "adjusted_fee_ppm": self.adjusted_fee_ppm,
+            "adjustment_pct": round(self.adjustment_pct * 100, 1),
+            "adjustment_type": self.adjustment_type,
+            "current_hour": self.current_hour,
+            "current_day": self.current_day,
+            "pattern_intensity": round(self.pattern_intensity, 2),
+            "confidence": round(self.confidence, 2),
+            "reason": self.reason
+        }
+
+
+class TimeBasedFeeAdjuster:
+    """
+    Adjusts fees based on detected temporal patterns.
+
+    Like circadian rhythms in nature - different behavior at different times.
+    Uses anticipatory liquidity patterns to:
+    - Increase fees during detected peak hours (capture premium)
+    - Decrease fees during low-activity periods (attract flow)
+
+    Integrates with AnticipatoryLiquidityManager for pattern data.
+    """
+
+    # Day name mapping for logging
+    DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+    def __init__(self, plugin: Any, anticipatory_mgr: Any = None):
+        """
+        Initialize the time-based fee adjuster.
+
+        Args:
+            plugin: CLN plugin for logging
+            anticipatory_mgr: AnticipatoryLiquidityManager for pattern data
+        """
+        self.plugin = plugin
+        self.anticipatory_mgr = anticipatory_mgr
+        self.our_pubkey: Optional[str] = None
+
+        # Cache: channel_id -> (adjustment, timestamp)
+        self._adjustment_cache: Dict[str, Tuple[TimeFeeAdjustment, float]] = {}
+
+        # Enabled flag (can be toggled via config)
+        self.enabled = TIME_FEE_ADJUSTMENT_ENABLED
+
+    def set_our_pubkey(self, pubkey: str) -> None:
+        self.our_pubkey = pubkey
+
+    def set_anticipatory_manager(self, mgr: Any) -> None:
+        """Set or update the anticipatory liquidity manager."""
+        self.anticipatory_mgr = mgr
+
+    def _log(self, msg: str, level: str = "info") -> None:
+        if self.plugin:
+            self.plugin.log(f"cl-hive: [TimeFee] {msg}", level=level)
+
+    def _get_current_time_context(self) -> Tuple[int, int]:
+        """Get current hour (0-23) and day of week (0-6, Mon=0)."""
+        import datetime
+        try:
+            # Python 3.11+
+            now = datetime.datetime.now(datetime.UTC)
+        except AttributeError:
+            # Python 3.9-3.10
+            now = datetime.datetime.now(datetime.timezone.utc)
+        return now.hour, now.weekday()
+
+    def _get_cached_adjustment(self, channel_id: str) -> Optional[TimeFeeAdjustment]:
+        """Get cached adjustment if still valid."""
+        if channel_id not in self._adjustment_cache:
+            return None
+
+        adjustment, cached_at = self._adjustment_cache[channel_id]
+        ttl_seconds = TIME_FEE_CACHE_TTL_HOURS * 3600
+
+        if time.time() - cached_at > ttl_seconds:
+            del self._adjustment_cache[channel_id]
+            return None
+
+        # Also check if hour changed (invalidate on hour boundary)
+        current_hour, _ = self._get_current_time_context()
+        if adjustment.current_hour != current_hour:
+            del self._adjustment_cache[channel_id]
+            return None
+
+        return adjustment
+
+    def get_time_adjustment(
+        self,
+        channel_id: str,
+        base_fee: int,
+        use_cache: bool = True
+    ) -> TimeFeeAdjustment:
+        """
+        Get time-adjusted fee for a channel.
+
+        Analyzes temporal patterns to determine if current time is:
+        - Peak hours: Increase fee to capture premium
+        - Low-activity: Decrease fee to attract flow
+        - Normal: No adjustment
+
+        Args:
+            channel_id: Channel short ID
+            base_fee: Current/base fee in ppm
+            use_cache: Whether to use cached adjustments
+
+        Returns:
+            TimeFeeAdjustment with recommended fee and reasoning
+        """
+        # Check cache
+        if use_cache:
+            cached = self._get_cached_adjustment(channel_id)
+            if cached and cached.base_fee_ppm == base_fee:
+                return cached
+
+        current_hour, current_day = self._get_current_time_context()
+
+        # Default no-adjustment result
+        no_adjustment = TimeFeeAdjustment(
+            channel_id=channel_id,
+            base_fee_ppm=base_fee,
+            adjusted_fee_ppm=base_fee,
+            adjustment_pct=0.0,
+            adjustment_type="none",
+            current_hour=current_hour,
+            current_day=current_day,
+            pattern_intensity=0.5,
+            confidence=0.0,
+            reason="No time adjustment"
+        )
+
+        # Check if enabled
+        if not self.enabled:
+            return no_adjustment
+
+        # Check if anticipatory manager is available
+        if not self.anticipatory_mgr:
+            return no_adjustment
+
+        # Get patterns for this channel
+        try:
+            patterns = self.anticipatory_mgr.detect_patterns(channel_id)
+        except Exception as e:
+            self._log(f"Error detecting patterns for {channel_id}: {e}", level="debug")
+            return no_adjustment
+
+        if not patterns:
+            return no_adjustment
+
+        # Find pattern matching current time
+        matching_pattern = None
+        best_confidence = 0.0
+
+        for pattern in patterns:
+            # Check hour match (allow ±1 hour tolerance)
+            hour_match = abs(pattern.hour_of_day - current_hour) <= 1
+            if pattern.hour_of_day == 23 and current_hour == 0:
+                hour_match = True
+            if pattern.hour_of_day == 0 and current_hour == 23:
+                hour_match = True
+
+            # Check day match (if pattern is day-specific)
+            day_match = pattern.day_of_week == -1 or pattern.day_of_week == current_day
+
+            if hour_match and day_match and pattern.confidence > best_confidence:
+                matching_pattern = pattern
+                best_confidence = pattern.confidence
+
+        if not matching_pattern or best_confidence < TIME_FEE_MIN_CONFIDENCE:
+            return no_adjustment
+
+        # Determine adjustment based on pattern intensity
+        intensity = matching_pattern.intensity
+        adjustment_pct = 0.0
+        adjustment_type = "none"
+        reason_parts = []
+
+        if intensity >= TIME_FEE_PEAK_INTENSITY:
+            # Peak hours - increase fee to capture premium
+            # Scale adjustment: 70% intensity = 0%, 100% intensity = max increase
+            scale = (intensity - TIME_FEE_PEAK_INTENSITY) / (1.0 - TIME_FEE_PEAK_INTENSITY)
+            adjustment_pct = scale * TIME_FEE_MAX_INCREASE_PCT
+            adjustment_type = "peak_increase"
+            reason_parts.append(
+                f"Peak {matching_pattern.direction} hour "
+                f"({intensity:.0%} intensity, +{adjustment_pct:.1%})"
+            )
+        elif intensity <= TIME_FEE_LOW_INTENSITY:
+            # Low activity - decrease fee to attract flow
+            # Scale adjustment: 30% intensity = 0%, 0% intensity = max decrease
+            scale = (TIME_FEE_LOW_INTENSITY - intensity) / TIME_FEE_LOW_INTENSITY
+            adjustment_pct = -scale * TIME_FEE_MAX_DECREASE_PCT
+            adjustment_type = "low_decrease"
+            reason_parts.append(
+                f"Low-activity period "
+                f"({intensity:.0%} intensity, {adjustment_pct:.1%})"
+            )
+
+        # Calculate adjusted fee
+        adjusted_fee = int(base_fee * (1 + adjustment_pct))
+
+        # Enforce bounds
+        adjusted_fee = max(adjusted_fee, FLEET_FEE_FLOOR_PPM)
+        adjusted_fee = min(adjusted_fee, FLEET_FEE_CEILING_PPM)
+
+        # Add time context to reason
+        day_name = self.DAY_NAMES[current_day]
+        time_str = f"{current_hour:02d}:00 UTC {day_name}"
+        reason_parts.append(f"at {time_str}")
+
+        result = TimeFeeAdjustment(
+            channel_id=channel_id,
+            base_fee_ppm=base_fee,
+            adjusted_fee_ppm=adjusted_fee,
+            adjustment_pct=adjustment_pct,
+            adjustment_type=adjustment_type,
+            current_hour=current_hour,
+            current_day=current_day,
+            pattern_intensity=intensity,
+            confidence=best_confidence,
+            reason="; ".join(reason_parts) if reason_parts else "No time adjustment"
+        )
+
+        # Cache the result
+        self._adjustment_cache[channel_id] = (result, time.time())
+
+        if adjustment_type != "none":
+            self._log(
+                f"Time adjustment for {channel_id}: "
+                f"{base_fee} → {adjusted_fee} ppm ({result.reason})",
+                level="debug"
+            )
+
+        return result
+
+    def detect_peak_hours(self, channel_id: str) -> List[Dict[str, Any]]:
+        """
+        Detect peak routing hours for a channel.
+
+        Returns list of peak hours with their characteristics.
+
+        Args:
+            channel_id: Channel short ID
+
+        Returns:
+            List of dicts with hour info:
+            [
+                {"hour": 14, "day": -1, "intensity": 0.85, "direction": "outbound"},
+                {"hour": 15, "day": 0, "intensity": 0.78, "direction": "inbound"},
+                ...
+            ]
+        """
+        if not self.anticipatory_mgr:
+            return []
+
+        try:
+            patterns = self.anticipatory_mgr.detect_patterns(channel_id)
+        except Exception:
+            return []
+
+        peak_hours = []
+        for pattern in patterns:
+            if pattern.intensity >= TIME_FEE_PEAK_INTENSITY and \
+               pattern.confidence >= TIME_FEE_MIN_CONFIDENCE:
+                peak_hours.append({
+                    "hour": pattern.hour_of_day,
+                    "day": pattern.day_of_week,
+                    "day_name": self.DAY_NAMES[pattern.day_of_week]
+                        if pattern.day_of_week >= 0 else "Any",
+                    "intensity": round(pattern.intensity, 2),
+                    "direction": pattern.direction,
+                    "confidence": round(pattern.confidence, 2),
+                    "samples": pattern.samples
+                })
+
+        # Sort by intensity descending
+        peak_hours.sort(key=lambda x: x["intensity"], reverse=True)
+        return peak_hours
+
+    def detect_low_hours(self, channel_id: str) -> List[Dict[str, Any]]:
+        """
+        Detect low-activity hours for a channel.
+
+        Returns list of low-activity hours where fee reduction may help.
+        """
+        if not self.anticipatory_mgr:
+            return []
+
+        try:
+            patterns = self.anticipatory_mgr.detect_patterns(channel_id)
+        except Exception:
+            return []
+
+        low_hours = []
+        for pattern in patterns:
+            if pattern.intensity <= TIME_FEE_LOW_INTENSITY and \
+               pattern.confidence >= TIME_FEE_MIN_CONFIDENCE:
+                low_hours.append({
+                    "hour": pattern.hour_of_day,
+                    "day": pattern.day_of_week,
+                    "day_name": self.DAY_NAMES[pattern.day_of_week]
+                        if pattern.day_of_week >= 0 else "Any",
+                    "intensity": round(pattern.intensity, 2),
+                    "direction": pattern.direction,
+                    "confidence": round(pattern.confidence, 2),
+                    "samples": pattern.samples
+                })
+
+        # Sort by intensity ascending (lowest first)
+        low_hours.sort(key=lambda x: x["intensity"])
+        return low_hours
+
+    def get_all_adjustments(self) -> Dict[str, Any]:
+        """
+        Get current time-based adjustments for all cached channels.
+
+        Returns summary of active time-based fee adjustments.
+        """
+        current_hour, current_day = self._get_current_time_context()
+
+        active = []
+        for channel_id, (adjustment, _) in self._adjustment_cache.items():
+            if adjustment.adjustment_type != "none":
+                active.append(adjustment.to_dict())
+
+        return {
+            "enabled": self.enabled,
+            "current_hour": current_hour,
+            "current_day": current_day,
+            "current_day_name": self.DAY_NAMES[current_day],
+            "active_adjustments": len(active),
+            "adjustments": active,
+            "config": {
+                "max_increase_pct": TIME_FEE_MAX_INCREASE_PCT * 100,
+                "max_decrease_pct": TIME_FEE_MAX_DECREASE_PCT * 100,
+                "peak_threshold": TIME_FEE_PEAK_INTENSITY,
+                "low_threshold": TIME_FEE_LOW_INTENSITY,
+                "min_confidence": TIME_FEE_MIN_CONFIDENCE
+            }
+        }
+
+    def clear_cache(self) -> int:
+        """Clear adjustment cache. Returns number of entries cleared."""
+        count = len(self._adjustment_cache)
+        self._adjustment_cache.clear()
+        return count
+
+
+# =============================================================================
 # FEE COORDINATION MANAGER (Main Interface)
 # =============================================================================
 
@@ -1022,6 +1415,7 @@ class FeeCoordinationManager:
     - Adaptive fee controller
     - Stigmergic coordination
     - Mycelium defense
+    - Time-based fee adjustments (Phase 7.4)
     """
 
     def __init__(
@@ -1030,7 +1424,8 @@ class FeeCoordinationManager:
         plugin: Any,
         state_manager: Any = None,
         liquidity_coordinator: Any = None,
-        gossip_mgr: Any = None
+        gossip_mgr: Any = None,
+        anticipatory_mgr: Any = None
     ):
         self.database = database
         self.plugin = plugin
@@ -1047,6 +1442,8 @@ class FeeCoordinationManager:
         self.defense_system = MyceliumDefenseSystem(
             database, plugin, gossip_mgr
         )
+        # Phase 7.4: Time-based fee adjuster
+        self.time_adjuster = TimeBasedFeeAdjuster(plugin, anticipatory_mgr)
 
     def set_our_pubkey(self, pubkey: str) -> None:
         self.our_pubkey = pubkey
@@ -1054,6 +1451,11 @@ class FeeCoordinationManager:
         self.adaptive_controller.set_our_pubkey(pubkey)
         self.stigmergic_coord.set_our_pubkey(pubkey)
         self.defense_system.set_our_pubkey(pubkey)
+        self.time_adjuster.set_our_pubkey(pubkey)
+
+    def set_anticipatory_manager(self, mgr: Any) -> None:
+        """Set or update the anticipatory liquidity manager for time-based fees."""
+        self.time_adjuster.set_anticipatory_manager(mgr)
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -1124,7 +1526,18 @@ class FeeCoordinationManager:
             recommended_fee = int(recommended_fee * defensive_multiplier)
             reasons.append(f"defensive_{defensive_multiplier:.2f}x")
 
-        # 5. Apply floor and ceiling
+        # 5. Apply time-based adjustment (Phase 7.4)
+        time_adjustment_pct = 0.0
+        if self.time_adjuster.enabled:
+            time_adj = self.time_adjuster.get_time_adjustment(
+                channel_id, recommended_fee
+            )
+            if time_adj.adjustment_type != "none":
+                recommended_fee = time_adj.adjusted_fee_ppm
+                time_adjustment_pct = time_adj.adjustment_pct
+                reasons.append(f"time_{time_adj.adjustment_type}")
+
+        # 6. Apply floor and ceiling
         if recommended_fee < FLEET_FEE_FLOOR_PPM:
             recommended_fee = FLEET_FEE_FLOOR_PPM
             floor_applied = True
@@ -1154,6 +1567,7 @@ class FeeCoordinationManager:
             ceiling_applied=ceiling_applied,
             stigmergic_influence=stigmergic_influence,
             defensive_multiplier=defensive_multiplier,
+            time_adjustment_pct=time_adjustment_pct,
             confidence=confidence,
             reason="; ".join(reasons) if reasons else "default"
         )
@@ -1191,6 +1605,7 @@ class FeeCoordinationManager:
         markers = self.stigmergic_coord.get_all_markers()
         defense_status = self.defense_system.get_defense_status()
         pheromone_levels = self.adaptive_controller.get_all_pheromone_levels()
+        time_status = self.time_adjuster.get_all_adjustments()
 
         return {
             "corridor_assignments": len(assignments),
@@ -1199,6 +1614,41 @@ class FeeCoordinationManager:
             "pheromone_channels": len(pheromone_levels),
             "fleet_fee_floor": FLEET_FEE_FLOOR_PPM,
             "fleet_fee_ceiling": FLEET_FEE_CEILING_PPM,
+            "time_based_fees": time_status,
             "assignments": [a.to_dict() for a in assignments[:10]],  # Limit output
             "recent_markers": [m.to_dict() for m in markers[:10]]
         }
+
+    def get_time_fee_adjustment(
+        self,
+        channel_id: str,
+        base_fee: int
+    ) -> Dict[str, Any]:
+        """
+        Get time-based fee adjustment for a specific channel.
+
+        Args:
+            channel_id: Channel short ID
+            base_fee: Current base fee in ppm
+
+        Returns:
+            Dict with adjustment details
+        """
+        adjustment = self.time_adjuster.get_time_adjustment(channel_id, base_fee)
+        return adjustment.to_dict()
+
+    def get_time_fee_status(self) -> Dict[str, Any]:
+        """
+        Get time-based fee system status.
+
+        Returns overview of time-based fee adjustments and configuration.
+        """
+        return self.time_adjuster.get_all_adjustments()
+
+    def get_channel_peak_hours(self, channel_id: str) -> List[Dict[str, Any]]:
+        """Get detected peak hours for a channel."""
+        return self.time_adjuster.detect_peak_hours(channel_id)
+
+    def get_channel_low_hours(self, channel_id: str) -> List[Dict[str, Any]]:
+        """Get detected low-activity hours for a channel."""
+        return self.time_adjuster.detect_low_hours(channel_id)

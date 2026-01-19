@@ -1217,6 +1217,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Anticipatory liquidity manager initialized (Phase 7.1)")
 
+    # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
+    if fee_coordination_mgr:
+        fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
+        plugin.log("cl-hive: Time-based fee adjustment enabled (Phase 7.4)")
+
     # Link yield optimization modules to Planner (Slime mold coordination)
     # These enable the planner to avoid redundant opens and prioritize high-value corridors
     planner.set_cooperation_modules(
@@ -8955,6 +8960,94 @@ def hive_anticipatory_status(plugin: Plugin):
         return {"error": "Anticipatory liquidity manager not initialized"}
 
     return anticipatory_liquidity_mgr.get_status()
+
+
+# =============================================================================
+# TIME-BASED FEE RPC METHODS (Phase 7.4)
+# =============================================================================
+
+@plugin.method("hive-time-fee-status")
+def hive_time_fee_status(plugin: Plugin):
+    """
+    Get time-based fee adjustment status.
+
+    Returns current time context, active adjustments, and configuration.
+
+    Returns:
+        Dict with time-based fee status.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    return fee_coordination_mgr.get_time_fee_status()
+
+
+@plugin.method("hive-time-fee-adjustment")
+def hive_time_fee_adjustment(plugin: Plugin, channel_id: str, base_fee: int = 250):
+    """
+    Get time-based fee adjustment for a specific channel.
+
+    Analyzes temporal patterns to determine optimal fee for current time.
+
+    Args:
+        channel_id: Channel short ID (e.g., "123x456x0")
+        base_fee: Current/base fee in ppm (default: 250)
+
+    Returns:
+        Dict with adjustment details including recommended fee.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    return fee_coordination_mgr.get_time_fee_adjustment(channel_id, base_fee)
+
+
+@plugin.method("hive-time-peak-hours")
+def hive_time_peak_hours(plugin: Plugin, channel_id: str):
+    """
+    Get detected peak routing hours for a channel.
+
+    Returns hours with above-average routing volume based on historical patterns.
+
+    Args:
+        channel_id: Channel short ID
+
+    Returns:
+        List of peak hour details with intensity and confidence.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    peak_hours = fee_coordination_mgr.get_channel_peak_hours(channel_id)
+    return {
+        "channel_id": channel_id,
+        "peak_hours": peak_hours,
+        "count": len(peak_hours)
+    }
+
+
+@plugin.method("hive-time-low-hours")
+def hive_time_low_hours(plugin: Plugin, channel_id: str):
+    """
+    Get detected low-activity hours for a channel.
+
+    Returns hours with below-average routing volume where fee reduction may help.
+
+    Args:
+        channel_id: Channel short ID
+
+    Returns:
+        List of low-activity hour details with intensity and confidence.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    low_hours = fee_coordination_mgr.get_channel_low_hours(channel_id)
+    return {
+        "channel_id": channel_id,
+        "low_hours": low_hours,
+        "count": len(low_hours)
+    }
 
 
 # =============================================================================
