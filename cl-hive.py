@@ -87,6 +87,7 @@ from modules.fee_coordination import FeeCoordinationManager
 from modules.cost_reduction import CostReductionManager
 from modules.channel_rationalization import RationalizationManager
 from modules.strategic_positioning import StrategicPositioningManager
+from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -299,6 +300,7 @@ fee_coordination_mgr: Optional[FeeCoordinationManager] = None
 cost_reduction_mgr: Optional[CostReductionManager] = None
 rationalization_mgr: Optional[RationalizationManager] = None
 strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
+anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -1204,6 +1206,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     strategic_positioning_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Strategic positioning manager initialized (Phase 5)")
+
+    # Initialize Anticipatory Liquidity Manager (Phase 7.1 - Anticipatory Liquidity)
+    global anticipatory_liquidity_mgr
+    anticipatory_liquidity_mgr = AnticipatoryLiquidityManager(
+        database=database,
+        plugin=safe_plugin,
+        state_manager=state_manager,
+        our_id=our_pubkey
+    )
+    plugin.log("cl-hive: Anticipatory liquidity manager initialized (Phase 7.1)")
 
     # Link yield optimization modules to Planner (Slime mold coordination)
     # These enable the planner to avoid redundant opens and prioritize high-value corridors
@@ -8706,6 +8718,202 @@ def hive_join(plugin: Plugin, ticket: str, peer_id: str = None):
         }
     except Exception as e:
         return {"error": f"Failed to send HELLO: {e}"}
+
+
+# =============================================================================
+# ANTICIPATORY LIQUIDITY RPC METHODS (Phase 7.1)
+# =============================================================================
+
+@plugin.method("hive-record-flow")
+def hive_record_flow(
+    plugin: Plugin,
+    channel_id: str,
+    inbound_sats: int,
+    outbound_sats: int,
+    timestamp: int = None
+):
+    """
+    Record a flow observation for pattern detection.
+
+    Called periodically (e.g., hourly) to build flow history for
+    temporal pattern detection and predictive rebalancing.
+
+    Args:
+        channel_id: Channel SCID
+        inbound_sats: Satoshis received in this period
+        outbound_sats: Satoshis sent in this period
+        timestamp: Unix timestamp (defaults to now)
+
+    Returns:
+        Dict with recording result.
+    """
+    if not anticipatory_liquidity_mgr:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    anticipatory_liquidity_mgr.record_flow_sample(
+        channel_id=channel_id,
+        inbound_sats=inbound_sats,
+        outbound_sats=outbound_sats,
+        timestamp=timestamp
+    )
+
+    return {
+        "status": "ok",
+        "channel_id": channel_id,
+        "net_flow": inbound_sats - outbound_sats
+    }
+
+
+@plugin.method("hive-detect-patterns")
+def hive_detect_patterns(plugin: Plugin, channel_id: str = None, force_refresh: bool = False):
+    """
+    Detect temporal patterns in channel flow.
+
+    Analyzes historical flow data to find recurring patterns by:
+    - Hour of day (e.g., "high outbound 14:00-17:00 UTC")
+    - Day of week (e.g., "high inbound on weekends")
+    - Combined patterns (e.g., "Monday mornings drain")
+
+    Args:
+        channel_id: Specific channel to analyze (None for all)
+        force_refresh: Force recalculation even if cached
+
+    Returns:
+        Dict with detected patterns.
+    """
+    if not anticipatory_liquidity_mgr:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    if channel_id:
+        patterns = anticipatory_liquidity_mgr.detect_patterns(
+            channel_id, force_refresh=force_refresh
+        )
+        return {
+            "channel_id": channel_id,
+            "pattern_count": len(patterns),
+            "patterns": [p.to_dict() for p in patterns]
+        }
+    else:
+        # Return summary for all channels
+        summary = anticipatory_liquidity_mgr.get_patterns_summary()
+        return summary
+
+
+@plugin.method("hive-predict-liquidity")
+def hive_predict_liquidity(
+    plugin: Plugin,
+    channel_id: str,
+    hours_ahead: int = 12,
+    current_local_pct: float = None,
+    capacity_sats: int = None
+):
+    """
+    Predict channel liquidity state N hours from now.
+
+    Combines velocity analysis with temporal patterns to predict
+    future balance and recommend preemptive actions.
+
+    Args:
+        channel_id: Channel SCID
+        hours_ahead: Hours to predict (default: 12)
+        current_local_pct: Current local balance % (fetched if not provided)
+        capacity_sats: Channel capacity (fetched if not provided)
+
+    Returns:
+        Dict with liquidity prediction including risks and recommendations.
+    """
+    if not anticipatory_liquidity_mgr:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    prediction = anticipatory_liquidity_mgr.predict_liquidity(
+        channel_id=channel_id,
+        hours_ahead=hours_ahead,
+        current_local_pct=current_local_pct,
+        capacity_sats=capacity_sats
+    )
+
+    if not prediction:
+        return {
+            "error": "no_data",
+            "channel_id": channel_id,
+            "reason": "Insufficient flow history for prediction"
+        }
+
+    return prediction.to_dict()
+
+
+@plugin.method("hive-anticipatory-predictions")
+def hive_anticipatory_predictions(
+    plugin: Plugin,
+    hours_ahead: int = 12,
+    min_risk: float = 0.3
+):
+    """
+    Get liquidity predictions for all channels.
+
+    Returns channels with significant depletion or saturation risk,
+    enabling proactive rebalancing before problems occur.
+
+    Args:
+        hours_ahead: Prediction horizon in hours (default: 12)
+        min_risk: Minimum risk threshold to include (default: 0.3)
+
+    Returns:
+        Dict with predictions for at-risk channels.
+    """
+    if not anticipatory_liquidity_mgr:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    predictions = anticipatory_liquidity_mgr.get_all_predictions(
+        hours_ahead=hours_ahead,
+        min_risk=min_risk
+    )
+
+    return {
+        "hours_ahead": hours_ahead,
+        "min_risk": min_risk,
+        "prediction_count": len(predictions),
+        "predictions": [p.to_dict() for p in predictions]
+    }
+
+
+@plugin.method("hive-fleet-anticipation")
+def hive_fleet_anticipation(plugin: Plugin):
+    """
+    Get fleet-wide anticipatory positioning recommendations.
+
+    Coordinates predictions across hive members to avoid competing
+    for the same rebalance routes.
+
+    Returns:
+        Dict with fleet coordination recommendations.
+    """
+    if not anticipatory_liquidity_mgr:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    recommendations = anticipatory_liquidity_mgr.get_fleet_recommendations()
+
+    return {
+        "recommendation_count": len(recommendations),
+        "recommendations": [r.to_dict() for r in recommendations]
+    }
+
+
+@plugin.method("hive-anticipatory-status")
+def hive_anticipatory_status(plugin: Plugin):
+    """
+    Get anticipatory liquidity manager status.
+
+    Returns operational status and configuration for diagnostics.
+
+    Returns:
+        Dict with manager status.
+    """
+    if not anticipatory_liquidity_mgr:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    return anticipatory_liquidity_mgr.get_status()
+
 
 # =============================================================================
 # MAIN

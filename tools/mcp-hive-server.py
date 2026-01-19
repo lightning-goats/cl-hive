@@ -562,6 +562,89 @@ async def list_tools() -> List[Tool]:
             }
         ),
         # =====================================================================
+        # Anticipatory Liquidity Tools (Phase 7.1)
+        # =====================================================================
+        Tool(
+            name="hive_anticipatory_status",
+            description="Get anticipatory liquidity manager status. Shows pattern detection state, prediction cache, and configuration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_detect_patterns",
+            description="Detect temporal patterns in channel flow. Analyzes historical data to find recurring patterns by hour-of-day and day-of-week that can predict future liquidity needs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Specific channel ID (optional, omit for summary of all patterns)"
+                    },
+                    "force_refresh": {
+                        "type": "boolean",
+                        "description": "Force recalculation even if cached (default: false)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_predict_liquidity",
+            description="Predict channel liquidity state N hours from now. Combines velocity analysis with temporal patterns to predict future balance and recommend preemptive rebalancing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID to predict"
+                    },
+                    "hours_ahead": {
+                        "type": "integer",
+                        "description": "Hours to predict ahead (default: 12)"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="hive_anticipatory_predictions",
+            description="Get liquidity predictions for all channels at risk. Returns channels with significant depletion or saturation risk, enabling proactive rebalancing before problems occur.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "hours_ahead": {
+                        "type": "integer",
+                        "description": "Prediction horizon in hours (default: 12)"
+                    },
+                    "min_risk": {
+                        "type": "number",
+                        "description": "Minimum risk threshold 0.0-1.0 to include (default: 0.3)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
         # cl-revenue-ops Tools
         # =====================================================================
         Tool(
@@ -1732,6 +1815,15 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_splice_recommendations(arguments)
         elif name == "hive_liquidity_intelligence":
             result = await handle_liquidity_intelligence(arguments)
+        # Anticipatory Liquidity tools (Phase 7.1)
+        elif name == "hive_anticipatory_status":
+            result = await handle_anticipatory_status(arguments)
+        elif name == "hive_detect_patterns":
+            result = await handle_detect_patterns(arguments)
+        elif name == "hive_predict_liquidity":
+            result = await handle_predict_liquidity(arguments)
+        elif name == "hive_anticipatory_predictions":
+            result = await handle_anticipatory_predictions(arguments)
         # cl-revenue-ops tools
         elif name == "revenue_status":
             result = await handle_revenue_status(arguments)
@@ -2233,6 +2325,143 @@ async def handle_liquidity_intelligence(args: Dict) -> Dict:
                 f"{depleted_count} members have depleted channels. "
                 "Fleet may benefit from coordinated fee adjustments."
             )
+
+    return result
+
+
+# =============================================================================
+# Anticipatory Liquidity Handlers (Phase 7.1)
+# =============================================================================
+
+async def handle_anticipatory_status(args: Dict) -> Dict:
+    """
+    Get anticipatory liquidity manager status.
+
+    Shows pattern detection state, prediction cache, and configuration.
+    """
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-anticipatory-status", {})
+
+
+async def handle_detect_patterns(args: Dict) -> Dict:
+    """
+    Detect temporal patterns in channel flow.
+
+    Analyzes historical flow data to find recurring patterns by
+    hour-of-day and day-of-week that can predict future liquidity needs.
+    """
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    force_refresh = args.get("force_refresh", False)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {"force_refresh": force_refresh}
+    if channel_id:
+        params["channel_id"] = channel_id
+
+    result = await node.call("hive-detect-patterns", params)
+
+    # Add helpful context
+    if result.get("patterns"):
+        patterns = result["patterns"]
+        outbound_patterns = [p for p in patterns if p.get("direction") == "outbound"]
+        inbound_patterns = [p for p in patterns if p.get("direction") == "inbound"]
+        if outbound_patterns:
+            result["ai_note"] = (
+                f"Detected {len(outbound_patterns)} outbound (drain) patterns and "
+                f"{len(inbound_patterns)} inbound patterns. "
+                "Use these to anticipate rebalancing needs before they become urgent."
+            )
+
+    return result
+
+
+async def handle_predict_liquidity(args: Dict) -> Dict:
+    """
+    Predict channel liquidity state N hours from now.
+
+    Combines velocity analysis with temporal patterns to predict
+    future balance and recommend preemptive rebalancing.
+    """
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    hours_ahead = args.get("hours_ahead", 12)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    result = await node.call("hive-predict-liquidity", {
+        "channel_id": channel_id,
+        "hours_ahead": hours_ahead
+    })
+
+    # Add actionable recommendations
+    if result.get("recommended_action") == "preemptive_rebalance":
+        urgency = result.get("urgency", "low")
+        hours = result.get("hours_to_critical")
+        if hours:
+            result["ai_recommendation"] = (
+                f"Urgency: {urgency}. Predicted to hit critical state in ~{hours:.0f} hours. "
+                "Consider rebalancing now while fees are lower."
+            )
+    elif result.get("recommended_action") == "fee_adjustment":
+        result["ai_recommendation"] = (
+            "Fee adjustment recommended to attract/repel flow before imbalance worsens."
+        )
+
+    return result
+
+
+async def handle_anticipatory_predictions(args: Dict) -> Dict:
+    """
+    Get liquidity predictions for all channels at risk.
+
+    Returns channels with significant depletion or saturation risk,
+    enabling proactive rebalancing before problems occur.
+    """
+    node_name = args.get("node")
+    hours_ahead = args.get("hours_ahead", 12)
+    min_risk = args.get("min_risk", 0.3)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-anticipatory-predictions", {
+        "hours_ahead": hours_ahead,
+        "min_risk": min_risk
+    })
+
+    # Summarize findings
+    if result.get("predictions"):
+        predictions = result["predictions"]
+        critical = [p for p in predictions if p.get("urgency") in ["critical", "urgent"]]
+        preemptive = [p for p in predictions if p.get("urgency") == "preemptive"]
+
+        if critical:
+            result["ai_summary"] = (
+                f"{len(critical)} channels need urgent attention (depleting/saturating soon). "
+                f"{len(preemptive)} channels are in preemptive window (good time to rebalance)."
+            )
+        elif preemptive:
+            result["ai_summary"] = (
+                f"No urgent issues. {len(preemptive)} channels in preemptive window - "
+                "ideal time to rebalance at lower cost."
+            )
+        else:
+            result["ai_summary"] = "All channels stable. No anticipatory action needed."
 
     return result
 

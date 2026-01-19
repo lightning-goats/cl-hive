@@ -708,6 +708,59 @@ class HiveDatabase:
             "ON pool_distributions(period)"
         )
 
+        # =====================================================================
+        # FLOW SAMPLES TABLE (Phase 7.1 - Anticipatory Liquidity)
+        # =====================================================================
+        # Stores hourly flow samples for temporal pattern detection
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS flow_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                day_of_week INTEGER NOT NULL,
+                inbound_sats INTEGER NOT NULL DEFAULT 0,
+                outbound_sats INTEGER NOT NULL DEFAULT 0,
+                net_flow_sats INTEGER NOT NULL DEFAULT 0,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_flow_samples_channel_ts "
+            "ON flow_samples(channel_id, timestamp DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_flow_samples_hour "
+            "ON flow_samples(hour)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_flow_samples_day "
+            "ON flow_samples(day_of_week)"
+        )
+
+        # =====================================================================
+        # TEMPORAL PATTERNS TABLE (Phase 7.1 - Anticipatory Liquidity)
+        # =====================================================================
+        # Stores detected temporal patterns for liquidity prediction
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS temporal_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                hour_of_day INTEGER,
+                day_of_week INTEGER,
+                direction TEXT NOT NULL,
+                intensity REAL NOT NULL DEFAULT 1.0,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                samples INTEGER NOT NULL DEFAULT 0,
+                avg_flow_sats INTEGER NOT NULL DEFAULT 0,
+                detected_at INTEGER NOT NULL,
+                UNIQUE(channel_id, hour_of_day, day_of_week)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_temporal_patterns_channel "
+            "ON temporal_patterns(channel_id)"
+        )
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -3772,3 +3825,237 @@ class HiveDatabase:
             end = start + datetime.timedelta(days=1)
 
         return (int(start.timestamp()), int(end.timestamp()))
+
+    # =========================================================================
+    # FLOW SAMPLES OPERATIONS (Phase 7.1 - Anticipatory Liquidity)
+    # =========================================================================
+
+    def record_flow_sample(
+        self,
+        channel_id: str,
+        hour: int,
+        day_of_week: int,
+        inbound_sats: int,
+        outbound_sats: int,
+        net_flow_sats: int,
+        timestamp: int
+    ) -> bool:
+        """
+        Record a flow sample for pattern analysis.
+
+        Args:
+            channel_id: Channel SCID
+            hour: Hour of day (0-23)
+            day_of_week: Day of week (0=Monday, 6=Sunday)
+            inbound_sats: Satoshis received
+            outbound_sats: Satoshis sent
+            net_flow_sats: Net flow (inbound - outbound)
+            timestamp: Unix timestamp
+
+        Returns:
+            True if recorded successfully
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT INTO flow_samples
+                (channel_id, hour, day_of_week, inbound_sats, outbound_sats,
+                 net_flow_sats, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (channel_id, hour, day_of_week, inbound_sats, outbound_sats,
+                  net_flow_sats, timestamp))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"Failed to record flow sample: {e}",
+                level="debug"
+            )
+            return False
+
+    def get_flow_samples(
+        self,
+        channel_id: str,
+        days: int = 14
+    ) -> List[Dict[str, Any]]:
+        """
+        Get flow samples for a channel.
+
+        Args:
+            channel_id: Channel SCID
+            days: Number of days of history to retrieve
+
+        Returns:
+            List of flow sample dicts
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days * 24 * 3600)
+
+        rows = conn.execute("""
+            SELECT * FROM flow_samples
+            WHERE channel_id = ? AND timestamp > ?
+            ORDER BY timestamp DESC
+        """, (channel_id, cutoff)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_all_flow_samples(
+        self,
+        days: int = 14
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all flow samples within timeframe.
+
+        Args:
+            days: Number of days of history to retrieve
+
+        Returns:
+            List of flow sample dicts
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days * 24 * 3600)
+
+        rows = conn.execute("""
+            SELECT * FROM flow_samples
+            WHERE timestamp > ?
+            ORDER BY timestamp DESC
+        """, (cutoff,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def prune_old_flow_samples(self, days_to_keep: int = 30) -> int:
+        """
+        Remove old flow samples to limit database growth.
+
+        Args:
+            days_to_keep: Days of samples to retain
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days_to_keep * 24 * 3600)
+
+        result = conn.execute("""
+            DELETE FROM flow_samples
+            WHERE timestamp < ?
+        """, (cutoff,))
+
+        deleted = result.rowcount
+        if deleted > 0:
+            self.plugin.log(
+                f"Pruned {deleted} old flow samples",
+                level="debug"
+            )
+        return deleted
+
+    # =========================================================================
+    # TEMPORAL PATTERNS OPERATIONS (Phase 7.1 - Anticipatory Liquidity)
+    # =========================================================================
+
+    def save_temporal_pattern(
+        self,
+        channel_id: str,
+        hour_of_day: Optional[int],
+        day_of_week: Optional[int],
+        direction: str,
+        intensity: float,
+        confidence: float,
+        samples: int,
+        avg_flow_sats: int,
+        detected_at: int
+    ) -> bool:
+        """
+        Save or update a temporal pattern.
+
+        Args:
+            channel_id: Channel SCID
+            hour_of_day: Hour (0-23) or None for all hours
+            day_of_week: Day (0-6) or None for all days
+            direction: "inbound", "outbound", or "balanced"
+            intensity: Relative intensity (1.0 = average)
+            confidence: Pattern confidence (0.0-1.0)
+            samples: Number of observations
+            avg_flow_sats: Average flow in this window
+            detected_at: Detection timestamp
+
+        Returns:
+            True if saved successfully
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT INTO temporal_patterns
+                (channel_id, hour_of_day, day_of_week, direction, intensity,
+                 confidence, samples, avg_flow_sats, detected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id, hour_of_day, day_of_week)
+                DO UPDATE SET
+                    direction = excluded.direction,
+                    intensity = excluded.intensity,
+                    confidence = excluded.confidence,
+                    samples = excluded.samples,
+                    avg_flow_sats = excluded.avg_flow_sats,
+                    detected_at = excluded.detected_at
+            """, (channel_id, hour_of_day, day_of_week, direction, intensity,
+                  confidence, samples, avg_flow_sats, detected_at))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"Failed to save temporal pattern: {e}",
+                level="debug"
+            )
+            return False
+
+    def get_temporal_patterns(
+        self,
+        channel_id: str = None,
+        min_confidence: float = 0.5
+    ) -> List[Dict[str, Any]]:
+        """
+        Get temporal patterns, optionally filtered by channel.
+
+        Args:
+            channel_id: Filter by channel (None for all)
+            min_confidence: Minimum confidence threshold
+
+        Returns:
+            List of pattern dicts
+        """
+        conn = self._get_connection()
+
+        if channel_id:
+            rows = conn.execute("""
+                SELECT * FROM temporal_patterns
+                WHERE channel_id = ? AND confidence >= ?
+                ORDER BY confidence DESC
+            """, (channel_id, min_confidence)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM temporal_patterns
+                WHERE confidence >= ?
+                ORDER BY confidence DESC
+            """, (min_confidence,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def clear_temporal_patterns(self, channel_id: str = None) -> int:
+        """
+        Clear temporal patterns, optionally for a specific channel.
+
+        Args:
+            channel_id: Channel to clear (None for all)
+
+        Returns:
+            Number of patterns deleted
+        """
+        conn = self._get_connection()
+
+        if channel_id:
+            result = conn.execute("""
+                DELETE FROM temporal_patterns
+                WHERE channel_id = ?
+            """, (channel_id,))
+        else:
+            result = conn.execute("DELETE FROM temporal_patterns")
+
+        return result.rowcount
