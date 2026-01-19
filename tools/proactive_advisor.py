@@ -20,7 +20,7 @@ Usage:
     from proactive_advisor import ProactiveAdvisor
 
     advisor = ProactiveAdvisor(mcp_client, db)
-    result = await advisor.run_cycle("Hive-Nexus-01")
+    result = await advisor.run_cycle("mainnet")
 """
 
 import asyncio

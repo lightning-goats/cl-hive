@@ -4275,9 +4275,19 @@ def _get_proactive_advisor():
 
             # Create a simple MCP client wrapper
             class MCPClientWrapper:
+                # Map tool names to handler names (some handlers drop the prefix)
+                TOOL_TO_HANDLER = {
+                    "hive_node_info": "handle_node_info",
+                    "hive_channels": "handle_channels",
+                    "hive_status": "handle_hive_status",
+                    "hive_pending_actions": "handle_pending_actions",
+                    "hive_set_fees": "handle_set_fees",
+                }
+
                 async def call(self, tool_name, params):
                     # Route to internal handlers
-                    handler = globals().get(f"handle_{tool_name}")
+                    handler_name = self.TOOL_TO_HANDLER.get(tool_name, f"handle_{tool_name}")
+                    handler = globals().get(handler_name)
                     if handler:
                         return await handler(params)
                     return {"error": f"Unknown tool: {tool_name}"}
