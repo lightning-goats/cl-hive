@@ -8077,14 +8077,18 @@ def hive_deposit_marker(
 
 
 @plugin.method("hive-defense-status")
-def hive_defense_status(plugin: Plugin):
+def hive_defense_status(plugin: Plugin, peer_id: str = None):
     """
     Get mycelium defense system status.
 
+    Args:
+        peer_id: Optional peer to check for threats (returns peer_threat info)
+
     Returns:
         Dict with active warnings and defensive fee adjustments.
+        If peer_id specified, includes peer_threat with is_threat, threat_type, etc.
     """
-    return rpc_defense_status(_get_hive_context())
+    return rpc_defense_status(_get_hive_context(), peer_id=peer_id)
 
 
 @plugin.method("hive-broadcast-warning")

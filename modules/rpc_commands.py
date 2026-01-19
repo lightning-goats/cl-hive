@@ -2191,23 +2191,50 @@ def deposit_marker(
         return {"error": f"Failed to deposit marker: {e}"}
 
 
-def defense_status(ctx: HiveContext) -> Dict[str, Any]:
+def defense_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
     """
     Get mycelium defense system status.
 
     Shows active warnings and defensive fee adjustments.
+    If peer_id is specified, includes peer_threat info for that peer.
 
     Args:
         ctx: HiveContext
+        peer_id: Optional peer to check for threats
 
     Returns:
         Dict with defense system status.
+        If peer_id specified, includes peer_threat with is_threat, threat_type, etc.
     """
     if not ctx.fee_coordination_mgr:
         return {"error": "Fee coordination not initialized"}
 
     try:
-        return ctx.fee_coordination_mgr.defense_system.get_defense_status()
+        result = ctx.fee_coordination_mgr.defense_system.get_defense_status()
+
+        # If peer_id specified, add peer-specific threat info
+        if peer_id:
+            peer_threat = {
+                "is_threat": False,
+                "threat_type": None,
+                "severity": 0.0,
+                "defensive_multiplier": 1.0
+            }
+
+            # Check if this peer has any active warnings
+            for warning in result.get("active_warnings", []):
+                if warning.get("peer_id") == peer_id:
+                    peer_threat = {
+                        "is_threat": True,
+                        "threat_type": warning.get("threat_type"),
+                        "severity": warning.get("severity", 0.5),
+                        "defensive_multiplier": warning.get("defensive_multiplier", 1.0)
+                    }
+                    break
+
+            result["peer_threat"] = peer_threat
+
+        return result
 
     except Exception as e:
         return {"error": f"Failed to get defense status: {e}"}
