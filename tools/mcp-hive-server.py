@@ -491,6 +491,77 @@ async def list_tools() -> List[Tool]:
             }
         ),
         # =====================================================================
+        # Splice Coordination Tools (Phase 3)
+        # =====================================================================
+        Tool(
+            name="hive_splice_check",
+            description="Check if a splice operation is safe for fleet connectivity. SAFETY CHECK ONLY - each node manages its own funds. Use before splice-out to ensure fleet connectivity is maintained.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "External peer being spliced from/to"
+                    },
+                    "splice_type": {
+                        "type": "string",
+                        "enum": ["splice_in", "splice_out"],
+                        "description": "Type of splice operation"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount to splice in/out (satoshis)"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional specific channel ID"
+                    }
+                },
+                "required": ["node", "peer_id", "splice_type", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="hive_splice_recommendations",
+            description="Get splice recommendations for a specific peer. Returns info about fleet connectivity and safe splice amounts. INFORMATION ONLY - helps make informed splice decisions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "External peer to analyze"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_liquidity_intelligence",
+            description="Get fleet liquidity intelligence for coordinated decisions. Information sharing only - shows which members need what, enabling coordinated fee/rebalance decisions. No fund movement between nodes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "needs"],
+                        "description": "Query type: 'status' for overview, 'needs' for fleet liquidity needs"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
         # cl-revenue-ops Tools
         # =====================================================================
         Tool(
@@ -1100,6 +1171,13 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_governance_mode(arguments)
         elif name == "hive_expansion_mode":
             result = await handle_expansion_mode(arguments)
+        # Splice coordination tools
+        elif name == "hive_splice_check":
+            result = await handle_splice_check(arguments)
+        elif name == "hive_splice_recommendations":
+            result = await handle_splice_recommendations(arguments)
+        elif name == "hive_liquidity_intelligence":
+            result = await handle_liquidity_intelligence(arguments)
         # cl-revenue-ops tools
         elif name == "revenue_status":
             result = await handle_revenue_status(arguments)
@@ -1417,6 +1495,108 @@ async def handle_expansion_mode(args: Dict) -> Dict:
             "expansions_enabled": planner.get("expansions_enabled", False),
             "max_feerate_perkb": planner.get("max_expansion_feerate_perkb", 5000)
         }
+
+
+# =============================================================================
+# Splice Coordination Handlers (Phase 3)
+# =============================================================================
+
+async def handle_splice_check(args: Dict) -> Dict:
+    """
+    Check if a splice operation is safe for fleet connectivity.
+
+    SAFETY CHECK ONLY - each node manages its own funds.
+    Returns safety assessment with fleet capacity analysis.
+    """
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    splice_type = args.get("splice_type")
+    amount_sats = args.get("amount_sats")
+    channel_id = args.get("channel_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {
+        "peer_id": peer_id,
+        "splice_type": splice_type,
+        "amount_sats": amount_sats
+    }
+    if channel_id:
+        params["channel_id"] = channel_id
+
+    result = await node.call("hive-splice-check", params)
+
+    # Add context for AI advisor
+    if result.get("safety") == "blocked":
+        result["ai_recommendation"] = (
+            "DO NOT proceed with this splice - it would break fleet connectivity. "
+            "Another member should open a channel to this peer first."
+        )
+    elif result.get("safety") == "coordinate":
+        result["ai_recommendation"] = (
+            "Consider delaying this splice to allow fleet coordination. "
+            "Fleet connectivity would be reduced but not broken."
+        )
+    else:
+        result["ai_recommendation"] = "Safe to proceed with this splice operation."
+
+    return result
+
+
+async def handle_splice_recommendations(args: Dict) -> Dict:
+    """
+    Get splice recommendations for a specific peer.
+
+    Returns fleet connectivity info and safe splice amounts.
+    INFORMATION ONLY - helps make informed splice decisions.
+    """
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-splice-recommendations", {"peer_id": peer_id})
+
+
+async def handle_liquidity_intelligence(args: Dict) -> Dict:
+    """
+    Get fleet liquidity intelligence for coordinated decisions.
+
+    Information sharing only - no fund movement between nodes.
+    Shows fleet liquidity state and needs for coordination.
+    """
+    node_name = args.get("node")
+    action = args.get("action", "status")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-liquidity-state", {"action": action})
+
+    # Add context about what this data means
+    if action == "needs" and result.get("fleet_needs"):
+        needs = result["fleet_needs"]
+        high_priority = [n for n in needs if n.get("severity") == "high"]
+        if high_priority:
+            result["ai_note"] = (
+                f"{len(high_priority)} fleet members have high-priority liquidity needs. "
+                "Consider fee adjustments to help direct flow to struggling members."
+            )
+    elif action == "status":
+        summary = result.get("fleet_summary", {})
+        depleted_count = summary.get("members_with_depleted_channels", 0)
+        if depleted_count > 0:
+            result["ai_note"] = (
+                f"{depleted_count} members have depleted channels. "
+                "Fleet may benefit from coordinated fee adjustments."
+            )
+
+    return result
 
 
 # =============================================================================

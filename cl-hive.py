@@ -77,6 +77,7 @@ from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
+from modules.splice_coordinator import SpliceCoordinator
 from modules.health_aggregator import HealthScoreAggregator, HealthTier
 from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
@@ -240,6 +241,7 @@ coop_expansion: Optional[CooperativeExpansionManager] = None
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
 health_aggregator: Optional[HealthScoreAggregator] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
+splice_coord: Optional[SpliceCoordinator] = None
 routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
 our_pubkey: Optional[str] = None
@@ -1018,6 +1020,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         fee_intel_mgr=fee_intel_mgr
     )
     plugin.log("cl-hive: Liquidity coordinator initialized")
+
+    # Initialize Splice Coordinator (Phase 3 - Splice Coordination)
+    global splice_coord
+    splice_coord = SpliceCoordinator(
+        database=database,
+        plugin=safe_plugin,
+        state_manager=state_manager
+    )
+    plugin.log("cl-hive: Splice coordinator initialized")
 
     # Initialize Routing Map (Phase 7.4 - Routing Intelligence)
     global routing_map
@@ -6787,6 +6798,97 @@ def hive_check_rebalance_conflict(plugin: Plugin, peer_id: str):
         return {"error": "Liquidity coordinator not initialized"}
 
     return liquidity_coord.check_rebalancing_conflict(peer_id)
+
+
+@plugin.method("hive-splice-check")
+def hive_splice_check(
+    plugin: Plugin,
+    peer_id: str,
+    splice_type: str,
+    amount_sats: int,
+    channel_id: str = None
+):
+    """
+    Check if a splice operation is safe for fleet connectivity.
+
+    SAFETY CHECK ONLY - no fund movement between nodes.
+    Each node manages its own splices. This is advisory.
+
+    Use this before performing splice-out to ensure fleet connectivity
+    is maintained. Splice-in is always safe (increases capacity).
+
+    Args:
+        peer_id: External peer being spliced from/to
+        splice_type: "splice_in" or "splice_out"
+        amount_sats: Amount to splice in/out
+        channel_id: Optional specific channel ID
+
+    Returns for splice_out:
+        {
+            "safety": "safe" | "coordinate" | "blocked",
+            "reason": str,
+            "can_proceed": bool,
+            "fleet_capacity": int,
+            "new_fleet_capacity": int,
+            "fleet_share": float,
+            "new_share": float,
+            "recommendation": str (if not safe)
+        }
+
+    Returns for splice_in:
+        {"safety": "safe", "reason": "Splice-in always safe"}
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not splice_coord:
+        return {"error": "Splice coordinator not initialized"}
+
+    if splice_type == "splice_in":
+        return splice_coord.check_splice_in_safety(peer_id, amount_sats)
+    elif splice_type == "splice_out":
+        return splice_coord.check_splice_out_safety(peer_id, amount_sats, channel_id)
+    else:
+        return {"error": f"Unknown splice_type: {splice_type}, use 'splice_in' or 'splice_out'"}
+
+
+@plugin.method("hive-splice-recommendations")
+def hive_splice_recommendations(plugin: Plugin, peer_id: str):
+    """
+    Get splice recommendations for a specific peer.
+
+    Returns info about fleet connectivity and safe splice amounts.
+    INFORMATION ONLY - helps nodes make informed splice decisions.
+
+    Args:
+        peer_id: External peer to analyze
+
+    Returns:
+        {
+            "peer_id": str,
+            "fleet_capacity": int,
+            "our_capacity": int,
+            "other_member_capacity": int,
+            "safe_splice_out_amount": int,
+            "has_fleet_coverage": bool,
+            "recommendations": [str]
+        }
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not splice_coord:
+        return {"error": "Splice coordinator not initialized"}
+
+    return splice_coord.get_splice_recommendations(peer_id)
 
 
 @plugin.method("hive-set-mode")
