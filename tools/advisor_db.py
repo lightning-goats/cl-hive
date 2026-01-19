@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Database Schema
 # =============================================================================
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 -- Schema version tracking
@@ -237,6 +237,75 @@ CREATE TABLE IF NOT EXISTS goat_feeder_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_goat_feeder_time ON goat_feeder_snapshots(timestamp);
 CREATE INDEX IF NOT EXISTS idx_goat_feeder_node ON goat_feeder_snapshots(node_name, timestamp);
+
+-- =============================================================================
+-- Proactive Advisor Tables (Schema Version 4)
+-- =============================================================================
+
+-- Goals for the advisor to pursue
+CREATE TABLE IF NOT EXISTS advisor_goals (
+    goal_id TEXT PRIMARY KEY,
+    goal_type TEXT NOT NULL,           -- 'profitability', 'routing_volume', 'channel_health'
+    target_metric TEXT NOT NULL,       -- e.g., 'roc_pct', 'underwater_pct'
+    current_value REAL,
+    target_value REAL,
+    deadline_days INTEGER,
+    created_at INTEGER,
+    priority INTEGER,                  -- 1-5
+    checkpoints TEXT,                  -- JSON array of {timestamp, value, notes}
+    status TEXT DEFAULT 'active'       -- 'active', 'achieved', 'failed', 'abandoned'
+);
+CREATE INDEX IF NOT EXISTS idx_advisor_goals_status ON advisor_goals(status);
+CREATE INDEX IF NOT EXISTS idx_advisor_goals_type ON advisor_goals(goal_type);
+
+-- Learned parameters for adaptive behavior
+CREATE TABLE IF NOT EXISTS learning_params (
+    param_key TEXT PRIMARY KEY,
+    param_value TEXT,                  -- JSON
+    updated_at INTEGER
+);
+
+-- Action outcomes for learning
+CREATE TABLE IF NOT EXISTS action_outcomes (
+    outcome_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER,               -- References ai_decisions.id
+    action_type TEXT,
+    opportunity_type TEXT,
+    channel_id TEXT,
+    node_name TEXT,
+    decision_confidence REAL,
+    predicted_benefit INTEGER,
+    actual_benefit INTEGER,
+    success INTEGER,                   -- 0 or 1
+    prediction_error REAL,
+    measured_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_action_outcomes_type ON action_outcomes(action_type);
+CREATE INDEX IF NOT EXISTS idx_action_outcomes_decision ON action_outcomes(decision_id);
+
+-- Advisor cycle results
+CREATE TABLE IF NOT EXISTS advisor_cycles (
+    cycle_id TEXT PRIMARY KEY,
+    node_name TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    duration_seconds REAL,
+    opportunities_found INTEGER,
+    auto_executed INTEGER,
+    queued INTEGER,
+    outcomes_measured INTEGER,
+    success INTEGER,                   -- 0 or 1
+    summary TEXT                       -- JSON
+);
+CREATE INDEX IF NOT EXISTS idx_advisor_cycles_node ON advisor_cycles(node_name, timestamp);
+
+-- Daily budget tracking
+CREATE TABLE IF NOT EXISTS daily_budgets (
+    date TEXT PRIMARY KEY,             -- YYYY-MM-DD
+    fee_changes_used INTEGER DEFAULT 0,
+    rebalances_used INTEGER DEFAULT 0,
+    rebalance_fees_spent_sats INTEGER DEFAULT 0,
+    updated_at INTEGER
+);
 """
 
 
@@ -1658,3 +1727,281 @@ class AdvisorDB:
                 "lifetime_net_profit_sats": row['total_net_profit'] or 0,
                 "profitable": (row['total_net_profit'] or 0) >= 0
             }
+
+    # =========================================================================
+    # Proactive Advisor: Goals
+    # =========================================================================
+
+    def save_goal(self, goal: Dict[str, Any]) -> None:
+        """Save or update a goal."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO advisor_goals (
+                    goal_id, goal_type, target_metric, current_value, target_value,
+                    deadline_days, created_at, priority, checkpoints, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                goal["goal_id"],
+                goal["goal_type"],
+                goal["target_metric"],
+                goal["current_value"],
+                goal["target_value"],
+                goal["deadline_days"],
+                goal["created_at"],
+                goal["priority"],
+                json.dumps(goal.get("checkpoints", [])),
+                goal.get("status", "active")
+            ))
+            conn.commit()
+
+    def get_goals(self, status: str = None) -> List[Dict]:
+        """Get goals, optionally filtered by status."""
+        with self._get_conn() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM advisor_goals WHERE status = ? ORDER BY priority DESC",
+                    (status,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM advisor_goals ORDER BY priority DESC"
+                ).fetchall()
+
+            goals = []
+            for row in rows:
+                goal = dict(row)
+                if goal.get("checkpoints"):
+                    try:
+                        goal["checkpoints"] = json.loads(goal["checkpoints"])
+                    except json.JSONDecodeError:
+                        goal["checkpoints"] = []
+                goals.append(goal)
+            return goals
+
+    def get_goal(self, goal_id: str) -> Optional[Dict]:
+        """Get a specific goal by ID."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM advisor_goals WHERE goal_id = ?",
+                (goal_id,)
+            ).fetchone()
+
+            if not row:
+                return None
+
+            goal = dict(row)
+            if goal.get("checkpoints"):
+                try:
+                    goal["checkpoints"] = json.loads(goal["checkpoints"])
+                except json.JSONDecodeError:
+                    goal["checkpoints"] = []
+            return goal
+
+    def update_goal_checkpoints(self, goal_id: str, checkpoints: List[Dict]) -> bool:
+        """Update goal checkpoints."""
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                UPDATE advisor_goals
+                SET checkpoints = ?
+                WHERE goal_id = ?
+            """, (json.dumps(checkpoints), goal_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def update_goal_status(self, goal_id: str, status: str) -> bool:
+        """Update goal status."""
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                UPDATE advisor_goals
+                SET status = ?
+                WHERE goal_id = ?
+            """, (status, goal_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # =========================================================================
+    # Proactive Advisor: Learning Parameters
+    # =========================================================================
+
+    def save_learning_params(self, params: Dict[str, Any]) -> None:
+        """Save learned parameters."""
+        with self._get_conn() as conn:
+            for key, value in params.items():
+                conn.execute("""
+                    INSERT OR REPLACE INTO learning_params (param_key, param_value, updated_at)
+                    VALUES (?, ?, ?)
+                """, (key, json.dumps(value), int(datetime.now().timestamp())))
+            conn.commit()
+
+    def get_learning_params(self) -> Dict[str, Any]:
+        """Get all learned parameters."""
+        with self._get_conn() as conn:
+            rows = conn.execute("SELECT param_key, param_value FROM learning_params").fetchall()
+
+            params = {}
+            for row in rows:
+                try:
+                    params[row["param_key"]] = json.loads(row["param_value"])
+                except json.JSONDecodeError:
+                    params[row["param_key"]] = row["param_value"]
+            return params
+
+    # =========================================================================
+    # Proactive Advisor: Action Outcomes
+    # =========================================================================
+
+    def record_action_outcome(self, outcome: Dict[str, Any]) -> int:
+        """Record an action outcome for learning."""
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO action_outcomes (
+                    decision_id, action_type, opportunity_type, channel_id, node_name,
+                    decision_confidence, predicted_benefit, actual_benefit,
+                    success, prediction_error, measured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                outcome.get("action_id"),
+                outcome.get("action_type"),
+                outcome.get("opportunity_type"),
+                outcome.get("channel_id"),
+                outcome.get("node_name"),
+                outcome.get("decision_confidence"),
+                outcome.get("predicted_benefit"),
+                outcome.get("actual_benefit"),
+                1 if outcome.get("success") else 0,
+                outcome.get("prediction_error"),
+                outcome.get("outcome_measured_at", int(datetime.now().timestamp()))
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_decisions_in_window(
+        self,
+        hours_ago_min: int,
+        hours_ago_max: int
+    ) -> List[Dict]:
+        """Get decisions made within a time window for outcome measurement."""
+        now = datetime.now()
+        min_cutoff = int((now - timedelta(hours=hours_ago_max)).timestamp())
+        max_cutoff = int((now - timedelta(hours=hours_ago_min)).timestamp())
+
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT d.*, ao.outcome_id IS NOT NULL as outcome_measured
+                FROM ai_decisions d
+                LEFT JOIN action_outcomes ao ON d.id = ao.decision_id
+                WHERE d.timestamp > ? AND d.timestamp < ?
+                AND ao.outcome_id IS NULL
+                ORDER BY d.timestamp
+            """, (min_cutoff, max_cutoff)).fetchall()
+
+            return [dict(row) for row in rows]
+
+    def count_outcomes(self) -> int:
+        """Count total measured outcomes."""
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT COUNT(*) as count FROM action_outcomes").fetchone()
+            return row["count"] if row else 0
+
+    def get_overall_success_rate(self) -> float:
+        """Get overall success rate of measured outcomes."""
+        with self._get_conn() as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes
+                FROM action_outcomes
+            """).fetchone()
+
+            if not row or row["total"] == 0:
+                return 0.5
+
+            return row["successes"] / row["total"]
+
+    # =========================================================================
+    # Proactive Advisor: Cycle Results
+    # =========================================================================
+
+    def save_cycle_result(self, cycle: Dict[str, Any]) -> None:
+        """Save an advisor cycle result."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO advisor_cycles (
+                    cycle_id, node_name, timestamp, duration_seconds,
+                    opportunities_found, auto_executed, queued,
+                    outcomes_measured, success, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                cycle["cycle_id"],
+                cycle["node_name"],
+                int(datetime.fromisoformat(cycle["timestamp"]).timestamp()),
+                cycle.get("duration_seconds", 0),
+                cycle.get("opportunities_found", 0),
+                cycle.get("auto_executed_count", 0),
+                cycle.get("queued_count", 0),
+                cycle.get("outcomes_measured", 0),
+                1 if cycle.get("success") else 0,
+                json.dumps(cycle)
+            ))
+            conn.commit()
+
+    def get_recent_cycles(self, node_name: str = None, limit: int = 10) -> List[Dict]:
+        """Get recent advisor cycles."""
+        with self._get_conn() as conn:
+            if node_name:
+                rows = conn.execute("""
+                    SELECT * FROM advisor_cycles
+                    WHERE node_name = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (node_name, limit)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM advisor_cycles
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (limit,)).fetchall()
+
+            cycles = []
+            for row in rows:
+                cycle = dict(row)
+                if cycle.get("summary"):
+                    try:
+                        cycle["summary"] = json.loads(cycle["summary"])
+                    except json.JSONDecodeError:
+                        pass
+                cycles.append(cycle)
+            return cycles
+
+    # =========================================================================
+    # Proactive Advisor: Daily Budgets
+    # =========================================================================
+
+    def get_daily_budget(self, date: str) -> Optional[Dict]:
+        """Get daily budget for a date."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM daily_budgets WHERE date = ?",
+                (date,)
+            ).fetchone()
+
+            if row:
+                return dict(row)
+            return None
+
+    def save_daily_budget(self, date: str, budget: Dict[str, Any]) -> None:
+        """Save daily budget."""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO daily_budgets (
+                    date, fee_changes_used, rebalances_used,
+                    rebalance_fees_spent_sats, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                date,
+                budget.get("fee_changes_used", 0),
+                budget.get("rebalances_used", 0),
+                budget.get("rebalance_fees_spent_sats", 0),
+                int(datetime.now().timestamp())
+            ))
+            conn.commit()

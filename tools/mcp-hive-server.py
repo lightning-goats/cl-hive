@@ -1300,6 +1300,131 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         # =====================================================================
+        # Proactive Advisor Tools - Goal-driven autonomous management
+        # =====================================================================
+        Tool(
+            name="advisor_run_cycle",
+            description="Run one complete proactive advisor cycle. Analyzes state, checks goals, scans opportunities, executes safe actions, queues risky ones, measures outcomes, and plans next cycle. Run every 3 hours for optimal management.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to advise"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_get_goals",
+            description="Get current advisor goals and progress. Shows what the advisor is optimizing for and whether it's on track.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (for context)"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "achieved", "failed", "abandoned"],
+                        "description": "Filter by status (optional, defaults to all)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="advisor_set_goal",
+            description="Set or update an advisor goal. Goals drive the advisor's decision-making and prioritization.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "goal_type": {
+                        "type": "string",
+                        "enum": ["profitability", "routing_volume", "channel_health"],
+                        "description": "Type of goal"
+                    },
+                    "target_metric": {
+                        "type": "string",
+                        "description": "Metric to optimize (e.g., 'roc_pct', 'underwater_pct', 'avg_balance_ratio')"
+                    },
+                    "current_value": {
+                        "type": "number",
+                        "description": "Current value of the metric"
+                    },
+                    "target_value": {
+                        "type": "number",
+                        "description": "Target value to achieve"
+                    },
+                    "deadline_days": {
+                        "type": "integer",
+                        "description": "Days to achieve the goal"
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "description": "Priority 1-5, higher = more important (default: 3)"
+                    }
+                },
+                "required": ["goal_type", "target_metric", "target_value"]
+            }
+        ),
+        Tool(
+            name="advisor_get_learning",
+            description="Get the advisor's learned parameters. Shows what the advisor has learned about which actions work, including action type confidence and opportunity success rates.",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="advisor_get_status",
+            description="Get comprehensive advisor status including goals, learning summary, last cycle results, and daily budget.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_get_cycle_history",
+            description="Get history of advisor cycles. Shows past decisions, opportunities found, and outcomes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, omit for all nodes)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum cycles to return (default: 10)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="advisor_scan_opportunities",
+            description="Scan for optimization opportunities without executing. Shows what the advisor would do if run_cycle was called.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
         # Routing Pool Tools - Collective Economics (Phase 0)
         # =====================================================================
         Tool(
@@ -1996,6 +2121,21 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_advisor_get_peer_intel(arguments)
         elif name == "advisor_measure_outcomes":
             result = await handle_advisor_measure_outcomes(arguments)
+        # Proactive Advisor tools
+        elif name == "advisor_run_cycle":
+            result = await handle_advisor_run_cycle(arguments)
+        elif name == "advisor_get_goals":
+            result = await handle_advisor_get_goals(arguments)
+        elif name == "advisor_set_goal":
+            result = await handle_advisor_set_goal(arguments)
+        elif name == "advisor_get_learning":
+            result = await handle_advisor_get_learning(arguments)
+        elif name == "advisor_get_status":
+            result = await handle_advisor_get_status(arguments)
+        elif name == "advisor_get_cycle_history":
+            result = await handle_advisor_get_cycle_history(arguments)
+        elif name == "advisor_scan_opportunities":
+            result = await handle_advisor_scan_opportunities(arguments)
         # Routing Pool tools
         elif name == "pool_status":
             result = await handle_pool_status(arguments)
@@ -4105,6 +4245,204 @@ async def handle_advisor_measure_outcomes(args: Dict) -> Dict:
         "measured_count": len(outcomes),
         "outcomes": outcomes
     }
+
+
+# =============================================================================
+# Proactive Advisor Handlers
+# =============================================================================
+
+# Import proactive advisor modules (lazy import to avoid circular deps)
+_proactive_advisor = None
+_goal_manager = None
+_learning_engine = None
+_opportunity_scanner = None
+
+
+def _get_proactive_advisor():
+    """Lazy-load proactive advisor components."""
+    global _proactive_advisor, _goal_manager, _learning_engine, _opportunity_scanner
+
+    if _proactive_advisor is None:
+        try:
+            from goal_manager import GoalManager
+            from learning_engine import LearningEngine
+            from opportunity_scanner import OpportunityScanner
+            from proactive_advisor import ProactiveAdvisor
+
+            db = ensure_advisor_db()
+            _goal_manager = GoalManager(db)
+            _learning_engine = LearningEngine(db)
+
+            # Create a simple MCP client wrapper
+            class MCPClientWrapper:
+                async def call(self, tool_name, params):
+                    # Route to internal handlers
+                    handler = globals().get(f"handle_{tool_name}")
+                    if handler:
+                        return await handler(params)
+                    return {"error": f"Unknown tool: {tool_name}"}
+
+            mcp_client = MCPClientWrapper()
+            _opportunity_scanner = OpportunityScanner(mcp_client, db)
+            _proactive_advisor = ProactiveAdvisor(mcp_client, db)
+
+        except ImportError as e:
+            logger.error(f"Failed to import proactive advisor modules: {e}")
+            return None
+
+    return _proactive_advisor
+
+
+async def handle_advisor_run_cycle(args: Dict) -> Dict:
+    """Run one complete proactive advisor cycle."""
+    node_name = args.get("node")
+    if not node_name:
+        return {"error": "node is required"}
+
+    advisor = _get_proactive_advisor()
+    if not advisor:
+        return {"error": "Proactive advisor modules not available"}
+
+    try:
+        result = await advisor.run_cycle(node_name)
+        return result.to_dict()
+    except Exception as e:
+        logger.exception("Error running advisor cycle")
+        return {"error": f"Failed to run cycle: {str(e)}"}
+
+
+async def handle_advisor_get_goals(args: Dict) -> Dict:
+    """Get current advisor goals."""
+    db = ensure_advisor_db()
+    status = args.get("status")
+
+    goals = db.get_goals(status=status)
+
+    return {
+        "count": len(goals),
+        "goals": goals
+    }
+
+
+async def handle_advisor_set_goal(args: Dict) -> Dict:
+    """Set or update an advisor goal."""
+    import time as time_module
+
+    db = ensure_advisor_db()
+
+    goal_type = args.get("goal_type")
+    target_metric = args.get("target_metric")
+    target_value = args.get("target_value")
+
+    if not goal_type or not target_metric or target_value is None:
+        return {"error": "goal_type, target_metric, and target_value are required"}
+
+    now = int(time_module.time())
+    goal = {
+        "goal_id": f"{target_metric}_{now}",
+        "goal_type": goal_type,
+        "target_metric": target_metric,
+        "current_value": args.get("current_value", 0),
+        "target_value": target_value,
+        "deadline_days": args.get("deadline_days", 30),
+        "created_at": now,
+        "priority": args.get("priority", 3),
+        "checkpoints": [],
+        "status": "active"
+    }
+
+    db.save_goal(goal)
+
+    return {
+        "success": True,
+        "goal_id": goal["goal_id"],
+        "message": f"Goal created: {goal_type} - {target_metric} to {target_value}"
+    }
+
+
+async def handle_advisor_get_learning(args: Dict) -> Dict:
+    """Get learned parameters."""
+    advisor = _get_proactive_advisor()
+    if not advisor:
+        # Fallback to raw database query
+        db = ensure_advisor_db()
+        params = db.get_learning_params()
+        return {
+            "action_type_confidence": params.get("action_type_confidence", {}),
+            "opportunity_success_rates": params.get("opportunity_success_rates", {}),
+            "total_outcomes_measured": params.get("total_outcomes_measured", 0),
+            "overall_success_rate": params.get("overall_success_rate", 0.5)
+        }
+
+    return advisor.learning_engine.get_learning_summary()
+
+
+async def handle_advisor_get_status(args: Dict) -> Dict:
+    """Get comprehensive advisor status."""
+    node_name = args.get("node")
+    if not node_name:
+        return {"error": "node is required"}
+
+    advisor = _get_proactive_advisor()
+    if not advisor:
+        return {"error": "Proactive advisor modules not available"}
+
+    try:
+        return await advisor.get_status(node_name)
+    except Exception as e:
+        return {"error": f"Failed to get status: {str(e)}"}
+
+
+async def handle_advisor_get_cycle_history(args: Dict) -> Dict:
+    """Get history of advisor cycles."""
+    db = ensure_advisor_db()
+
+    node_name = args.get("node")
+    limit = args.get("limit", 10)
+
+    cycles = db.get_recent_cycles(node_name, limit)
+
+    return {
+        "count": len(cycles),
+        "cycles": cycles
+    }
+
+
+async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
+    """Scan for optimization opportunities without executing."""
+    node_name = args.get("node")
+    if not node_name:
+        return {"error": "node is required"}
+
+    advisor = _get_proactive_advisor()
+    if not advisor:
+        return {"error": "Proactive advisor modules not available"}
+
+    try:
+        # Get node state
+        state = await advisor._analyze_node_state(node_name)
+
+        # Scan for opportunities
+        opportunities = await advisor.scanner.scan_all(node_name, state)
+
+        # Score them
+        scored = advisor._score_opportunities(opportunities, state)
+
+        # Classify
+        auto, queue, require = advisor.scanner.filter_safe_opportunities(scored)
+
+        return {
+            "node": node_name,
+            "total_opportunities": len(opportunities),
+            "auto_execute_safe": len(auto),
+            "queue_for_review": len(queue),
+            "require_approval": len(require),
+            "opportunities": [opp.to_dict() for opp in scored[:20]],  # Top 20
+            "state_summary": state.get("summary", {})
+        }
+    except Exception as e:
+        logger.exception("Error scanning opportunities")
+        return {"error": f"Failed to scan opportunities: {str(e)}"}
 
 
 # =============================================================================
