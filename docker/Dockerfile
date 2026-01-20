@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y \
 # =============================================================================
 
 # Install Core Lightning from GitHub releases
-ARG CLN_VERSION=v25.02.1
+ARG CLN_VERSION=v25.12.1
 RUN ARCH=$(uname -m) \
     && if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi \
     && if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi \
