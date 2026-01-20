@@ -103,7 +103,6 @@ from modules.rpc_commands import (
     budget_summary as rpc_budget_summary,
     set_mode as rpc_set_mode,
     enable_expansions as rpc_enable_expansions,
-    pending_admin_promotions as rpc_pending_admin_promotions,
     pending_bans as rpc_pending_bans,
     # Phase 4: Topology, Planner, and Query Commands
     reinit_bridge as rpc_reinit_bridge,
@@ -7642,76 +7641,6 @@ def hive_promote_admin(plugin: Plugin, peer_id: str):
             "waiting_for": [pk[:16] + "..." for pk in missing],
             "message": f"Need {approvals_needed - approvals_received} more admin approval(s)"
         }
-
-
-@plugin.method("hive-pending-admin-promotions")
-def hive_pending_admin_promotions(plugin: Plugin):
-    """
-    View pending admin promotion proposals.
-
-    Returns:
-        Dict with pending admin promotions and their approval status.
-
-    Permission: Admin only
-    """
-    return rpc_pending_admin_promotions(_get_hive_context())
-
-
-@plugin.method("hive-resign-admin")
-def hive_resign_admin(plugin: Plugin):
-    """
-    Resign from admin status, becoming a regular member.
-
-    The last admin cannot resign - there must always be at least one admin.
-
-    Returns:
-        Dict with resignation status.
-
-    Permission: Admin only
-    """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not database or not our_pubkey or not membership_mgr:
-        return {"error": "Database not initialized"}
-
-    # Get all current admins
-    all_members = database.get_all_members()
-    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
-    admin_count = len(admins)
-
-    # Cannot resign if we're the last admin
-    if admin_count <= 1:
-        return {
-            "error": "cannot_resign",
-            "message": "Cannot resign: you are the only admin. Promote another member to admin first."
-        }
-
-    # Demote self to member
-    success = membership_mgr.set_tier(our_pubkey, MembershipTier.MEMBER.value)
-    if success:
-        plugin.log(f"cl-hive: Admin {our_pubkey[:16]}... resigned to member")
-
-        # Broadcast tier change
-        tier_payload = {
-            "peer_id": our_pubkey,
-            "new_tier": "member",
-            "reason": "admin_resignation"
-        }
-        tier_msg = serialize(HiveMessageType.PROMOTION, tier_payload)
-        _broadcast_to_members(tier_msg)
-
-        return {
-            "status": "resigned",
-            "peer_id": our_pubkey,
-            "new_tier": "member",
-            "remaining_admins": admin_count - 1,
-            "message": "Successfully resigned from admin. You are now a member."
-        }
-    else:
-        return {"error": "resignation_failed", "message": "Failed to update tier"}
 
 
 @plugin.method("hive-leave")
