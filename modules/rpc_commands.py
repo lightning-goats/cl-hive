@@ -215,9 +215,21 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     member_count = len([m for m in members if m['tier'] == 'member'])
     neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
 
+    # Get our own membership status (used by cl-revenue-ops to detect hive mode)
+    our_membership = {"tier": None, "joined_at": None}
+    if ctx.our_pubkey:
+        our_member = ctx.database.get_member(ctx.our_pubkey)
+        if our_member:
+            our_membership = {
+                "tier": our_member.get("tier"),
+                "joined_at": our_member.get("joined_at"),
+                "pubkey": ctx.our_pubkey,
+            }
+
     return {
         "status": "active" if members else "no_members",
         "governance_mode": ctx.config.governance_mode if ctx.config else "unknown",
+        "membership": our_membership,  # Our own membership for cl-revenue-ops detection
         "members": {
             "total": len(members),
             "member": member_count,
@@ -257,14 +269,16 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         },
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
+            "auto_join_enabled": ctx.config.auto_join_enabled,
             "auto_vouch_enabled": ctx.config.auto_vouch_enabled,
             "auto_promote_enabled": ctx.config.auto_promote_enabled,
             "ban_autotrigger_enabled": ctx.config.ban_autotrigger_enabled,
             "neophyte_fee_discount_pct": ctx.config.neophyte_fee_discount_pct,
             "member_fee_ppm": ctx.config.member_fee_ppm,
             "probation_days": ctx.config.probation_days,
-            "vouch_threshold_pct": ctx.config.vouch_threshold_pct,
-            "min_vouch_count": ctx.config.min_vouch_count,
+            "min_contribution_ratio": ctx.config.min_contribution_ratio,
+            "min_uptime_pct": ctx.config.min_uptime_pct,
+            "min_unique_peers": ctx.config.min_unique_peers,
             "max_members": ctx.config.max_members,
         },
         "protocol": {
