@@ -1070,11 +1070,11 @@ class TestCooperationModuleIntegration:
         member2 = '02' + 'b' * 64
         member3 = '02' + 'c' * 64
 
-        # Setup 3 hive members
+        # Setup 3 hive members (all members, admin tier removed)
         mock_database.get_all_members.return_value = [
             {'peer_id': member1, 'tier': 'member'},
             {'peer_id': member2, 'tier': 'member'},
-            {'peer_id': member3, 'tier': 'admin'}
+            {'peer_id': member3, 'tier': 'member'}
         ]
 
         # Only 2 of them have the target in their topology

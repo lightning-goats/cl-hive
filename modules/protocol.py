@@ -117,8 +117,13 @@ VOUCH_TTL_SECONDS = 7 * 24 * 3600
 
 @dataclass
 class HelloPayload:
-    """HIVE_HELLO message payload - Ticket presentation."""
-    ticket: str         # Base64-encoded signed ticket
+    """
+    HIVE_HELLO message payload - Introduction to hive.
+
+    Channel existence serves as proof of stake - no ticket needed.
+    If sender has a channel with a hive member, they can join as neophyte.
+    """
+    pubkey: str         # Sender's public key (66 hex chars)
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -143,7 +148,7 @@ class AttestPayload:
 class WelcomePayload:
     """HIVE_WELCOME message payload - Session established."""
     hive_id: str        # Assigned Hive identifier
-    tier: str           # 'neophyte', 'member', or 'admin'
+    tier: str           # 'neophyte' or 'member'
     member_count: int   # Current Hive size
     state_hash: str     # Current state hash for anti-entropy
 
@@ -1070,10 +1075,17 @@ def get_intent_abort_signing_payload(payload: Dict[str, Any]) -> str:
 # HELPER FUNCTIONS
 # =============================================================================
 
-def create_hello(ticket: str) -> bytes:
-    """Create a HIVE_HELLO message."""
+def create_hello(pubkey: str) -> bytes:
+    """
+    Create a HIVE_HELLO message.
+
+    Args:
+        pubkey: Sender's public key (66 hex chars)
+
+    Channel existence serves as proof of stake - no ticket needed.
+    """
     return serialize(HiveMessageType.HELLO, {
-        "ticket": ticket,
+        "pubkey": pubkey,
         "protocol_version": PROTOCOL_VERSION
     })
 

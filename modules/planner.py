@@ -1120,11 +1120,11 @@ class Planner:
     # =========================================================================
 
     def _get_hive_members(self) -> List[str]:
-        """Get list of Hive member pubkeys."""
+        """Get list of Hive member pubkeys (full members only, not neophytes)."""
         if not self.db:
             return []
         members = self.db.get_all_members()
-        return [m['peer_id'] for m in members if m.get('tier') in ('member', 'admin')]
+        return [m['peer_id'] for m in members if m.get('tier') == 'member']
 
     def _get_hive_capacity_to_target(self, target: str, hive_members: List[str]) -> int:
         """

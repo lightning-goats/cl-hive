@@ -2,19 +2,24 @@
 Handshake module for cl-hive
 
 Implements the PKI-based authentication protocol:
-- Genesis: Create a new Hive as Admin
-- Ticket: Generate and verify invitation tickets
+- Genesis: Create a new Hive as the founding Member
 - Manifest: Create and verify capability attestations
+- Challenge-Response: Prove identity via HSM signatures
 
 Crypto Strategy:
     Uses Core Lightning's signmessage/checkmessage RPCs.
     Keys never leave the HSM. No external crypto libraries required.
 
-Handshake Flow:
-    1. A -> B (HELLO): Candidate presents Ticket
-    2. B -> A (CHALLENGE): Member sends random Nonce
-    3. A -> B (ATTEST): Candidate sends signed Manifest + Nonce
-    4. B -> A (WELCOME): Session established
+Join Flow (Channel-as-Proof-of-Stake):
+    A node with a channel to any hive member can join:
+    1. A -> B (HELLO): Candidate announces pubkey
+    2. B checks for existing channel with A
+    3. B -> A (CHALLENGE): Member sends random Nonce
+    4. A -> B (ATTEST): Candidate sends signed Manifest + Nonce
+    5. B -> A (WELCOME): New member joins as neophyte
+
+Note: Tickets are deprecated. Channel existence serves as proof of stake.
+Having a channel demonstrates economic commitment to the network.
 """
 
 import os
@@ -59,8 +64,12 @@ class Ticket:
     """
     Invitation ticket structure.
 
-    An Admin generates this to authorize new members to join.
-    The ticket is signed by the Admin's node key.
+    DEPRECATED: Tickets are no longer required for joining. Channel existence
+    serves as proof of stake. This class is retained for backward compatibility
+    with genesis bootstrapping and legacy flows.
+
+    A Member generates this to authorize new members to join.
+    The ticket is signed by the Member's node key.
     """
     admin_pubkey: str       # 66-char hex pubkey of issuing admin
     hive_id: str            # Unique Hive identifier
@@ -68,7 +77,7 @@ class Ticket:
     issued_at: int          # Unix timestamp
     expires_at: int         # Unix timestamp
     signature: str          # signmessage result
-    initial_tier: str = 'neophyte'  # Starting tier: 'neophyte' or 'admin' (bootstrap)
+    initial_tier: str = 'neophyte'  # Starting tier: always 'neophyte' (member tier via promotion only)
     
     def to_json(self) -> str:
         """Serialize to JSON (excluding signature for signing)."""
@@ -143,12 +152,16 @@ class Requirements:
 class HandshakeManager:
     """
     Manages Hive authentication and session establishment.
-    
+
     Handles:
-    - Genesis (creating a new Hive)
-    - Ticket generation and verification
+    - Genesis (creating a new Hive as founding member)
     - Manifest creation and verification
-    - Challenge-response protocol
+    - Challenge-response protocol for identity proof
+    - Legacy ticket operations (deprecated)
+
+    Join Flow:
+    Nodes join by having a channel with any existing member.
+    Channel existence serves as proof of stake - no ticket needed.
     """
     
     def __init__(self, rpc_proxy, db, plugin, min_vouch_count: int = 3):
@@ -185,17 +198,18 @@ class HandshakeManager:
     
     def genesis(self, hive_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Create a new Hive with this node as the founding Admin.
-        
-        This creates a self-signed genesis ticket that bootstraps
-        the Hive's PKI chain of trust.
-        
+        Create a new Hive with this node as the founding Member.
+
+        This bootstraps a new Hive. The founding node starts as a full
+        member and can invite others. Other nodes join by opening a
+        channel to any existing member (no tickets required).
+
         Args:
             hive_id: Optional custom Hive ID (auto-generated if not provided)
-            
+
         Returns:
-            Dict with genesis info (hive_id, admin_pubkey, etc.)
-            
+            Dict with genesis info (hive_id, member_pubkey, etc.)
+
         Raises:
             ValueError: If this node is already part of a Hive
         """
@@ -231,11 +245,12 @@ class HandshakeManager:
             **ticket_data,
             signature=signature
         )
-        
-        # Store ourselves as Admin
+
+        # Store ourselves as founding member
+        # NOTE: Admin tier removed - genesis creates a member directly
         self.db.add_member(
             peer_id=our_pubkey,
-            tier='admin',
+            tier='member',
             joined_at=now,
             promoted_at=now
         )
@@ -269,42 +284,33 @@ class HandshakeManager:
         """
         Generate an invitation ticket for a new member.
 
-        Only Admins can generate invite tickets. Bootstrap tickets (initial_tier='member')
-        can only be generated when hive member count < min_vouch_count.
+        DEPRECATED: Prefer JOIN_INTENT flow where nodes join by opening a
+        channel to any hive member and broadcasting intent.
+
+        Only Members can generate invite tickets. All new members start as neophytes.
 
         Args:
             valid_hours: Hours until ticket expires
             requirements: Bitmask of required features
-            initial_tier: Starting tier for new member ('neophyte' or 'member')
+            initial_tier: Starting tier (always 'neophyte')
 
         Returns:
             Base64-encoded signed ticket
 
         Raises:
-            PermissionError: If caller is not an Admin
-            ValueError: If bootstrap ticket requested but hive is not in bootstrap phase
+            PermissionError: If caller is not a Member
+            ValueError: If invalid initial_tier requested
         """
         our_pubkey = self.get_our_pubkey()
 
-        # Verify we're an Admin
+        # Verify we're a Member
         member = self.db.get_member(our_pubkey)
-        if not member or member['tier'] != 'admin':
-            raise PermissionError("Only Admins can generate invite tickets")
+        if not member or member['tier'] != 'member':
+            raise PermissionError("Only Members can generate invite tickets")
 
-        # Validate initial_tier
-        if initial_tier not in ('neophyte', 'admin'):
-            raise ValueError(f"Invalid initial_tier: {initial_tier}. Use 'neophyte' or 'admin' (bootstrap)")
-
-        # Bootstrap check: admin tier only allowed for second admin
-        # Bootstrap creates exactly 2 admins (genesis + 1 bootstrap invite)
-        if initial_tier == 'admin':
-            all_members = self.db.get_all_members()
-            admin_count = sum(1 for m in all_members if m.get('tier') == 'admin')
-            if admin_count >= 2:
-                raise ValueError(
-                    f"Bootstrap complete: hive already has {admin_count} admins. "
-                    f"Use normal invite (tier=neophyte) and vouch process."
-                )
+        # All new members start as neophytes - no more bootstrap/admin tier
+        if initial_tier != 'neophyte':
+            raise ValueError(f"Invalid initial_tier: {initial_tier}. All new members start as 'neophyte'")
 
         # Get Hive ID from metadata
         metadata = json.loads(member.get('metadata', '{}'))
@@ -370,10 +376,10 @@ class HandshakeManager:
         except Exception as e:
             return (False, ticket, f"Signature verification failed: {e}")
         
-        # Verify admin is known
-        admin = self.db.get_member(ticket.admin_pubkey)
-        if not admin or admin['tier'] != 'admin':
-            return (False, ticket, "Unknown or non-admin issuer")
+        # Verify issuer is a known member
+        issuer = self.db.get_member(ticket.admin_pubkey)
+        if not issuer or issuer['tier'] != 'member':
+            return (False, ticket, "Unknown or non-member issuer")
         
         return (True, ticket, "")
     

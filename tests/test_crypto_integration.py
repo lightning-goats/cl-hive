@@ -400,8 +400,8 @@ class TestTicketVerificationFlow:
         node_a_handshake.genesis(hive_id="cross_node_hive")
         invite_b64 = node_a_handshake.generate_invite_ticket(valid_hours=24)
 
-        # Node B needs to know Node A is an admin (simulating gossip/sync)
-        node_b_db.add_member(node_a_pubkey, tier='admin')
+        # Node B needs to know Node A is a member (simulating gossip/sync)
+        node_b_db.add_member(node_a_pubkey, tier='member')
 
         # Node B verifies the ticket
         is_valid, ticket, error = node_b_handshake.verify_ticket(invite_b64)
@@ -433,7 +433,7 @@ class TestTicketVerificationFlow:
         invite_b64 = expired_ticket.to_base64()
 
         # Node B tries to verify
-        node_b_db.add_member(node_a_pubkey, tier='admin')
+        node_b_db.add_member(node_a_pubkey, tier='member')
         is_valid, ticket, error = node_b_handshake.verify_ticket(invite_b64)
 
         assert is_valid is False

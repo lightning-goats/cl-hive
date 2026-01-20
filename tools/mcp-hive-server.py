@@ -387,6 +387,74 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="hive_propose_promotion",
+            description="Propose a neophyte for early promotion to member status. Any member can propose a neophyte for promotion before the 90-day probation period completes. When a majority (51%) of active members approve, the neophyte is promoted.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (must be a member node)"
+                    },
+                    "target_peer_id": {
+                        "type": "string",
+                        "description": "The neophyte's public key to propose for promotion"
+                    }
+                },
+                "required": ["node", "target_peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_vote_promotion",
+            description="Vote to approve a neophyte's promotion to member. Only members can vote. When majority is reached, the neophyte can be promoted.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (must be a member node)"
+                    },
+                    "target_peer_id": {
+                        "type": "string",
+                        "description": "The neophyte's public key being voted on"
+                    }
+                },
+                "required": ["node", "target_peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_pending_promotions",
+            description="Get all pending manual promotion proposals with their approval status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_execute_promotion",
+            description="Execute a manual promotion if quorum has been reached. This bypasses the normal 90-day probation period when a majority of members have approved.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "target_peer_id": {
+                        "type": "string",
+                        "description": "The neophyte's public key to promote"
+                    }
+                },
+                "required": ["node", "target_peer_id"]
+            }
+        ),
+        Tool(
             name="hive_node_info",
             description="Get detailed info about a specific Lightning node including channels, balance, and peers.",
             inputSchema={
@@ -2135,6 +2203,14 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_reject_action(arguments)
         elif name == "hive_members":
             result = await handle_members(arguments)
+        elif name == "hive_propose_promotion":
+            result = await handle_propose_promotion(arguments)
+        elif name == "hive_vote_promotion":
+            result = await handle_vote_promotion(arguments)
+        elif name == "hive_pending_promotions":
+            result = await handle_pending_promotions(arguments)
+        elif name == "hive_execute_promotion":
+            result = await handle_execute_promotion(arguments)
         elif name == "hive_node_info":
             result = await handle_node_info(arguments)
         elif name == "hive_channels":
@@ -2419,6 +2495,77 @@ async def handle_members(args: Dict) -> Dict:
         return {"error": "No nodes available"}
 
     return await node.call("hive-members")
+
+
+async def handle_propose_promotion(args: Dict) -> Dict:
+    """Propose a neophyte for early promotion to member status."""
+    node_name = args.get("node")
+    target_peer_id = args.get("target_peer_id")
+
+    if not node_name or not target_peer_id:
+        return {"error": "node and target_peer_id are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Get our pubkey as the proposer
+    info = await node.call("getinfo")
+    proposer_peer_id = info.get("id")
+
+    return await node.call("hive-propose-promotion",
+                           target_peer_id=target_peer_id,
+                           proposer_peer_id=proposer_peer_id)
+
+
+async def handle_vote_promotion(args: Dict) -> Dict:
+    """Vote to approve a neophyte's promotion to member."""
+    node_name = args.get("node")
+    target_peer_id = args.get("target_peer_id")
+
+    if not node_name or not target_peer_id:
+        return {"error": "node and target_peer_id are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Get our pubkey as the voter
+    info = await node.call("getinfo")
+    voter_peer_id = info.get("id")
+
+    return await node.call("hive-vote-promotion",
+                           target_peer_id=target_peer_id,
+                           voter_peer_id=voter_peer_id)
+
+
+async def handle_pending_promotions(args: Dict) -> Dict:
+    """Get all pending manual promotion proposals."""
+    node_name = args.get("node")
+
+    if not node_name:
+        return {"error": "node is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-pending-promotions")
+
+
+async def handle_execute_promotion(args: Dict) -> Dict:
+    """Execute a manual promotion if quorum has been reached."""
+    node_name = args.get("node")
+    target_peer_id = args.get("target_peer_id")
+
+    if not node_name or not target_peer_id:
+        return {"error": "node and target_peer_id are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-execute-promotion", target_peer_id=target_peer_id)
 
 
 async def handle_node_info(args: Dict) -> Dict:

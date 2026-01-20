@@ -196,7 +196,8 @@ class HiveDatabase:
         """)
 
         # =====================================================================
-        # ADMIN PROMOTION TABLE (requires 100% admin approval)
+        # MANUAL PROMOTION TABLE (requires majority member approval)
+        # NOTE: Table name kept as admin_promotions for backward compatibility
         # =====================================================================
         conn.execute("""
             CREATE TABLE IF NOT EXISTS admin_promotions (
@@ -773,10 +774,10 @@ class HiveDatabase:
                    promoted_at: Optional[int] = None) -> bool:
         """
         Add a new member to the Hive.
-        
+
         Args:
             peer_id: 66-character hex public key
-            tier: 'admin', 'member', or 'neophyte'
+            tier: 'member' or 'neophyte'
             joined_at: Unix timestamp (defaults to now)
             promoted_at: Unix timestamp if promoted (None for neophytes)
             
@@ -1216,11 +1217,12 @@ class HiveDatabase:
         return [dict(row) for row in rows]
 
     # =========================================================================
-    # ADMIN PROMOTIONS (100% admin approval required)
+    # MANUAL PROMOTIONS (majority member approval required)
+    # NOTE: Method names kept as "admin_promotion" for backward compatibility
     # =========================================================================
 
     def create_admin_promotion(self, target_peer_id: str, proposed_by: str) -> bool:
-        """Create or update an admin promotion proposal."""
+        """Create or update a manual promotion proposal."""
         conn = self._get_connection()
         now = int(time.time())
         try:
@@ -1234,7 +1236,7 @@ class HiveDatabase:
             return False
 
     def get_admin_promotion(self, target_peer_id: str) -> Optional[Dict[str, Any]]:
-        """Get admin promotion proposal for a peer."""
+        """Get manual promotion proposal for a peer."""
         conn = self._get_connection()
         row = conn.execute("""
             SELECT * FROM admin_promotions WHERE target_peer_id = ?
@@ -1243,7 +1245,7 @@ class HiveDatabase:
 
     def add_admin_promotion_approval(self, target_peer_id: str,
                                       approver_peer_id: str) -> bool:
-        """Add an admin's approval for a promotion."""
+        """Add a member's approval for a promotion."""
         conn = self._get_connection()
         now = int(time.time())
         try:
@@ -1257,7 +1259,7 @@ class HiveDatabase:
             return False
 
     def get_admin_promotion_approvals(self, target_peer_id: str) -> List[Dict[str, Any]]:
-        """Get all approvals for an admin promotion."""
+        """Get all approvals for a manual promotion."""
         conn = self._get_connection()
         rows = conn.execute("""
             SELECT * FROM admin_promotion_approvals WHERE target_peer_id = ?
@@ -1265,7 +1267,7 @@ class HiveDatabase:
         return [dict(row) for row in rows]
 
     def complete_admin_promotion(self, target_peer_id: str) -> bool:
-        """Mark admin promotion as complete."""
+        """Mark manual promotion as complete."""
         conn = self._get_connection()
         try:
             conn.execute("""
@@ -1277,7 +1279,7 @@ class HiveDatabase:
             return False
 
     def get_pending_admin_promotions(self) -> List[Dict[str, Any]]:
-        """Get all pending admin promotions."""
+        """Get all pending manual promotions."""
         conn = self._get_connection()
         rows = conn.execute("""
             SELECT * FROM admin_promotions WHERE status = 'pending'

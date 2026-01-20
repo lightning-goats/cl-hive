@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.protocol import (
     HIVE_MAGIC,
     HiveMessageType,
+    PROTOCOL_VERSION,
     serialize,
     deserialize,
     is_hive_message,
@@ -184,12 +185,14 @@ class TestMessageHelpers:
     
     def test_create_hello(self):
         """create_hello should produce valid HELLO message."""
-        data = create_hello("myticket123")
-        
+        pubkey = "02" + "a" * 64
+        data = create_hello(pubkey)
+
         assert data[:4] == HIVE_MAGIC
         msg_type, payload = deserialize(data)
         assert msg_type == HiveMessageType.HELLO
-        assert payload['ticket'] == "myticket123"
+        assert payload['pubkey'] == pubkey
+        assert payload['protocol_version'] == PROTOCOL_VERSION
     
     def test_create_challenge(self):
         """create_challenge should produce valid CHALLENGE message."""

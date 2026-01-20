@@ -1257,6 +1257,57 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
 
 # =============================================================================
+# PEER CONNECTED HOOK (Autodiscovery)
+# =============================================================================
+
+@plugin.hook("peer_connected")
+def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
+    """
+    Handle peer connection - trigger autodiscovery if enabled.
+
+    When a peer connects and we're not a hive member yet, send HIVE_HELLO
+    to discover if they're part of a hive we can join.
+    """
+    global config, database, handshake_mgr
+
+    # Check if auto-join is enabled
+    if not config or not config.auto_join_enabled:
+        return {"result": "continue"}
+
+    # Check if we're already a member
+    if not handshake_mgr or not database:
+        return {"result": "continue"}
+
+    our_pubkey = handshake_mgr.get_our_pubkey()
+    our_member = database.get_member(our_pubkey)
+
+    # If we're already a member, no need to autodiscover
+    if our_member:
+        return {"result": "continue"}
+
+    # Check if this peer is already known to us as a member
+    peer_member = database.get_member(peer_id)
+    if peer_member:
+        # Peer is known, but we're not a member - this shouldn't happen normally
+        return {"result": "continue"}
+
+    # Send HIVE_HELLO to discover if peer is a hive member
+    try:
+        from modules.protocol import create_hello
+        hello_msg = create_hello(our_pubkey)
+
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": hello_msg.hex()
+        })
+        plugin.log(f"cl-hive: Sent HELLO to {peer_id[:16]}... (autodiscovery)")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to send autodiscovery HELLO: {e}", level='debug')
+
+    return {"result": "continue"}
+
+
+# =============================================================================
 # CUSTOM MESSAGE HOOK (BOLT 8 Protocol Layer)
 # =============================================================================
 
@@ -1380,51 +1431,84 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
 
 def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
-    Handle HIVE_HELLO message (ticket presentation).
-    
-    A candidate is presenting their invite ticket.
-    Verify the ticket and respond with a CHALLENGE.
+    Handle HIVE_HELLO message (autodiscovery join request).
+
+    A node is requesting to join the hive. Channel existence serves as
+    proof of stake - no ticket required.
+
+    Flow:
+    1. Check if we're a hive member (only members can accept new nodes)
+    2. Check if peer has a channel with us (proof of stake)
+    3. Check if peer is already a member
+    4. Send CHALLENGE if all conditions met
     """
-    ticket_b64 = payload.get('ticket')
-    if not ticket_b64:
-        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... missing ticket", level='warn')
-        return {"result": "continue"}
-    
-    # Verify the ticket
-    is_valid, ticket, error = handshake_mgr.verify_ticket(ticket_b64)
-
-    if not is_valid:
-        plugin.log(f"cl-hive: Invalid ticket from {peer_id[:16]}...: {error}", level='warn')
+    sender_pubkey = payload.get('pubkey')
+    if not sender_pubkey:
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... missing pubkey", level='warn')
         return {"result": "continue"}
 
-    # Get initial tier from ticket (default to neophyte for backwards compatibility)
-    initial_tier = getattr(ticket, 'initial_tier', 'neophyte')
+    # Verify pubkey matches peer_id (identity binding)
+    if sender_pubkey != peer_id:
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... pubkey mismatch", level='warn')
+        return {"result": "continue"}
 
-    # Generate challenge nonce (stores initial_tier for use after ATTEST)
-    nonce = handshake_mgr.generate_challenge(peer_id, ticket.requirements, initial_tier)
-    
-    # Get Hive ID from an existing admin
+    # Check if we're a member (only members can accept new nodes)
+    our_pubkey = handshake_mgr.get_our_pubkey()
+    our_member = database.get_member(our_pubkey)
+    if not our_member or our_member.get('tier') != 'member':
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... but we're not a member", level='debug')
+        return {"result": "continue"}
+
+    # Check if peer is already a member
+    existing_member = database.get_member(peer_id)
+    if existing_member:
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... already a {existing_member.get('tier')}", level='debug')
+        return {"result": "continue"}
+
+    # Check if peer has a channel with us (proof of stake)
+    try:
+        channels = safe_plugin.rpc.listpeerchannels(id=peer_id)
+        peer_channels = channels.get('channels', [])
+        # Look for any active channel
+        has_channel = any(
+            ch.get('state') in ('CHANNELD_NORMAL', 'CHANNELD_AWAITING_LOCKIN')
+            for ch in peer_channels
+        )
+        if not has_channel:
+            plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... no channel (proof of stake required)", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... channel check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # All checks passed - generate challenge
+    # No requirements for autodiscovery join, tier is always neophyte
+    nonce = handshake_mgr.generate_challenge(peer_id, requirements=0, initial_tier='neophyte')
+
+    # Get Hive ID from metadata
     members = database.get_all_members()
-    hive_id = "unknown"
+    hive_id = "hive"
     for m in members:
-        if m['tier'] == 'admin' and m.get('metadata'):
-            import json
-            metadata = json.loads(m['metadata'])
-            hive_id = metadata.get('hive_id', 'unknown')
-            break
-    
+        if m.get('metadata'):
+            try:
+                metadata = json.loads(m['metadata'])
+                hive_id = metadata.get('hive_id', 'hive')
+                break
+            except (json.JSONDecodeError, TypeError):
+                continue
+
     # Send CHALLENGE response
     challenge_msg = create_challenge(nonce, hive_id)
-    
+
     try:
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": challenge_msg.hex()
         })
-        plugin.log(f"cl-hive: Sent CHALLENGE to {peer_id[:16]}...")
+        plugin.log(f"cl-hive: Sent CHALLENGE to {peer_id[:16]}... (autodiscovery join)")
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send CHALLENGE: {e}", level='warn')
-    
+
     return {"result": "continue"}
 
 
@@ -1552,19 +1636,15 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
 
-    # Get initial tier from pending challenge (bootstrap support)
+    # Get initial tier from pending challenge (always neophyte for autodiscovery)
     initial_tier = pending.get('initial_tier', 'neophyte')
 
-    # Verification passed! Add member with appropriate tier
+    # Verification passed! Add member as neophyte
     database.add_member(
         peer_id=peer_id,
         tier=initial_tier,
         joined_at=int(time.time())
     )
-
-    # If admin tier (bootstrap), also trigger policy sync
-    if initial_tier == 'admin' and membership_mgr:
-        membership_mgr.set_tier(peer_id, initial_tier)
 
     handshake_mgr.clear_challenge(peer_id)
 
@@ -1572,11 +1652,13 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     members = database.get_all_members()
     hive_id = "hive"
     for m in members:
-        if m['tier'] == 'admin' and m.get('metadata'):
-            import json
-            metadata = json.loads(m['metadata'])
-            hive_id = metadata.get('hive_id', 'hive')
-            break
+        if m.get('metadata'):
+            try:
+                metadata = json.loads(m['metadata'])
+                hive_id = metadata.get('hive_id', 'hive')
+                break
+            except (json.JSONDecodeError, TypeError):
+                continue
 
     # Calculate real state hash via StateManager
     if state_manager:
@@ -1592,8 +1674,7 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             "node_id": peer_id,
             "msg": welcome_msg.hex()
         })
-        bootstrap_note = " [BOOTSTRAP]" if initial_tier == 'admin' else ""
-        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new {initial_tier}){bootstrap_note}")
+        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new {initial_tier})")
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
 
@@ -5020,6 +5101,71 @@ def hive_members(plugin: Plugin):
         List of member records with tier, contribution ratio, uptime, etc.
     """
     return rpc_members(_get_hive_context())
+
+
+@plugin.method("hive-propose-promotion")
+def hive_propose_promotion(plugin: Plugin, target_peer_id: str,
+                           proposer_peer_id: str = None):
+    """
+    Propose a neophyte for early promotion to member status.
+
+    Any member can propose a neophyte for promotion before the 90-day
+    probation period completes. When a majority (51%) of active members
+    approve, the neophyte is promoted.
+
+    Args:
+        target_peer_id: The neophyte to propose for promotion
+        proposer_peer_id: Optional, defaults to our pubkey
+
+    Permission: Member only
+    """
+    from modules.rpc_commands import propose_promotion
+    return propose_promotion(_get_hive_context(), target_peer_id, proposer_peer_id)
+
+
+@plugin.method("hive-vote-promotion")
+def hive_vote_promotion(plugin: Plugin, target_peer_id: str,
+                        voter_peer_id: str = None):
+    """
+    Vote to approve a neophyte's promotion to member.
+
+    Args:
+        target_peer_id: The neophyte being voted on
+        voter_peer_id: Optional, defaults to our pubkey
+
+    Permission: Member only
+    """
+    from modules.rpc_commands import vote_promotion
+    return vote_promotion(_get_hive_context(), target_peer_id, voter_peer_id)
+
+
+@plugin.method("hive-pending-promotions")
+def hive_pending_promotions(plugin: Plugin):
+    """
+    View pending manual promotion proposals.
+
+    Returns:
+        Dict with pending promotions and their approval status.
+    """
+    from modules.rpc_commands import pending_promotions
+    return pending_promotions(_get_hive_context())
+
+
+@plugin.method("hive-execute-promotion")
+def hive_execute_promotion(plugin: Plugin, target_peer_id: str):
+    """
+    Execute a manual promotion if quorum has been reached.
+
+    This bypasses the normal 90-day probation period when a majority
+    of members have approved the promotion.
+
+    Args:
+        target_peer_id: The neophyte to promote
+
+    Permission: Any member can execute once quorum is reached
+    """
+    from modules.rpc_commands import execute_promotion
+    return execute_promotion(_get_hive_context(), target_peer_id)
 
 
 @plugin.method("hive-topology")

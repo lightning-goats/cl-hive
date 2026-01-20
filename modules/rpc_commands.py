@@ -52,7 +52,7 @@ def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str,
 
     Args:
         ctx: HiveContext with database and our_pubkey
-        required_tier: 'admin' or 'member'
+        required_tier: 'member' (only tier that has special permissions)
 
     Returns:
         None if permission granted, or error dict if denied
@@ -66,19 +66,11 @@ def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str,
 
     current_tier = member.get('tier', 'neophyte')
 
-    if required_tier == 'admin':
-        if current_tier != 'admin':
+    if required_tier == 'member':
+        if current_tier != 'member':
             return {
                 "error": "permission_denied",
-                "message": "This command requires admin privileges",
-                "current_tier": current_tier,
-                "required_tier": "admin"
-            }
-    elif required_tier == 'member':
-        if current_tier not in ('admin', 'member'):
-            return {
-                "error": "permission_denied",
-                "message": "This command requires member or admin privileges",
+                "message": "This command requires member privileges",
                 "current_tier": current_tier,
                 "required_tier": "member"
             }
@@ -138,10 +130,10 @@ def vpn_add_peer(ctx: HiveContext, pubkey: str, vpn_address: str) -> Dict[str, A
     Returns:
         Dict with result.
 
-    Permission: Admin only
+    Permission: Member only
     """
-    # Permission check: Admin only
-    perm_error = check_permission(ctx, 'admin')
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
@@ -181,10 +173,10 @@ def vpn_remove_peer(ctx: HiveContext, pubkey: str) -> Dict[str, Any]:
     Returns:
         Dict with result.
 
-    Permission: Admin only
+    Permission: Member only
     """
-    # Permission check: Admin only
-    perm_error = check_permission(ctx, 'admin')
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
@@ -222,14 +214,12 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     members = ctx.database.get_all_members()
     member_count = len([m for m in members if m['tier'] == 'member'])
     neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
-    admin_count = len([m for m in members if m['tier'] == 'admin'])
 
     return {
-        "status": "active" if members else "genesis_required",
+        "status": "active" if members else "no_members",
         "governance_mode": ctx.config.governance_mode if ctx.config else "unknown",
         "members": {
             "total": len(members),
-            "admin": admin_count,
             "member": member_count,
             "neophyte": neophyte_count,
         },
@@ -344,9 +334,9 @@ def reject_action(ctx: HiveContext, action_id) -> Dict[str, Any]:
     Returns:
         Dict with rejection result.
 
-    Permission: Member or Admin only
+    Permission: Member only
     """
-    # Permission check: Member or Admin
+    # Permission check: Member only
     perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
@@ -454,9 +444,9 @@ def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
     Returns:
         Dict with budget utilization and spending history.
 
-    Permission: Member or Admin only
+    Permission: Member only
     """
-    # Permission check: Member or Admin
+    # Permission check: Member only
     perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
@@ -493,9 +483,9 @@ def approve_action(ctx: HiveContext, action_id, amount_sats: int = None) -> Dict
     Returns:
         Dict with approval result including budget details.
 
-    Permission: Member or Admin only
+    Permission: Member only
     """
-    # Permission check: Member or Admin
+    # Permission check: Member only
     perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
@@ -1098,12 +1088,12 @@ def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
     Returns:
         Dict with new mode and previous mode.
 
-    Permission: Admin only
+    Permission: Member only
     """
     from modules.config import VALID_GOVERNANCE_MODES
 
-    # Permission check: Admin only
-    perm_error = check_permission(ctx, 'admin')
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
@@ -1146,10 +1136,10 @@ def enable_expansions(ctx: HiveContext, enabled: bool = True) -> Dict[str, Any]:
     Returns:
         Dict with new setting.
 
-    Permission: Admin only
+    Permission: Member only
     """
-    # Permission check: Admin only
-    perm_error = check_permission(ctx, 'admin')
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
@@ -1170,53 +1160,97 @@ def enable_expansions(ctx: HiveContext, enabled: bool = True) -> Dict[str, Any]:
     }
 
 
-def pending_admin_promotions(ctx: HiveContext) -> Dict[str, Any]:
+def pending_promotions(ctx: HiveContext) -> Dict[str, Any]:
     """
-    View pending admin promotion proposals.
+    View pending manual promotion proposals.
+
+    Shows neophytes proposed for early promotion to member status
+    and the current approval count for each proposal.
 
     Returns:
-        Dict with pending admin promotions and their approval status.
+        Dict with pending promotions and their approval status.
 
-    Permission: Admin only
+    Permission: Any hive member (read-only)
     """
-    from modules.membership import MembershipTier
+    if not ctx.database or not ctx.membership_mgr:
+        return {"error": "Not initialized"}
 
-    perm_error = check_permission(ctx, 'admin')
+    pending = ctx.membership_mgr.get_pending_promotions()
+
+    return {
+        "count": len(pending),
+        "pending_promotions": pending
+    }
+
+
+def propose_promotion(ctx: HiveContext, target_peer_id: str,
+                      proposer_peer_id: str = None) -> Dict[str, Any]:
+    """
+    Propose a neophyte for early promotion to member status.
+
+    Any member can propose a neophyte for promotion before the 90-day
+    probation period completes. When a majority (51%) of active members
+    approve, the neophyte is promoted.
+
+    Args:
+        target_peer_id: The neophyte to propose for promotion
+        proposer_peer_id: Optional, defaults to our pubkey
+
+    Permission: Member only
+    """
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
-    if not ctx.database:
-        return {"error": "Database not initialized"}
+    if not ctx.membership_mgr:
+        return {"error": "Membership manager not initialized"}
 
-    # Get all current admins
-    all_members = ctx.database.get_all_members()
-    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
-    admin_pubkeys = set(m["peer_id"] for m in admins)
+    proposer = proposer_peer_id or ctx.our_pubkey
+    return ctx.membership_mgr.propose_manual_promotion(target_peer_id, proposer)
 
-    pending = ctx.database.get_pending_admin_promotions()
-    result = []
 
-    for p in pending:
-        target = p["target_peer_id"]
-        approvals = ctx.database.get_admin_promotion_approvals(target)
-        approval_pubkeys = set(a["approver_peer_id"] for a in approvals)
-        valid_approvals = approval_pubkeys & admin_pubkeys
+def vote_promotion(ctx: HiveContext, target_peer_id: str,
+                   voter_peer_id: str = None) -> Dict[str, Any]:
+    """
+    Vote to approve a neophyte's promotion to member.
 
-        result.append({
-            "peer_id": target,
-            "proposed_by": p["proposed_by"],
-            "proposed_at": p["proposed_at"],
-            "approvals_received": len(valid_approvals),
-            "approvals_needed": len(admins),
-            "approved_by": [pk[:16] + "..." for pk in valid_approvals],
-            "waiting_for": [pk[:16] + "..." for pk in (admin_pubkeys - valid_approvals)]
-        })
+    Args:
+        target_peer_id: The neophyte being voted on
+        voter_peer_id: Optional, defaults to our pubkey
 
-    return {
-        "count": len(result),
-        "admin_count": len(admins),
-        "pending_promotions": result
-    }
+    Permission: Member only
+    """
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.membership_mgr:
+        return {"error": "Membership manager not initialized"}
+
+    voter = voter_peer_id or ctx.our_pubkey
+    return ctx.membership_mgr.vote_on_promotion(target_peer_id, voter)
+
+
+def execute_promotion(ctx: HiveContext, target_peer_id: str) -> Dict[str, Any]:
+    """
+    Execute a manual promotion if quorum has been reached.
+
+    This bypasses the normal 90-day probation period when a majority
+    of members have approved the promotion.
+
+    Args:
+        target_peer_id: The neophyte to promote
+
+    Permission: Any member can execute once quorum is reached
+    """
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.membership_mgr:
+        return {"error": "Membership manager not initialized"}
+
+    return ctx.membership_mgr.execute_manual_promotion(target_peer_id)
 
 
 def pending_bans(ctx: HiveContext) -> Dict[str, Any]:
@@ -1247,7 +1281,7 @@ def pending_bans(ctx: HiveContext) -> Dict[str, Any]:
     for p in proposals:
         target_id = p["target_peer_id"]
         eligible = [m for m in all_members
-                    if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+                    if m.get("tier") == MembershipTier.MEMBER.value
                     and m["peer_id"] != target_id]
         eligible_ids = set(m["peer_id"] for m in eligible)
         quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
@@ -1292,9 +1326,9 @@ def reinit_bridge(ctx: HiveContext) -> Dict[str, Any]:
     """
     Re-attempt bridge initialization if it failed at startup.
 
-    Permission: Admin only
+    Permission: Member only
     """
-    perm_error = check_permission(ctx, 'admin')
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
@@ -1677,10 +1711,10 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
     Returns:
         Dict with snapshot results.
 
-    Permission: Admin only
+    Permission: Member only
     """
-    # Permission check: Admin only
-    perm_error = check_permission(ctx, 'admin')
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
@@ -1744,10 +1778,10 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
     Returns:
         Dict with settlement results.
 
-    Permission: Admin only
+    Permission: Member only
     """
-    # Permission check: Admin only
-    perm_error = check_permission(ctx, 'admin')
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 
@@ -1796,10 +1830,10 @@ def pool_record_revenue(ctx: HiveContext, amount_sats: int, channel_id: str = No
     Returns:
         Dict with recording result.
 
-    Permission: Admin only
+    Permission: Member only
     """
-    # Permission check: Admin only
-    perm_error = check_permission(ctx, 'admin')
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
     if perm_error:
         return perm_error
 

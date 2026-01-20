@@ -24,14 +24,16 @@ IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
 CONFIG_FIELD_TYPES: Dict[str, type] = {
     'governance_mode': str,
     'membership_enabled': bool,
+    'auto_join_enabled': bool,
     'auto_vouch_enabled': bool,
     'auto_promote_enabled': bool,
     'ban_autotrigger_enabled': bool,
     'neophyte_fee_discount_pct': float,
     'member_fee_ppm': int,
     'probation_days': int,
-    'vouch_threshold_pct': float,
-    'min_vouch_count': int,
+    'min_contribution_ratio': float,
+    'min_uptime_pct': float,
+    'min_unique_peers': int,
     'max_members': int,
     'market_share_cap_pct': float,
     'intent_hold_seconds': int,
@@ -57,8 +59,9 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'neophyte_fee_discount_pct': (0.0, 1.0),
     'member_fee_ppm': (0, 100000),
     'probation_days': (1, 365),
-    'vouch_threshold_pct': (0.0, 1.0),
-    'min_vouch_count': (1, 50),
+    'min_contribution_ratio': (0.0, 10.0),
+    'min_uptime_pct': (50.0, 100.0),
+    'min_unique_peers': (0, 10),
     'max_members': (2, 100),
     'market_share_cap_pct': (0.0, 1.0),
     'intent_hold_seconds': (10, 600),
@@ -100,6 +103,7 @@ class HiveConfig:
 
     # Phase 5 safety knobs
     membership_enabled: bool = True
+    auto_join_enabled: bool = True        # Auto-send HELLO on peer_connected to discover hive
     auto_vouch_enabled: bool = True
     auto_promote_enabled: bool = True
     ban_autotrigger_enabled: bool = False
@@ -107,11 +111,12 @@ class HiveConfig:
     # Membership Economics
     neophyte_fee_discount_pct: float = 0.5    # 50% of public rate for neophytes
     member_fee_ppm: int = 0                    # 0-fee for full members
-    probation_days: int = 30                   # Minimum days before promotion
-    
-    # Promotion Consensus
-    vouch_threshold_pct: float = 0.51          # 51% of members must vouch
-    min_vouch_count: int = 3                   # Minimum 3 vouches required
+    probation_days: int = 90                   # 90 days probation before auto-promotion
+
+    # Auto-Promotion Criteria (no vouching required - meritocratic)
+    min_contribution_ratio: float = 1.0        # Must forward at least as much as received
+    min_uptime_pct: float = 95.0               # 95% uptime required
+    min_unique_peers: int = 1                  # Must bring at least 1 unique peer
     
     # Ecological Limits
     max_members: int = 50                      # Dunbar cap for gossip efficiency
@@ -186,14 +191,16 @@ class HiveConfigSnapshot:
     db_path: str
     governance_mode: str
     membership_enabled: bool
+    auto_join_enabled: bool
     auto_vouch_enabled: bool
     auto_promote_enabled: bool
     ban_autotrigger_enabled: bool
     neophyte_fee_discount_pct: float
     member_fee_ppm: int
     probation_days: int
-    vouch_threshold_pct: float
-    min_vouch_count: int
+    min_contribution_ratio: float
+    min_uptime_pct: float
+    min_unique_peers: int
     max_members: int
     market_share_cap_pct: float
     intent_hold_seconds: int
@@ -220,14 +227,16 @@ class HiveConfigSnapshot:
             db_path=config.db_path,
             governance_mode=config.governance_mode,
             membership_enabled=config.membership_enabled,
+            auto_join_enabled=config.auto_join_enabled,
             auto_vouch_enabled=config.auto_vouch_enabled,
             auto_promote_enabled=config.auto_promote_enabled,
             ban_autotrigger_enabled=config.ban_autotrigger_enabled,
             neophyte_fee_discount_pct=config.neophyte_fee_discount_pct,
             member_fee_ppm=config.member_fee_ppm,
             probation_days=config.probation_days,
-            vouch_threshold_pct=config.vouch_threshold_pct,
-            min_vouch_count=config.min_vouch_count,
+            min_contribution_ratio=config.min_contribution_ratio,
+            min_uptime_pct=config.min_uptime_pct,
+            min_unique_peers=config.min_unique_peers,
             max_members=config.max_members,
             market_share_cap_pct=config.market_share_cap_pct,
             intent_hold_seconds=config.intent_hold_seconds,
