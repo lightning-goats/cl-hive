@@ -1255,7 +1255,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 # =============================================================================
 
 @plugin.hook("peer_connected")
-def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
+def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
     """
     Handle peer connection - trigger autodiscovery if enabled.
 
@@ -1263,6 +1263,11 @@ def on_peer_connected(peer_id: str, plugin: Plugin, **kwargs):
     to discover if they're part of a hive we can join.
     """
     global config, database, handshake_mgr
+
+    # Extract peer_id from the peer dict
+    peer_id = peer.get("id") if isinstance(peer, dict) else None
+    if not peer_id:
+        return {"result": "continue"}
 
     # Check if auto-join is enabled
     if not config or not config.auto_join_enabled:
