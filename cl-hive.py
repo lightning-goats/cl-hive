@@ -8040,14 +8040,74 @@ def hive_settlement_calculate(plugin: Plugin):
     Returns:
         Dict with calculated fair shares.
     """
+    from modules.settlement import MemberContribution
+
     if not settlement_mgr:
         return {"error": "Settlement manager not initialized"}
     if not routing_pool:
         return {"error": "Routing pool not initialized"}
+    if not database:
+        return {"error": "Database not initialized"}
 
-    # Get contribution data from routing pool
-    contributions = routing_pool.get_pool_status()
-    return settlement_mgr.calculate_fair_shares(contributions)
+    # Get pool status with member contributions
+    pool_status = routing_pool.get_pool_status()
+    pool_contributions = pool_status.get("contributions", [])
+
+    # Convert pool data to MemberContribution objects
+    member_contributions = []
+    for contrib in pool_contributions:
+        peer_id = contrib.get("member_id_full", contrib.get("member_id", ""))
+        if not peer_id:
+            continue
+
+        # Get forwarding stats from contribution ledger
+        contrib_stats = database.get_contribution_stats(peer_id, window_days=7)
+        forwards_sats = contrib_stats.get("forwarded", 0)
+
+        # Get fees earned from cl-revenue-ops if available
+        fees_earned = 0
+        if bridge and bridge.status == BridgeStatus.ENABLED:
+            try:
+                peer_report = bridge.safe_call("revenue-report-peer", peer_id=peer_id)
+                if peer_report and "error" not in peer_report:
+                    fees_earned = peer_report.get("fees_earned_sats", 0)
+            except Exception:
+                pass  # Fallback to 0 if revenue-ops unavailable
+
+        # Get BOLT12 offer if registered
+        offer = settlement_mgr.get_offer(peer_id)
+
+        member_contributions.append(MemberContribution(
+            peer_id=peer_id,
+            capacity_sats=contrib.get("capacity_sats", 0),
+            forwards_sats=forwards_sats,
+            fees_earned_sats=fees_earned,
+            uptime_pct=contrib.get("uptime_pct", 0.0),
+            bolt12_offer=offer
+        ))
+
+    # Calculate fair shares
+    results = settlement_mgr.calculate_fair_shares(member_contributions)
+
+    # Format for JSON response
+    return {
+        "period": pool_status.get("period", "unknown"),
+        "total_members": len(results),
+        "total_fees_sats": sum(r.fees_earned for r in results),
+        "fair_shares": [
+            {
+                "peer_id": r.peer_id[:16] + "...",
+                "peer_id_full": r.peer_id,
+                "fees_earned": r.fees_earned,
+                "fair_share": r.fair_share,
+                "balance": r.balance,
+                "has_offer": r.bolt12_offer is not None,
+                "status": "pays" if r.balance < 0 else ("receives" if r.balance > 0 else "even")
+            }
+            for r in results
+        ],
+        "payments_required": []  # Will be populated when there's actual revenue
+    }
 
 
 @plugin.method("hive-settlement-execute")
@@ -8064,13 +8124,23 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
     Returns:
         Dict with settlement execution result.
     """
-    if not settlement_mgr:
-        return {"error": "Settlement manager not initialized"}
-    if not routing_pool:
-        return {"error": "Routing pool not initialized"}
+    # First calculate fair shares (reuses the calculation logic)
+    calc_result = hive_settlement_calculate(plugin)
 
-    contributions = routing_pool.get_pool_status()
-    return settlement_mgr.execute_settlement(contributions, dry_run=dry_run)
+    if "error" in calc_result:
+        return calc_result
+
+    # For dry run, just return the calculation
+    if dry_run:
+        calc_result["execution_status"] = "dry_run"
+        calc_result["message"] = "Dry run - no payments executed"
+        return calc_result
+
+    # For actual execution, generate and execute payments
+    # Note: BOLT12 payment execution is not yet implemented
+    calc_result["execution_status"] = "not_implemented"
+    calc_result["message"] = "BOLT12 payment execution pending implementation"
+    return calc_result
 
 
 @plugin.method("hive-settlement-history")
