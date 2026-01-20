@@ -1640,6 +1640,10 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     handshake_mgr.clear_challenge(peer_id)
 
+    # Set hive fee policy for new member (0 fee to all hive members)
+    if bridge and bridge.status == BridgeStatus.ENABLED:
+        bridge.set_hive_policy(peer_id, is_member=True)
+
     # Get Hive info for WELCOME
     members = database.get_all_members()
     hive_id = "hive"
