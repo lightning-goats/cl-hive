@@ -76,7 +76,7 @@ docker-compose up -d
 - [ ] Bitcoin Core is synced and RPC accessible
 - [ ] Adequate disk space (10GB+ recommended)
 - [ ] Adequate memory (4GB+ recommended)
-- [ ] Firewall configured (port 9735 for Lightning)
+- [ ] Firewall configured (port 9736 for Lightning)
 - [ ] Backup strategy planned
 
 ### 2. Using Docker Secrets (Recommended)
@@ -138,14 +138,20 @@ BACKUP_RETENTION=30  # days
 | `NETWORK` | `bitcoin` | Network: bitcoin, testnet, signet, regtest |
 | `ALIAS` | `cl-hive-node` | Node alias |
 | `RGB` | `e33502` | Node color (hex) |
-| `ANNOUNCE_ADDR` | - | Public address to announce |
 
-#### Privacy & Networking
+#### Network Mode & Connectivity
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOR_ENABLED` | `true` | Enable Tor hidden service |
+| `LIGHTNING_PORT` | `9736` | Lightning P2P port |
+| `NETWORK_MODE` | `tor` | Network mode: `tor`, `clearnet`, or `hybrid` |
+| `ANNOUNCE_ADDR` | - | Public address (required for clearnet/hybrid) |
 | `WIREGUARD_ENABLED` | `false` | Enable WireGuard VPN |
+
+**Network Modes:**
+- **tor** - Tor-only, anonymous, no clearnet exposure (default)
+- **clearnet** - Direct connections only, requires `ANNOUNCE_ADDR`
+- **hybrid** - Both Tor hidden service and clearnet
 
 #### Resource Limits
 
@@ -264,7 +270,7 @@ docker-compose exec cln cat /var/lib/tor/cln-service/hostname
 Set in `.env`:
 ```bash
 TOR_ENABLED=false
-ANNOUNCE_ADDR=your.public.ip:9735
+ANNOUNCE_ADDR=your.public.ip:9736
 ```
 
 ## WireGuard Configuration

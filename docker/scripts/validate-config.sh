@@ -291,7 +291,7 @@ check_ports() {
     source "$env_file" 2>/dev/null || true
     set +a
 
-    local lightning_port="${LIGHTNING_PORT:-9735}"
+    local lightning_port="${LIGHTNING_PORT:-9736}"
     local wireguard_port="${WIREGUARD_PORT:-51820}"
 
     log_check "Port $lightning_port (Lightning P2P)"

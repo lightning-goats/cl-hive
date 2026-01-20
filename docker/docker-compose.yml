@@ -65,10 +65,11 @@ services:
       # Node Identity
       - ALIAS=${ALIAS:-cl-hive-node}
       - RGB=${RGB:-e33502}
-      - ANNOUNCE_ADDR=${ANNOUNCE_ADDR:-}
 
-      # Tor
-      - TOR_ENABLED=${TOR_ENABLED:-true}
+      # Network Mode & Connectivity
+      - LIGHTNING_PORT=${LIGHTNING_PORT:-9736}
+      - NETWORK_MODE=${NETWORK_MODE:-tor}
+      - ANNOUNCE_ADDR=${ANNOUNCE_ADDR:-}
 
       # WireGuard VPN (credentials from VPN admin)
       - WIREGUARD_ENABLED=${WIREGUARD_ENABLED:-false}
@@ -99,8 +100,8 @@ services:
       - ${CUSTOM_CONFIG_PATH:-./config}:/etc/lightning/custom:ro
 
     ports:
-      # Lightning P2P (only if not using Tor exclusively)
-      - "${LIGHTNING_PORT:-9735}:9735"
+      # Lightning P2P (only needed for clearnet/hybrid modes)
+      - "${LIGHTNING_PORT:-9736}:${LIGHTNING_PORT:-9736}"
 
       # REST API (optional, uncomment if needed)
       # - "8080:8080"

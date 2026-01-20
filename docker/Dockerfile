@@ -180,7 +180,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # =============================================================================
 
 # Lightning P2P
-EXPOSE 9735
+EXPOSE 9736
 # Lightning REST API
 EXPOSE 8080
 # Tor SOCKS (internal)

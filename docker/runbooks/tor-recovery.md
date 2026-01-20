@@ -114,9 +114,9 @@ docker-compose exec cln kill -HUP $(pgrep -x tor)
 # Check torrc
 docker-compose exec cln cat /etc/tor/torrc
 
-# Verify it contains:
+# Verify it contains (port may vary based on LIGHTNING_PORT):
 # HiddenServiceDir /var/lib/tor/cln-service
-# HiddenServicePort 9735 127.0.0.1:9735
+# HiddenServicePort 9736 127.0.0.1:9736
 
 # Test configuration
 docker-compose exec cln tor --verify-config
@@ -145,11 +145,11 @@ docker-compose exec cln cat /var/lib/tor/cln-service/hostname
 # Step 1: Stop everything
 docker-compose stop
 
-# Step 2: Recreate Tor config
+# Step 2: Recreate Tor config (adjust port if using custom LIGHTNING_PORT)
 cat > /tmp/torrc << 'EOF'
 DataDirectory /var/lib/tor
 HiddenServiceDir /var/lib/tor/cln-service
-HiddenServicePort 9735 127.0.0.1:9735
+HiddenServicePort 9736 127.0.0.1:9736
 HiddenServiceVersion 3
 SocksPort 9050
 Log notice file /var/log/tor/notices.log

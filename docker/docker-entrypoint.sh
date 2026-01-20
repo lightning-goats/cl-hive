@@ -12,8 +12,9 @@ set -e
 #   NETWORK              - bitcoin, testnet, signet, regtest (default: bitcoin)
 #   ALIAS                - Node alias (default: cl-hive-node)
 #   RGB                  - Node color in hex (default: e33502)
-#   ANNOUNCE_ADDR        - Public address to announce (optional)
-#   TOR_ENABLED          - Enable Tor (default: true)
+#   LIGHTNING_PORT       - Lightning P2P port (default: 9736)
+#   NETWORK_MODE         - tor, clearnet, hybrid (default: tor)
+#   ANNOUNCE_ADDR        - Public address to announce (required for clearnet/hybrid)
 #   WIREGUARD_ENABLED    - Enable WireGuard (default: false)
 #   WIREGUARD_CONFIG     - Path to WireGuard config (default: /etc/wireguard/wg0.conf)
 #   HIVE_GOVERNANCE_MODE - advisor, autonomous, oracle (default: advisor)
@@ -59,7 +60,8 @@ BITCOIN_RPCPORT="${BITCOIN_RPCPORT:-8332}"
 NETWORK="${NETWORK:-bitcoin}"
 ALIAS="${ALIAS:-cl-hive-node}"
 RGB="${RGB:-e33502}"
-TOR_ENABLED="${TOR_ENABLED:-true}"
+LIGHTNING_PORT="${LIGHTNING_PORT:-9736}"
+NETWORK_MODE="${NETWORK_MODE:-tor}"
 WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
 HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
@@ -142,51 +144,109 @@ wallet=sqlite3://$LIGHTNING_DIR/lightningd.sqlite3
 plugin-dir=/root/.lightning/plugins
 EOF
 
-# Add announce address if specified
-if [ -n "$ANNOUNCE_ADDR" ]; then
-    echo "announce-addr=$ANNOUNCE_ADDR" >> "$CONFIG_FILE"
-fi
-
 # -----------------------------------------------------------------------------
-# Tor Configuration
+# Network Mode Configuration (tor/clearnet/hybrid)
 # -----------------------------------------------------------------------------
 
-if [ "$TOR_ENABLED" = "true" ]; then
-    echo "Configuring Tor..."
+echo "Configuring network mode: $NETWORK_MODE"
 
-    # Update torrc with correct paths
-    cat > /etc/tor/torrc << EOF
+case "$NETWORK_MODE" in
+    tor)
+        # Tor-only mode: hidden service, no clearnet
+        echo "Mode: Tor only (anonymous)"
+
+        # Configure Tor hidden service
+        cat > /etc/tor/torrc << EOF
 DataDirectory /var/lib/tor
 HiddenServiceDir /var/lib/tor/cln-service
-HiddenServicePort 9735 127.0.0.1:9735
+HiddenServicePort $LIGHTNING_PORT 127.0.0.1:$LIGHTNING_PORT
 HiddenServiceVersion 3
 SocksPort 9050
 Log notice file /var/log/tor/notices.log
 EOF
 
-    # Add Tor settings to lightning config
-    cat >> "$CONFIG_FILE" << EOF
+        # Lightning config for Tor-only
+        cat >> "$CONFIG_FILE" << EOF
 
-# Tor Configuration
+# Tor-only Configuration
 proxy=127.0.0.1:9050
 always-use-proxy=true
-bind-addr=127.0.0.1:9735
+bind-addr=127.0.0.1:$LIGHTNING_PORT
 EOF
 
-    # Ensure Tor directories exist with correct permissions
-    mkdir -p /var/lib/tor/cln-service /var/log/tor
-    chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor
-    chmod 700 /var/lib/tor/cln-service
+        # Ensure Tor directories exist with correct permissions
+        mkdir -p /var/lib/tor/cln-service /var/log/tor
+        chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor
+        chmod 700 /var/lib/tor/cln-service
 
-    echo "Tor configured - hidden service will be created on first start"
-else
-    echo "Tor disabled"
-    cat >> "$CONFIG_FILE" << EOF
+        echo "Tor configured - hidden service will be created on first start"
+        ;;
 
-# Direct connections (Tor disabled)
-bind-addr=0.0.0.0:9735
+    clearnet)
+        # Clearnet-only mode: direct connections, no Tor
+        echo "Mode: Clearnet only (direct connections)"
+
+        if [ -z "$ANNOUNCE_ADDR" ]; then
+            echo "WARNING: ANNOUNCE_ADDR not set - node will not be discoverable!"
+            echo "Set ANNOUNCE_ADDR=your.ip.or.domain:$LIGHTNING_PORT"
+        fi
+
+        # Lightning config for clearnet
+        cat >> "$CONFIG_FILE" << EOF
+
+# Clearnet Configuration
+bind-addr=0.0.0.0:$LIGHTNING_PORT
 EOF
-fi
+
+        # Add announce address if specified
+        if [ -n "$ANNOUNCE_ADDR" ]; then
+            echo "announce-addr=$ANNOUNCE_ADDR" >> "$CONFIG_FILE"
+        fi
+        ;;
+
+    hybrid)
+        # Hybrid mode: both Tor and clearnet
+        echo "Mode: Hybrid (Tor + clearnet)"
+
+        # Configure Tor hidden service
+        cat > /etc/tor/torrc << EOF
+DataDirectory /var/lib/tor
+HiddenServiceDir /var/lib/tor/cln-service
+HiddenServicePort $LIGHTNING_PORT 127.0.0.1:$LIGHTNING_PORT
+HiddenServiceVersion 3
+SocksPort 9050
+Log notice file /var/log/tor/notices.log
+EOF
+
+        # Lightning config for hybrid mode
+        cat >> "$CONFIG_FILE" << EOF
+
+# Hybrid Configuration (Tor + Clearnet)
+proxy=127.0.0.1:9050
+bind-addr=0.0.0.0:$LIGHTNING_PORT
+EOF
+
+        # Add announce address if specified (for clearnet reachability)
+        if [ -n "$ANNOUNCE_ADDR" ]; then
+            echo "announce-addr=$ANNOUNCE_ADDR" >> "$CONFIG_FILE"
+            echo "Clearnet address: $ANNOUNCE_ADDR"
+        else
+            echo "No ANNOUNCE_ADDR set - node reachable via Tor only"
+        fi
+
+        # Ensure Tor directories exist with correct permissions
+        mkdir -p /var/lib/tor/cln-service /var/log/tor
+        chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor
+        chmod 700 /var/lib/tor/cln-service
+
+        echo "Tor configured - hidden service will be created on first start"
+        ;;
+
+    *)
+        echo "ERROR: Invalid NETWORK_MODE '$NETWORK_MODE'. Must be: tor, clearnet, or hybrid"
+        exit 1
+        ;;
+esac
 
 # -----------------------------------------------------------------------------
 # WireGuard Configuration
@@ -348,10 +408,14 @@ echo "=== Configuration Summary ==="
 echo "Network:        $NETWORK"
 echo "Alias:          $ALIAS"
 echo "Bitcoin RPC:    $BITCOIN_RPCHOST:$BITCOIN_RPCPORT"
-echo "Tor:            $TOR_ENABLED"
+echo "Lightning Port: $LIGHTNING_PORT"
+echo "Network Mode:   $NETWORK_MODE"
 echo "WireGuard:      $WIREGUARD_ENABLED"
 echo "Hive Mode:      $HIVE_GOVERNANCE_MODE"
 echo "Lightning Dir:  $LIGHTNING_DIR"
+if [ -n "$ANNOUNCE_ADDR" ]; then
+    echo "Announce Addr:  $ANNOUNCE_ADDR"
+fi
 echo ""
 echo "Required Plugins:"
 echo "  CLBOSS:       installed"

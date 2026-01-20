@@ -29,7 +29,8 @@ DEFAULT_BITCOIN_RPCPORT="8332"
 DEFAULT_NETWORK="bitcoin"
 DEFAULT_ALIAS="cl-hive-node"
 DEFAULT_RGB="e33502"
-DEFAULT_TOR_ENABLED="true"
+DEFAULT_LIGHTNING_PORT="9736"
+DEFAULT_NETWORK_MODE="tor"
 DEFAULT_WIREGUARD_ENABLED="false"
 DEFAULT_BACKUP_LOCATION="/backups"
 DEFAULT_BACKUP_RETENTION="30"
@@ -260,13 +261,38 @@ main() {
     # -------------------------------------------------------------------------
     print_step 4 6 "Privacy & Networking"
 
-    prompt_yes_no TOR_ENABLED "Enable Tor hidden service? (Recommended)" "Y"
+    prompt LIGHTNING_PORT "Lightning P2P port" "$DEFAULT_LIGHTNING_PORT"
 
-    if [[ "$TOR_ENABLED" == "true" ]]; then
-        print_success "Tor enabled - your node will be accessible via .onion address"
-    else
-        prompt ANNOUNCE_ADDR "Public announce address (ip:port or hostname:port)" ""
-    fi
+    echo ""
+    print_info "Network Mode Options:"
+    echo "  1. tor      - Tor-only, anonymous, no clearnet (recommended)"
+    echo "  2. clearnet - Direct connections only, requires public IP"
+    echo "  3. hybrid   - Both Tor and clearnet"
+    echo ""
+    prompt_choice NETWORK_MODE "Select network mode:" "tor" "clearnet" "hybrid"
+
+    case "$NETWORK_MODE" in
+        tor)
+            print_success "Tor-only mode - your node will be accessible via .onion address"
+            ANNOUNCE_ADDR=""
+            ;;
+        clearnet)
+            print_info "Clearnet mode requires a public address"
+            prompt ANNOUNCE_ADDR "Public announce address (ip:port or hostname:port)" ""
+            if [[ -z "$ANNOUNCE_ADDR" ]]; then
+                print_warning "No announce address set - node will not be discoverable!"
+            fi
+            ;;
+        hybrid)
+            print_success "Hybrid mode - accessible via Tor and optionally clearnet"
+            prompt ANNOUNCE_ADDR "Public announce address (optional, press Enter to skip)" ""
+            if [[ -n "$ANNOUNCE_ADDR" ]]; then
+                print_success "Clearnet address: $ANNOUNCE_ADDR"
+            else
+                print_info "No clearnet address - node reachable via Tor only"
+            fi
+            ;;
+    esac
 
     echo ""
     prompt_yes_no WIREGUARD_ENABLED "Enable WireGuard VPN?" "N"
@@ -389,12 +415,13 @@ NETWORK=$NETWORK
 # =============================================================================
 ALIAS=$ALIAS
 RGB=$RGB
-ANNOUNCE_ADDR=${ANNOUNCE_ADDR:-}
 
 # =============================================================================
-# PRIVACY & NETWORKING
+# NETWORK MODE & CONNECTIVITY
 # =============================================================================
-TOR_ENABLED=$TOR_ENABLED
+LIGHTNING_PORT=$LIGHTNING_PORT
+NETWORK_MODE=$NETWORK_MODE
+ANNOUNCE_ADDR=${ANNOUNCE_ADDR:-}
 WIREGUARD_ENABLED=$WIREGUARD_ENABLED
 EOF
 
@@ -439,7 +466,7 @@ GPG_KEY_ID=${GPG_KEY_ID:-}
 # =============================================================================
 # PORTS
 # =============================================================================
-LIGHTNING_PORT=9735
+LIGHTNING_PORT=$LIGHTNING_PORT
 WIREGUARD_PORT=51820
 EOF
 
@@ -526,7 +553,8 @@ EOF
     echo "  Network:     $NETWORK"
     echo "  Alias:       $ALIAS"
     echo "  Bitcoin RPC: $BITCOIN_RPCHOST:$BITCOIN_RPCPORT"
-    echo "  Tor:         $TOR_ENABLED"
+    echo "  LN Port:     $LIGHTNING_PORT"
+    echo "  Net Mode:    $NETWORK_MODE"
     echo "  WireGuard:   $WIREGUARD_ENABLED"
     echo "  Resources:   ${CPU_LIMIT} CPUs, ${MEMORY_LIMIT}G RAM"
     echo "  Backups:     $BACKUP_LOCATION (${BACKUP_RETENTION} days)"
