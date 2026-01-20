@@ -8225,7 +8225,7 @@ def hive_deposit_marker(
     destination: str,
     fee_ppm: int,
     success: bool,
-    volume_sats: int
+    volume_sats: int = 0
 ):
     """
     Deposit a stigmergic route marker.
