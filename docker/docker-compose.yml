@@ -103,9 +103,13 @@ services:
       - ./docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro
       - ./supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
 
-      # bitcoin-cli mount (uncomment if build fails to download from bitcoincore.org)
+      # cl-hive plugin mount (for development - updates without rebuild)
+      - ../cl-hive.py:/opt/cl-hive/cl-hive.py:ro
+      - ../modules:/opt/cl-hive/modules:ro
+
+      # bitcoin-cli mount (needed when build fails to download from bitcoincore.org)
       # Copy your host's bitcoin-cli first: cp /usr/local/bin/bitcoin-cli ./bitcoin-cli
-      # - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
+      - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
 
     ports:
       # Lightning P2P (only needed for clearnet/hybrid modes)
