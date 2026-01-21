@@ -1691,6 +1691,13 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
 
+    # Send our settlement offer to the new member so they have it for settlement calculations
+    if settlement_mgr and handshake_mgr:
+        our_pubkey = handshake_mgr.get_our_pubkey()
+        our_offer = settlement_mgr.get_offer(our_pubkey)
+        if our_offer:
+            _send_settlement_offer_to_peer(peer_id, our_pubkey, our_offer)
+
     # Broadcast membership update to all existing members
     _broadcast_full_sync_to_members(plugin)
 
@@ -4465,6 +4472,54 @@ def _broadcast_settlement_offer(peer_id: str, bolt12_offer: str) -> int:
         safe_plugin.log(f"cl-hive: Broadcast settlement offer to {sent} member(s)")
 
     return sent
+
+
+def _send_settlement_offer_to_peer(target_peer_id: str, our_peer_id: str, bolt12_offer: str) -> bool:
+    """
+    Send our settlement offer to a specific peer.
+
+    Used when welcoming a new member to ensure they have our offer
+    for settlement calculations.
+
+    Args:
+        target_peer_id: The peer to send to
+        our_peer_id: Our node's public key
+        bolt12_offer: Our BOLT12 offer string
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    if not safe_plugin:
+        return False
+
+    timestamp = int(time.time())
+
+    # Sign the offer
+    signing_payload = get_settlement_offer_signing_payload(our_peer_id, bolt12_offer)
+    try:
+        sign_result = safe_plugin.rpc.call("signmessage", {"message": signing_payload})
+        signature = sign_result.get("zbase")
+        if not signature:
+            safe_plugin.log("cl-hive: Failed to sign settlement offer for peer", level='warn')
+            return False
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to sign settlement offer: {e}", level='warn')
+        return False
+
+    # Create the message
+    msg = create_settlement_offer(our_peer_id, bolt12_offer, timestamp, signature)
+
+    # Send to the specific peer
+    try:
+        safe_plugin.rpc.call("sendcustommsg", {
+            "node_id": target_peer_id,
+            "msg": msg.hex()
+        })
+        safe_plugin.log(f"cl-hive: Sent settlement offer to new member {target_peer_id[:16]}...")
+        return True
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to send settlement offer to {target_peer_id[:16]}...: {e}", level='debug')
+        return False
 
 
 # =============================================================================
