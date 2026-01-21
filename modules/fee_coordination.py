@@ -1029,8 +1029,191 @@ class MyceliumDefenseSystem:
             "active_warnings": len(self._warnings),
             "defensive_fees_active": len(self._defensive_fees),
             "warnings": [w.to_dict() for w in self._warnings.values()],
-            "defensive_peers": list(self._defensive_fees.keys())
+            "defensive_peers": list(self._defensive_fees.keys()),
+            "ban_candidates": self.get_ban_candidates()
         }
+
+    def set_peer_reputation_manager(self, peer_rep_mgr: Any) -> None:
+        """Set reference to peer reputation manager for warning broadcast."""
+        self._peer_rep_mgr = peer_rep_mgr
+
+    def broadcast_warning_via_reputation(
+        self,
+        warning: PeerWarning,
+        rpc: Any
+    ) -> bool:
+        """
+        Broadcast a warning through the PEER_REPUTATION protocol.
+
+        Uses the peer reputation system to propagate threat information,
+        encoding the threat as a warning in the reputation report.
+
+        Args:
+            warning: The PeerWarning to broadcast
+            rpc: RPC interface for signing
+
+        Returns:
+            True if broadcast succeeded
+        """
+        if not hasattr(self, '_peer_rep_mgr') or not self._peer_rep_mgr:
+            self._log("No peer reputation manager - cannot broadcast warning", level='warn')
+            return False
+
+        # Map threat types to warning codes
+        warning_code_map = {
+            "drain": "drain_attack",
+            "unreliable": "unreliable",
+            "force_close": "force_close_risk"
+        }
+        warning_code = warning_code_map.get(warning.threat_type, warning.threat_type)
+
+        try:
+            # Create a peer reputation message with the warning
+            msg = self._peer_rep_mgr.create_reputation_message(
+                peer_id=warning.peer_id,
+                rpc=rpc,
+                uptime_pct=1.0 - warning.severity,  # Lower uptime = worse reputation
+                htlc_success_rate=1.0 - warning.severity if warning.threat_type == "unreliable" else 1.0,
+                warnings=[warning_code],
+                observation_days=7
+            )
+
+            if msg:
+                self._log(
+                    f"Warning broadcast prepared for {warning.peer_id[:12]}: "
+                    f"{warning.threat_type} (severity={warning.severity:.2f})"
+                )
+                return True
+
+        except Exception as e:
+            self._log(f"Failed to broadcast warning: {e}", level='error')
+
+        return False
+
+    def get_accumulated_warnings(self, peer_id: str) -> Dict[str, Any]:
+        """
+        Get accumulated warning information for a peer.
+
+        Combines local warnings with aggregated peer reputation data.
+
+        Args:
+            peer_id: Peer to check
+
+        Returns:
+            Dict with warning summary including count from all reporters
+        """
+        result = {
+            "peer_id": peer_id,
+            "local_warning": None,
+            "reputation_warnings": {},
+            "total_reporters": 0,
+            "severity_weighted": 0.0,
+            "recommend_ban": False
+        }
+
+        # Local warning
+        local = self._warnings.get(peer_id)
+        if local and not local.is_expired():
+            result["local_warning"] = local.to_dict()
+
+        # Aggregated reputation warnings
+        if hasattr(self, '_peer_rep_mgr') and self._peer_rep_mgr:
+            rep = self._peer_rep_mgr.get_reputation(peer_id)
+            if rep:
+                result["reputation_warnings"] = rep.warnings
+                result["total_reporters"] = len(rep.reporters)
+                result["reputation_score"] = rep.reputation_score
+
+                # Calculate severity-weighted score
+                # Multiple reporters with same warning = more severe
+                for warning_code, count in rep.warnings.items():
+                    result["severity_weighted"] += count * 0.2  # Each reporter adds 0.2
+
+        # Add local warning severity
+        if local:
+            result["severity_weighted"] += local.severity
+
+        # Recommend ban if severity is high or multiple reporters
+        # Threshold: severity >= 2.0 (e.g., 2+ reporters or very severe local detection)
+        result["recommend_ban"] = result["severity_weighted"] >= 2.0
+
+        return result
+
+    def get_ban_candidates(self) -> List[Dict[str, Any]]:
+        """
+        Get peers that should be considered for ban proposals.
+
+        Combines local threat detection with aggregated reputation data
+        to identify peers that warrant community action.
+
+        Returns:
+            List of peers with recommendation to ban
+        """
+        candidates = []
+
+        # Check all peers with active warnings
+        checked_peers = set(self._warnings.keys())
+
+        # Also check peers in reputation system with warnings
+        if hasattr(self, '_peer_rep_mgr') and self._peer_rep_mgr:
+            for peer_id, rep in self._peer_rep_mgr.get_all_reputations().items():
+                if rep.warnings or rep.reputation_score < 30:
+                    checked_peers.add(peer_id)
+
+        for peer_id in checked_peers:
+            accumulated = self.get_accumulated_warnings(peer_id)
+            if accumulated["recommend_ban"]:
+                candidates.append({
+                    "peer_id": peer_id,
+                    "severity_weighted": accumulated["severity_weighted"],
+                    "total_reporters": accumulated["total_reporters"],
+                    "warnings": accumulated.get("reputation_warnings", {}),
+                    "local_threat": accumulated.get("local_warning", {}).get("threat_type")
+                })
+
+        # Sort by severity (most severe first)
+        candidates.sort(key=lambda x: x["severity_weighted"], reverse=True)
+
+        return candidates
+
+    def should_auto_propose_ban(self, peer_id: str) -> Optional[str]:
+        """
+        Check if a peer should have an automatic ban proposal created.
+
+        Returns the reason for ban if yes, None otherwise.
+
+        Criteria:
+        - Severity weighted score >= 3.0 (very severe)
+        - OR 3+ unique reporters with same warning type
+        - OR local force_close threat with severity > 0.8
+
+        Args:
+            peer_id: Peer to check
+
+        Returns:
+            Ban reason string if should propose, None otherwise
+        """
+        accumulated = self.get_accumulated_warnings(peer_id)
+
+        # Very high severity from multiple sources
+        if accumulated["severity_weighted"] >= 3.0:
+            return f"Multiple reports of malicious behavior (severity={accumulated['severity_weighted']:.1f})"
+
+        # Check for consensus among reporters
+        if accumulated["total_reporters"] >= 3:
+            for warning_code, count in accumulated.get("reputation_warnings", {}).items():
+                if count >= 3:
+                    return f"Consensus warning: {warning_code} reported by {count} members"
+
+        # Severe local detection
+        local = accumulated.get("local_warning")
+        if local:
+            if local.get("threat_type") == "force_close" and local.get("severity", 0) > 0.8:
+                return "Force close threat detected with high severity"
+            if local.get("threat_type") == "drain" and local.get("severity", 0) > 0.9:
+                return "Severe drain attack detected"
+
+        return None
 
 
 # =============================================================================

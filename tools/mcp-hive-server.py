@@ -1779,6 +1779,42 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="ban_candidates",
+            description="Get peers that should be considered for ban proposals. Uses accumulated warnings from local threat detection and peer reputation reports from hive members. Set auto_propose=true to automatically create ban proposals for severe cases.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "auto_propose": {
+                        "type": "boolean",
+                        "description": "If true, automatically create ban proposals for severe cases (default: false)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="accumulated_warnings",
+            description="Get accumulated warning information for a specific peer. Combines local threat detection with aggregated peer reputation data from other hive members. Shows whether peer should be auto-banned.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer public key to check warnings for"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
             name="pheromone_levels",
             description="Get pheromone levels for adaptive fee control. Shows the 'memory' of successful fees for channels.",
             inputSchema={
@@ -2365,6 +2401,10 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_stigmergic_markers(arguments)
         elif name == "defense_status":
             result = await handle_defense_status(arguments)
+        elif name == "ban_candidates":
+            result = await handle_ban_candidates(arguments)
+        elif name == "accumulated_warnings":
+            result = await handle_accumulated_warnings(arguments)
         elif name == "pheromone_levels":
             result = await handle_pheromone_levels(arguments)
         elif name == "fee_coordination_status":
@@ -4976,6 +5016,70 @@ async def handle_defense_status(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-defense-status", {})
+
+
+async def handle_ban_candidates(args: Dict) -> Dict:
+    """Get peers that should be considered for ban proposals."""
+    node_name = args.get("node")
+    auto_propose = args.get("auto_propose", False)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-ban-candidates", {"auto_propose": auto_propose})
+
+    # Add AI-friendly note
+    candidates = result.get("ban_candidates", [])
+    if candidates:
+        result["ai_note"] = (
+            f"Found {len(candidates)} ban candidates. "
+            f"Most severe: {candidates[0].get('peer_id', 'unknown')[:16]}... "
+            f"with severity {candidates[0].get('severity_weighted', 0):.1f}. "
+            f"Use auto_propose=true to automatically create ban proposals for severe cases."
+        )
+    else:
+        result["ai_note"] = "No ban candidates found. The fleet has no peers with accumulated warnings meeting the ban threshold."
+
+    return result
+
+
+async def handle_accumulated_warnings(args: Dict) -> Dict:
+    """Get accumulated warning information for a specific peer."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-accumulated-warnings", {"peer_id": peer_id})
+
+    # Add AI-friendly note
+    severity = result.get("severity_weighted", 0)
+    reporters = result.get("total_reporters", 0)
+    should_ban = result.get("should_auto_ban", False)
+
+    if should_ban:
+        result["ai_note"] = (
+            f"ALERT: Peer {peer_id[:16]}... exceeds auto-ban threshold. "
+            f"Severity: {severity:.1f}, Reporters: {reporters}. "
+            f"Reason: {result.get('auto_ban_reason', 'Multiple severe warnings')}. "
+            f"Use ban_candidates with auto_propose=true to create ban proposal."
+        )
+    elif severity > 0:
+        result["ai_note"] = (
+            f"Peer {peer_id[:16]}... has warnings but below ban threshold. "
+            f"Severity: {severity:.1f}, Reporters: {reporters}. "
+            f"Ban threshold is 2.0 severity or 3+ reporters with same warning."
+        )
+    else:
+        result["ai_note"] = f"Peer {peer_id[:16]}... has no accumulated warnings."
+
+    return result
 
 
 async def handle_pheromone_levels(args: Dict) -> Dict:

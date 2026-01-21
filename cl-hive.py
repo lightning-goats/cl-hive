@@ -1223,6 +1223,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
         plugin.log("cl-hive: Time-based fee adjustment enabled (Phase 7.4)")
 
+    # Link defense system to peer reputation manager for collective warnings
+    if fee_coordination_mgr and peer_reputation_mgr:
+        fee_coordination_mgr.defense_system.set_peer_reputation_manager(peer_reputation_mgr)
+        plugin.log("cl-hive: Defense system linked to peer reputation (collective warnings enabled)")
+
     # Link yield optimization modules to Planner (Slime mold coordination)
     # These enable the planner to avoid redundant opens and prioritize high-value corridors
     planner.set_cooperation_modules(
@@ -8825,6 +8830,86 @@ def hive_broadcast_warning(
         threat_type=threat_type,
         severity=severity
     )
+
+
+@plugin.method("hive-ban-candidates")
+def hive_ban_candidates(plugin: Plugin, auto_propose: bool = False):
+    """
+    Get peers that should be considered for ban proposals.
+
+    Uses accumulated warnings from local threat detection and peer reputation
+    reports from other hive members to identify malicious actors.
+
+    Permission: Member only
+
+    Args:
+        auto_propose: If True, automatically create ban proposals for severe cases
+
+    Returns:
+        Dict with ban candidates and their severity scores.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    # Get candidates from defense system
+    candidates = fee_coordination_mgr.defense_system.get_ban_candidates()
+
+    result = {
+        "ban_candidates": candidates,
+        "count": len(candidates),
+        "auto_propose_enabled": auto_propose
+    }
+
+    if auto_propose and candidates:
+        # Check each candidate for auto-ban threshold
+        proposed = []
+        for candidate in candidates:
+            peer_id = candidate.get("peer_id")
+            reason = fee_coordination_mgr.defense_system.should_auto_propose_ban(peer_id)
+            if reason:
+                # Create ban proposal
+                try:
+                    ban_result = hive_ban(plugin, peer_id, reason)
+                    if "error" not in ban_result:
+                        proposed.append({
+                            "peer_id": peer_id,
+                            "reason": reason,
+                            "proposal_id": ban_result.get("proposal_id")
+                        })
+                except Exception as e:
+                    plugin.log(f"cl-hive: Failed to auto-propose ban for {peer_id[:16]}: {e}", level='warn')
+
+        result["auto_proposed"] = proposed
+        result["auto_proposed_count"] = len(proposed)
+
+    return result
+
+
+@plugin.method("hive-accumulated-warnings")
+def hive_accumulated_warnings(plugin: Plugin, peer_id: str):
+    """
+    Get accumulated warning information for a specific peer.
+
+    Combines local threat detection with aggregated peer reputation data
+    from other hive members.
+
+    Args:
+        peer_id: Peer to check
+
+    Returns:
+        Dict with warning summary including all reporters' data.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    warnings = fee_coordination_mgr.defense_system.get_accumulated_warnings(peer_id)
+
+    # Add auto-ban check
+    auto_ban_reason = fee_coordination_mgr.defense_system.should_auto_propose_ban(peer_id)
+    warnings["should_auto_ban"] = auto_ban_reason is not None
+    warnings["auto_ban_reason"] = auto_ban_reason
+
+    return warnings
 
 
 @plugin.method("hive-pheromone-levels")
