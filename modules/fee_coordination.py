@@ -70,6 +70,106 @@ TIME_FEE_MIN_CONFIDENCE = 0.5        # Require 50% confidence
 TIME_FEE_TRANSITION_PERIODS = 2      # Smooth over 2 hours
 TIME_FEE_CACHE_TTL_HOURS = 1         # Cache adjustments for 1 hour
 
+# =============================================================================
+# SALIENCE DETECTION (Noise Filtering)
+# =============================================================================
+# These thresholds determine what constitutes a "meaningful" change worth acting on.
+# Changes below these thresholds are considered noise and should be ignored.
+
+# Fee change salience
+SALIENT_FEE_CHANGE_PCT = 0.05        # 5% fee change minimum to be salient
+SALIENT_FEE_CHANGE_MIN_PPM = 10      # At least 10 ppm absolute change
+SALIENT_FEE_CHANGE_COOLDOWN = 3600   # 1 hour between fee changes per channel
+
+# Balance change salience
+SALIENT_BALANCE_CHANGE_PCT = 0.05    # 5% balance shift to be salient
+SALIENT_VELOCITY_CHANGE_PCT = 0.10   # 10% velocity change to be salient
+
+# Routing stats salience
+SALIENT_SUCCESS_RATE_CHANGE = 0.10   # 10% success rate change to be salient
+SALIENT_LATENCY_CHANGE_MS = 100      # 100ms latency change to be salient
+
+
+def is_fee_change_salient(
+    current_fee: int,
+    new_fee: int,
+    last_change_time: float = 0
+) -> Tuple[bool, str]:
+    """
+    Determine if a fee change is significant enough to warrant action.
+
+    Returns:
+        Tuple of (is_salient, reason)
+    """
+    # Check cooldown
+    now = time.time()
+    if last_change_time > 0 and (now - last_change_time) < SALIENT_FEE_CHANGE_COOLDOWN:
+        return False, "cooldown_active"
+
+    if current_fee == new_fee:
+        return False, "no_change"
+
+    # Calculate absolute and percentage change
+    abs_change = abs(new_fee - current_fee)
+    pct_change = abs_change / max(current_fee, 1)
+
+    # Must meet BOTH minimum thresholds
+    if abs_change < SALIENT_FEE_CHANGE_MIN_PPM:
+        return False, f"abs_change_too_small ({abs_change} < {SALIENT_FEE_CHANGE_MIN_PPM} ppm)"
+
+    if pct_change < SALIENT_FEE_CHANGE_PCT:
+        return False, f"pct_change_too_small ({pct_change * 100:.1f}% < {SALIENT_FEE_CHANGE_PCT * 100}%)"
+
+    return True, "salient"
+
+
+def is_balance_change_salient(
+    old_balance_pct: float,
+    new_balance_pct: float
+) -> Tuple[bool, str]:
+    """
+    Determine if a balance change is significant enough to warrant action.
+
+    Args:
+        old_balance_pct: Previous local balance as 0-1 ratio
+        new_balance_pct: Current local balance as 0-1 ratio
+
+    Returns:
+        Tuple of (is_salient, reason)
+    """
+    change = abs(new_balance_pct - old_balance_pct)
+
+    if change < SALIENT_BALANCE_CHANGE_PCT:
+        return False, f"balance_change_too_small ({change * 100:.1f}% < {SALIENT_BALANCE_CHANGE_PCT * 100}%)"
+
+    return True, "salient"
+
+
+def is_velocity_change_salient(
+    old_velocity: float,
+    new_velocity: float
+) -> Tuple[bool, str]:
+    """
+    Determine if a velocity change is significant enough to warrant action.
+
+    Args:
+        old_velocity: Previous velocity (sats/hour)
+        new_velocity: Current velocity (sats/hour)
+
+    Returns:
+        Tuple of (is_salient, reason)
+    """
+    if old_velocity == 0:
+        # Any non-zero velocity from zero is salient
+        return new_velocity != 0, "from_zero" if new_velocity != 0 else "no_change"
+
+    pct_change = abs(new_velocity - old_velocity) / abs(old_velocity)
+
+    if pct_change < SALIENT_VELOCITY_CHANGE_PCT:
+        return False, f"velocity_change_too_small ({pct_change * 100:.1f}% < {SALIENT_VELOCITY_CHANGE_PCT * 100}%)"
+
+    return True, "salient"
+
 
 # =============================================================================
 # DATA CLASSES
@@ -225,6 +325,11 @@ class FeeRecommendation:
     defensive_multiplier: float = 1.0
     time_adjustment_pct: float = 0.0    # Phase 7.4: Time-based adjustment
 
+    # Salience detection (noise filtering)
+    current_fee_ppm: int = 0            # Current fee for comparison
+    is_salient: bool = True             # Whether change is significant
+    salience_reason: str = ""           # Why change is/isn't salient
+
     # Confidence
     confidence: float = 0.5
     reason: str = ""
@@ -233,6 +338,7 @@ class FeeRecommendation:
         return {
             "channel_id": self.channel_id,
             "peer_id": self.peer_id,
+            "current_fee_ppm": self.current_fee_ppm,
             "recommended_fee_ppm": self.recommended_fee_ppm,
             "is_primary": self.is_primary,
             "corridor_source": self.corridor_source,
@@ -242,6 +348,8 @@ class FeeRecommendation:
             "stigmergic_influence": round(self.stigmergic_influence, 2),
             "defensive_multiplier": round(self.defensive_multiplier, 2),
             "time_adjustment_pct": round(self.time_adjustment_pct * 100, 1),
+            "is_salient": self.is_salient,
+            "salience_reason": self.salience_reason,
             "confidence": round(self.confidence, 2),
             "reason": self.reason
         }
@@ -1628,6 +1736,9 @@ class FeeCoordinationManager:
         # Phase 7.4: Time-based fee adjuster
         self.time_adjuster = TimeBasedFeeAdjuster(plugin, anticipatory_mgr)
 
+        # Salience detection: Track last fee change times per channel
+        self._fee_change_times: Dict[str, float] = {}
+
     def set_our_pubkey(self, pubkey: str) -> None:
         self.our_pubkey = pubkey
         self.corridor_mgr.set_our_pubkey(pubkey)
@@ -1643,6 +1754,15 @@ class FeeCoordinationManager:
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
             self.plugin.log(f"cl-hive: [FeeCoord] {msg}", level=level)
+
+    def _get_last_fee_change_time(self, channel_id: str) -> float:
+        """Get the timestamp of the last fee change for a channel."""
+        return self._fee_change_times.get(channel_id, 0)
+
+    def record_fee_change(self, channel_id: str) -> None:
+        """Record that a fee change was made for a channel."""
+        self._fee_change_times[channel_id] = time.time()
+        self._log(f"Recorded fee change for {channel_id}")
 
     def get_fee_recommendation(
         self,
@@ -1739,9 +1859,21 @@ class FeeCoordinationManager:
             confidence += stigmergic_influence * 0.2
         confidence = min(0.95, confidence)
 
+        # 7. Check salience (is this change worth making?)
+        is_salient, salience_reason = is_fee_change_salient(
+            current_fee=current_fee,
+            new_fee=recommended_fee,
+            last_change_time=self._get_last_fee_change_time(channel_id)
+        )
+
+        # If not salient, recommend keeping current fee
+        if not is_salient:
+            reasons.append(f"not_salient:{salience_reason}")
+
         return FeeRecommendation(
             channel_id=channel_id,
             peer_id=peer_id,
+            current_fee_ppm=current_fee,
             recommended_fee_ppm=recommended_fee,
             is_primary=is_primary,
             corridor_source=source_hint,
@@ -1751,6 +1883,8 @@ class FeeCoordinationManager:
             stigmergic_influence=stigmergic_influence,
             defensive_multiplier=defensive_multiplier,
             time_adjustment_pct=time_adjustment_pct,
+            is_salient=is_salient,
+            salience_reason=salience_reason,
             confidence=confidence,
             reason="; ".join(reasons) if reasons else "default"
         )

@@ -1919,6 +1919,43 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 "required": ["node"]
             }
         ),
+        # Routing Intelligence tools (Phase 4 - Cooperative Routing)
+        Tool(
+            name="routing_stats",
+            description="Get collective routing intelligence statistics. Shows aggregated data from all hive members including path success rates, probe counts, and overall routing health.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="route_suggest",
+            description="Get route suggestions for a destination using hive intelligence. Uses collective routing data from all members to suggest optimal paths with success rates and latency estimates.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Target node public key"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount to route in satoshis (default: 100000)"
+                    }
+                },
+                "required": ["node", "destination"]
+            }
+        ),
         # Channel Rationalization tools
         Tool(
             name="coverage_analysis",
@@ -2418,6 +2455,11 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_circular_flow_status(arguments)
         elif name == "cost_reduction_status":
             result = await handle_cost_reduction_status(arguments)
+        # Routing Intelligence tools
+        elif name == "routing_stats":
+            result = await handle_routing_stats(arguments)
+        elif name == "route_suggest":
+            result = await handle_route_suggest(arguments)
         # Channel Rationalization tools
         elif name == "coverage_analysis":
             result = await handle_coverage_analysis(arguments)
@@ -5165,6 +5207,80 @@ async def handle_cost_reduction_status(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-cost-reduction-status", {})
+
+
+# =============================================================================
+# Routing Intelligence Handlers (Phase 4 - Cooperative Routing)
+# =============================================================================
+
+async def handle_routing_stats(args: Dict) -> Dict:
+    """Get collective routing intelligence statistics."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-routing-stats", {})
+
+    # Add AI-friendly note
+    paths = result.get("paths_tracked", 0)
+    probes = result.get("total_probes", 0)
+    success_rate = result.get("overall_success_rate", 0)
+
+    if probes > 0:
+        result["ai_note"] = (
+            f"Routing intelligence: {paths} paths tracked from {probes} probes. "
+            f"Overall success rate: {success_rate * 100:.1f}%. "
+            f"High quality paths (>90% success): {result.get('high_quality_paths', 0)}. "
+            "Use route_suggest to get recommendations for specific destinations."
+        )
+    else:
+        result["ai_note"] = (
+            "No routing probes collected yet. Route probes are shared between hive members "
+            "to build collective routing intelligence. Data will accumulate over time."
+        )
+
+    return result
+
+
+async def handle_route_suggest(args: Dict) -> Dict:
+    """Get route suggestions for a destination using hive intelligence."""
+    node_name = args.get("node")
+    destination = args.get("destination")
+    amount_sats = args.get("amount_sats", 100000)
+
+    if not destination:
+        return {"error": "destination is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-route-suggest", {
+        "destination": destination,
+        "amount_sats": amount_sats
+    })
+
+    # Add AI-friendly note
+    route_count = result.get("route_count", 0)
+    routes = result.get("routes", [])
+
+    if route_count > 0:
+        best = routes[0] if routes else {}
+        result["ai_note"] = (
+            f"Found {route_count} routes to {destination[:16]}... "
+            f"Best route has {best.get('success_rate', 0) * 100:.1f}% success rate, "
+            f"~{best.get('expected_latency_ms', 0)}ms latency, "
+            f"confidence: {best.get('confidence', 0) * 100:.0f}%."
+        )
+    else:
+        result["ai_note"] = (
+            f"No routes found to {destination[:16]}... in hive routing intelligence. "
+            "Route data is built from shared probes - this destination may not have been probed yet."
+        )
+
+    return result
 
 
 # =============================================================================
