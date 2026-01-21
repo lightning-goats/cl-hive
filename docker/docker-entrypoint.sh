@@ -144,8 +144,8 @@ bitcoin-rpcpassword=$BITCOIN_RPCPASSWORD
 log-level=$LOG_LEVEL
 log-file=$LIGHTNING_DIR/lightningd.log
 
-# Database
-wallet=sqlite3://$LIGHTNING_DIR/lightningd.sqlite3
+# Database with real-time replication to backup directory
+wallet=sqlite3://$LIGHTNING_DIR/lightningd.sqlite3:/backups/database/lightningd.sqlite3
 
 # Plugins directory
 plugin-dir=/root/.lightning/plugins

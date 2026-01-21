@@ -52,21 +52,28 @@ RUN apt-get update && apt-get install -y \
     supervisor \
     # JSON processing
     jq \
+    # File watching for backup
+    inotify-tools \
+    # Node.js for c-lightning-REST
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
 # BITCOIN CLI (required for CLN's bcli plugin)
 # =============================================================================
-
-# Install bitcoin-cli from Bitcoin Core
-ARG BITCOIN_VERSION=28.1
-RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then ARCH="x86_64-linux-gnu"; fi \
-    && if [ "$ARCH" = "aarch64" ]; then ARCH="aarch64-linux-gnu"; fi \
-    && curl -SLO "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/bitcoin-${BITCOIN_VERSION}-${ARCH}.tar.gz" \
-    && tar -xzf bitcoin-${BITCOIN_VERSION}-${ARCH}.tar.gz \
-    && install -m 0755 bitcoin-${BITCOIN_VERSION}/bin/bitcoin-cli /usr/local/bin/ \
-    && rm -rf bitcoin-${BITCOIN_VERSION} bitcoin-${BITCOIN_VERSION}-${ARCH}.tar.gz
+# NOTE: bitcoin-cli is mounted from host via docker-compose.yml
+# The download step is skipped to avoid network issues with bitcoincore.org
+# If you need bitcoin-cli baked into the image, uncomment below:
+#
+# ARG BITCOIN_VERSION=28.1
+# RUN ARCH=$(uname -m) \
+#     && if [ "$ARCH" = "x86_64" ]; then ARCH="x86_64-linux-gnu"; fi \
+#     && if [ "$ARCH" = "aarch64" ]; then ARCH="aarch64-linux-gnu"; fi \
+#     && curl -SLO "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/bitcoin-${BITCOIN_VERSION}-${ARCH}.tar.gz" \
+#     && tar -xzf bitcoin-${BITCOIN_VERSION}-${ARCH}.tar.gz \
+#     && install -m 0755 bitcoin-${BITCOIN_VERSION}/bin/bitcoin-cli /usr/local/bin/ \
+#     && rm -rf bitcoin-${BITCOIN_VERSION} bitcoin-${BITCOIN_VERSION}-${ARCH}.tar.gz
 
 # =============================================================================
 # CORE LIGHTNING

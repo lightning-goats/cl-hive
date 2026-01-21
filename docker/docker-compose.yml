@@ -111,6 +111,12 @@ services:
       # Copy your host's bitcoin-cli first: cp /usr/local/bin/bitcoin-cli ./bitcoin-cli
       - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
 
+      # Backup directory for database replication and emergency.recover
+      - ${BACKUP_LOCATION:-./backups}:/backups
+
+      # Emergency.recover watcher script
+      - ./scripts/emergency-recover-watcher.sh:/usr/local/bin/emergency-recover-watcher.sh:ro
+
     ports:
       # Lightning P2P (only needed for clearnet/hybrid modes)
       - "${LIGHTNING_PORT:-9736}:${LIGHTNING_PORT:-9736}"
