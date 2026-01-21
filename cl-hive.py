@@ -7651,7 +7651,7 @@ def hive_force_promote(plugin: Plugin, peer_id: str):
         "peer_id": peer_id,
         "new_tier": MembershipTier.MEMBER.value,
         "method": "admin_bootstrap",
-        "remaining_bootstrap_slots": min_vouch - member_count - 1
+        "remaining_bootstrap_slots": min_for_quorum - member_count - 1
     }
 
 
