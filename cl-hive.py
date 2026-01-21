@@ -1136,7 +1136,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global settlement_mgr
     settlement_mgr = SettlementManager(
         database=database,
-        plugin=safe_plugin
+        plugin=safe_plugin,
+        rpc=safe_plugin.rpc
     )
     settlement_mgr.initialize_tables()
     plugin.log("cl-hive: Settlement manager initialized (BOLT12 payouts)")
