@@ -262,6 +262,23 @@ restore_database() {
     docker cp "$temp_dir/database/lightningd.sqlite3-wal" "$CONTAINER_NAME:$target_dir/" 2>/dev/null || true
     docker cp "$temp_dir/database/lightningd.sqlite3-shm" "$CONTAINER_NAME:$target_dir/" 2>/dev/null || true
 
+    # Restore plugin databases (cl-hive and cl-revenue-ops)
+    if [[ -f "$temp_dir/database/cl_hive.db" ]]; then
+        log "Restoring cl-hive database..."
+        docker cp "$temp_dir/database/cl_hive.db" "$CONTAINER_NAME:$target_dir/$NETWORK/"
+        log_success "cl-hive database restored"
+    else
+        log_warning "cl-hive database not found in backup"
+    fi
+
+    if [[ -f "$temp_dir/database/revenue_ops.db" ]]; then
+        log "Restoring cl-revenue-ops database..."
+        docker cp "$temp_dir/database/revenue_ops.db" "$CONTAINER_NAME:$target_dir/$NETWORK/"
+        log_success "cl-revenue-ops database restored"
+    else
+        log_warning "cl-revenue-ops database not found in backup"
+    fi
+
     # Cleanup
     rm -rf "$temp_dir"
 

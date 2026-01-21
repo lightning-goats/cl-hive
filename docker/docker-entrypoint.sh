@@ -367,6 +367,12 @@ cat >> "$CONFIG_FILE" << EOF
 
 hive-governance-mode=$HIVE_GOVERNANCE_MODE
 hive-db-path=$LIGHTNING_DIR/$NETWORK/cl_hive.db
+
+# =============================================================================
+# cl-revenue-ops Configuration
+# =============================================================================
+
+revenue-ops-db-path=$LIGHTNING_DIR/$NETWORK/revenue_ops.db
 EOF
 
 # Append additional hive config if exists

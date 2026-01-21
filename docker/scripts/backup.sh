@@ -175,6 +175,15 @@ backup_database() {
     docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/lightningd.sqlite3-wal" "$db_dir/" 2>/dev/null || true
     docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/lightningd.sqlite3-shm" "$db_dir/" 2>/dev/null || true
 
+    # Copy plugin databases (cl-hive and cl-revenue-ops)
+    log "Backing up plugin databases..."
+    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/$NETWORK/cl_hive.db" "$db_dir/" 2>/dev/null || \
+        docker cp "$CONTAINER_NAME:/root/.lightning/cl_hive.db" "$db_dir/" 2>/dev/null || \
+        log_warning "cl-hive database not found"
+    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/$NETWORK/revenue_ops.db" "$db_dir/" 2>/dev/null || \
+        docker cp "$CONTAINER_NAME:/root/.lightning/revenue_ops.db" "$db_dir/" 2>/dev/null || \
+        log_warning "cl-revenue-ops database not found"
+
     # Create checksum
     sha256sum "$db_dir"/* > "$db_dir/checksums.sha256"
 
