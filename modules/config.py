@@ -103,7 +103,7 @@ class HiveConfig:
 
     # Phase 5 safety knobs
     membership_enabled: bool = True
-    auto_join_enabled: bool = True        # Auto-send HELLO on peer_connected to discover hive
+    auto_join_enabled: bool = False       # Auto-send HELLO on peer_connected (disabled: CLN crash bug)
     auto_vouch_enabled: bool = True
     auto_promote_enabled: bool = True
     ban_autotrigger_enabled: bool = False

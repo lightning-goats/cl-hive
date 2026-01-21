@@ -599,6 +599,13 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='hive-auto-join',
+    default='false',
+    description='Auto-discover hive peers on connect (disabled to avoid CLN crash bug)',
+    dynamic=True
+)
+
+plugin.add_option(
     name='hive-auto-promote',
     default='true',
     description='Auto-promote when quorum reached (default: true)',
@@ -750,6 +757,7 @@ OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
     'hive-max-members': ('max_members', int),
     'hive-market-share-cap': ('market_share_cap_pct', float),
     'hive-membership-enabled': ('membership_enabled', bool),
+    'hive-auto-join': ('auto_join_enabled', bool),
     'hive-auto-vouch': ('auto_vouch_enabled', bool),
     'hive-auto-promote': ('auto_promote_enabled', bool),
     'hive-ban-autotrigger': ('ban_autotrigger_enabled', bool),
@@ -884,6 +892,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         db_path=options.get('hive-db-path', '~/.lightning/cl_hive.db'),
         governance_mode=options.get('hive-governance-mode', 'advisor'),
         membership_enabled=_parse_bool(options.get('hive-membership-enabled', 'true')),
+        auto_join_enabled=_parse_bool(options.get('hive-auto-join', 'false')),
         auto_vouch_enabled=_parse_bool(options.get('hive-auto-vouch', 'true')),
         auto_promote_enabled=_parse_bool(options.get('hive-auto-promote', 'true')),
         ban_autotrigger_enabled=_parse_bool(options.get('hive-ban-autotrigger', 'false')),
