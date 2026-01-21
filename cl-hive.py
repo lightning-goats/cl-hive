@@ -8299,6 +8299,9 @@ def hive_settlement_calculate(plugin: Plugin):
     # Calculate fair shares
     results = settlement_mgr.calculate_fair_shares(member_contributions)
 
+    # Generate payments that would be required
+    payments = settlement_mgr.generate_payments(results)
+
     # Format for JSON response
     return {
         "period": pool_status.get("period", "unknown"),
@@ -8316,7 +8319,17 @@ def hive_settlement_calculate(plugin: Plugin):
             }
             for r in results
         ],
-        "payments_required": []  # Will be populated when there's actual revenue
+        "payments_required": [
+            {
+                "from_peer": p.from_peer[:16] + "...",
+                "from_peer_full": p.from_peer,
+                "to_peer": p.to_peer[:16] + "...",
+                "to_peer_full": p.to_peer,
+                "amount_sats": p.amount_sats,
+                "bolt12_offer": p.bolt12_offer[:40] + "..." if p.bolt12_offer else None
+            }
+            for p in payments
+        ]
     }
 
 
@@ -8334,23 +8347,223 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
     Returns:
         Dict with settlement execution result.
     """
-    # First calculate fair shares (reuses the calculation logic)
-    calc_result = hive_settlement_calculate(plugin)
+    from modules.settlement import MemberContribution, SettlementResult, MIN_PAYMENT_SATS
 
-    if "error" in calc_result:
-        return calc_result
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    if not routing_pool:
+        return {"error": "Routing pool not initialized"}
+    if not database:
+        return {"error": "Database not initialized"}
 
-    # For dry run, just return the calculation
+    # Get pool status with member contributions
+    pool_status = routing_pool.get_pool_status()
+    pool_contributions = pool_status.get("contributions", [])
+    period = pool_status.get("period", "unknown")
+
+    # Convert pool data to MemberContribution objects
+    member_contributions = []
+    for contrib in pool_contributions:
+        peer_id = contrib.get("member_id_full", contrib.get("member_id", ""))
+        if not peer_id:
+            continue
+
+        # Get forwarding stats from contribution ledger
+        contrib_stats = database.get_contribution_stats(peer_id, window_days=7)
+        forwards_sats = contrib_stats.get("forwarded", 0)
+
+        # Get fees earned from cl-revenue-ops if available
+        fees_earned = 0
+        if bridge and bridge.status == BridgeStatus.ENABLED:
+            try:
+                peer_report = bridge.safe_call("revenue-report-peer", peer_id=peer_id)
+                if peer_report and "error" not in peer_report:
+                    fees_earned = peer_report.get("fees_earned_sats", 0)
+            except Exception:
+                pass  # Fallback to 0 if revenue-ops unavailable
+
+        # Get BOLT12 offer if registered
+        offer = settlement_mgr.get_offer(peer_id)
+
+        member_contributions.append(MemberContribution(
+            peer_id=peer_id,
+            capacity_sats=contrib.get("capacity_sats", 0),
+            forwards_sats=forwards_sats,
+            fees_earned_sats=fees_earned,
+            uptime_pct=contrib.get("uptime_pct", 0.0),  # Already in 0-100 format
+            bolt12_offer=offer
+        ))
+
+    if not member_contributions:
+        return {"error": "No member contributions found"}
+
+    # Calculate fair shares
+    results = settlement_mgr.calculate_fair_shares(member_contributions)
+
+    # Generate payments from results
+    payments = settlement_mgr.generate_payments(results)
+
+    # Build response
+    response = {
+        "period": period,
+        "total_members": len(results),
+        "total_fees_sats": sum(r.fees_earned for r in results),
+        "fair_shares": [
+            {
+                "peer_id": r.peer_id[:16] + "...",
+                "peer_id_full": r.peer_id,
+                "fees_earned": r.fees_earned,
+                "fair_share": r.fair_share,
+                "balance": r.balance,
+                "has_offer": r.bolt12_offer is not None,
+                "status": "pays" if r.balance < 0 else ("receives" if r.balance > 0 else "even")
+            }
+            for r in results
+        ],
+        "payments_required": [
+            {
+                "from_peer": p.from_peer[:16] + "...",
+                "from_peer_full": p.from_peer,
+                "to_peer": p.to_peer[:16] + "...",
+                "to_peer_full": p.to_peer,
+                "amount_sats": p.amount_sats,
+                "bolt12_offer": p.bolt12_offer[:40] + "..." if p.bolt12_offer else None
+            }
+            for p in payments
+        ]
+    }
+
+    # For dry run, return calculation without executing
     if dry_run:
-        calc_result["execution_status"] = "dry_run"
-        calc_result["message"] = "Dry run - no payments executed"
-        return calc_result
+        response["execution_status"] = "dry_run"
+        response["message"] = f"Dry run - {len(payments)} payments would be executed"
+        return response
 
-    # For actual execution, generate and execute payments
-    # Note: BOLT12 payment execution is not yet implemented
-    calc_result["execution_status"] = "not_implemented"
-    calc_result["message"] = "BOLT12 payment execution pending implementation"
-    return calc_result
+    # Check if we have any payments to execute
+    if not payments:
+        response["execution_status"] = "no_payments"
+        response["message"] = "No payments required (all members at fair share or below minimum threshold)"
+        return response
+
+    # Check that payer has offers registered (to verify they're real members)
+    our_pubkey = None
+    try:
+        info = safe_plugin.rpc.getinfo()
+        our_pubkey = info.get("id")
+    except Exception:
+        pass
+
+    # Execute payments - we can only pay from our own node
+    executed = []
+    skipped = []
+    errors = []
+
+    for payment in payments:
+        # We can only execute payments FROM our own node
+        if payment.from_peer != our_pubkey:
+            skipped.append({
+                "from_peer": payment.from_peer[:16] + "...",
+                "to_peer": payment.to_peer[:16] + "...",
+                "amount_sats": payment.amount_sats,
+                "reason": "not_our_payment"
+            })
+            continue
+
+        if not payment.bolt12_offer:
+            errors.append({
+                "to_peer": payment.to_peer[:16] + "...",
+                "amount_sats": payment.amount_sats,
+                "error": "recipient has no BOLT12 offer registered"
+            })
+            continue
+
+        try:
+            # Fetch invoice from BOLT12 offer
+            invoice_result = safe_plugin.rpc.fetchinvoice(
+                offer=payment.bolt12_offer,
+                amount_msat=f"{payment.amount_sats * 1000}msat"
+            )
+
+            if "invoice" not in invoice_result:
+                errors.append({
+                    "to_peer": payment.to_peer[:16] + "...",
+                    "amount_sats": payment.amount_sats,
+                    "error": "Failed to fetch invoice from offer"
+                })
+                continue
+
+            bolt12_invoice = invoice_result["invoice"]
+
+            # Pay the invoice
+            pay_result = safe_plugin.rpc.pay(bolt12_invoice)
+
+            if pay_result.get("status") == "complete":
+                executed.append({
+                    "to_peer": payment.to_peer[:16] + "...",
+                    "amount_sats": payment.amount_sats,
+                    "payment_hash": pay_result.get("payment_hash"),
+                    "status": "completed"
+                })
+            else:
+                errors.append({
+                    "to_peer": payment.to_peer[:16] + "...",
+                    "amount_sats": payment.amount_sats,
+                    "error": pay_result.get("message", "Payment failed")
+                })
+
+        except Exception as e:
+            errors.append({
+                "to_peer": payment.to_peer[:16] + "...",
+                "amount_sats": payment.amount_sats,
+                "error": str(e)
+            })
+
+    # Create settlement period record
+    period_id = settlement_mgr.create_settlement_period()
+    settlement_mgr.record_contributions(period_id, results, member_contributions)
+    settlement_mgr.record_payments(period_id, payments)
+
+    # Update payment statuses in database
+    for exec_payment in executed:
+        # Find original payment to get full peer IDs
+        for p in payments:
+            if p.to_peer[:16] == exec_payment["to_peer"][:16]:
+                settlement_mgr.update_payment_status(
+                    period_id=period_id,
+                    from_peer=p.from_peer,
+                    to_peer=p.to_peer,
+                    status="completed",
+                    payment_hash=exec_payment.get("payment_hash")
+                )
+                break
+
+    for err_payment in errors:
+        for p in payments:
+            if p.to_peer[:16] == err_payment["to_peer"][:16]:
+                settlement_mgr.update_payment_status(
+                    period_id=period_id,
+                    from_peer=p.from_peer,
+                    to_peer=p.to_peer,
+                    status="error",
+                    error=err_payment.get("error")
+                )
+                break
+
+    # Complete period if all our payments are done
+    if not errors:
+        settlement_mgr.complete_settlement_period(period_id)
+
+    response["execution_status"] = "executed"
+    response["period_id"] = period_id
+    response["payments_executed"] = executed
+    response["payments_skipped"] = skipped
+    response["payments_errors"] = errors
+    response["message"] = (
+        f"Settlement executed: {len(executed)} payments completed, "
+        f"{len(skipped)} skipped (other nodes), {len(errors)} errors"
+    )
+
+    return response
 
 
 @plugin.method("hive-settlement-history")
