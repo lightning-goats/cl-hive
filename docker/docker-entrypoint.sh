@@ -285,7 +285,40 @@ EOF
         chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor
         chmod 700 /var/lib/tor/cln-service
 
-        echo "Tor configured - hidden service will be created on first start"
+        # For hybrid mode, we need the onion address in the config
+        # Check if hostname file already exists (persisted from previous run)
+        ONION_FILE="/var/lib/tor/cln-service/hostname"
+        if [ -f "$ONION_FILE" ]; then
+            ONION_ADDR=$(cat "$ONION_FILE" | tr -d '\n')
+            echo "announce-addr=${ONION_ADDR}:${LIGHTNING_PORT}" >> "$CONFIG_FILE"
+            echo "Tor address: ${ONION_ADDR}:${LIGHTNING_PORT}"
+        else
+            # First run - start Tor temporarily to generate hidden service
+            echo "Generating Tor hidden service (first run)..."
+            tor -f /etc/tor/torrc &
+            TOR_PID=$!
+
+            # Wait for hidden service hostname (max 30 seconds)
+            for i in $(seq 1 30); do
+                if [ -f "$ONION_FILE" ]; then
+                    ONION_ADDR=$(cat "$ONION_FILE" | tr -d '\n')
+                    echo "announce-addr=${ONION_ADDR}:${LIGHTNING_PORT}" >> "$CONFIG_FILE"
+                    echo "Tor address: ${ONION_ADDR}:${LIGHTNING_PORT}"
+                    break
+                fi
+                sleep 1
+            done
+
+            # Stop temporary Tor (supervisor will manage it)
+            kill $TOR_PID 2>/dev/null || true
+            wait $TOR_PID 2>/dev/null || true
+
+            if [ -z "$ONION_ADDR" ]; then
+                echo "WARNING: Could not generate Tor hidden service"
+            fi
+        fi
+
+        echo "Hybrid mode configured"
         ;;
 
     *)
