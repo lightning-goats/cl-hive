@@ -120,6 +120,10 @@ services:
       # Plugin database backup script (runs every 5 min)
       - ./scripts/plugin-db-backup.sh:/usr/local/bin/plugin-db-backup.sh:ro
 
+      # Graceful shutdown scripts
+      - ./scripts/lightningd-wrapper.sh:/usr/local/bin/lightningd-wrapper.sh:ro
+      - ./scripts/pre-stop.sh:/usr/local/bin/pre-stop.sh:ro
+
     ports:
       # Lightning P2P (only needed for clearnet/hybrid modes)
       - "${LIGHTNING_PORT:-9736}:${LIGHTNING_PORT:-9736}"

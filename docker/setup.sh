@@ -271,11 +271,23 @@ main() {
     prompt_yes_no RTL_ENABLED "Enable RTL web interface?" "Y"
 
     if [[ "$RTL_ENABLED" == "true" ]]; then
-        prompt RTL_PASSWORD "RTL web interface password" "" true
-        if [[ -z "$RTL_PASSWORD" ]]; then
-            RTL_PASSWORD="changeme"
-            print_warning "Using default password 'changeme' - CHANGE THIS IN PRODUCTION!"
-        fi
+        echo ""
+        print_warning "SECURITY: RTL requires a strong password for web access"
+        echo ""
+        while true; do
+            prompt RTL_PASSWORD "RTL web interface password" "" true
+            if [[ -z "$RTL_PASSWORD" ]]; then
+                print_error "RTL password is required for security - cannot be empty"
+                continue
+            elif [[ "$RTL_PASSWORD" == "changeme" ]]; then
+                print_error "Cannot use 'changeme' as password - choose a strong password"
+                continue
+            elif [[ ${#RTL_PASSWORD} -lt 8 ]]; then
+                print_error "Password must be at least 8 characters"
+                continue
+            fi
+            break
+        done
         prompt RTL_PORT "RTL web interface port" "$DEFAULT_RTL_PORT"
         print_success "RTL will be accessible at http://localhost:$RTL_PORT"
     else
@@ -419,6 +431,12 @@ main() {
         print_success "Created secrets/wg_private_key"
     fi
 
+    if [[ -n "$RTL_PASSWORD" && "$RTL_PASSWORD" != "changeme" ]]; then
+        echo -n "$RTL_PASSWORD" > secrets/rtl_password
+        chmod 600 secrets/rtl_password
+        print_success "Created secrets/rtl_password"
+    fi
+
     # Generate .env file (non-sensitive values)
     cat > .env << EOF
 # cl-hive Production Node Environment Configuration
@@ -497,7 +515,7 @@ GPG_KEY_ID=${GPG_KEY_ID:-}
 # RIDE THE LIGHTNING
 # =============================================================================
 RTL_ENABLED=$RTL_ENABLED
-RTL_PASSWORD=${RTL_PASSWORD:-changeme}
+# Password is in secrets/rtl_password (not stored in .env for security)
 RTL_PORT=${RTL_PORT:-3000}
 EOF
 
@@ -517,7 +535,9 @@ EOF
 LIGHTNING_PORT=$LIGHTNING_PORT
 EOF
 
-    print_success "Created .env"
+    # SECURITY: Restrict .env file permissions (contains usernames and paths)
+    chmod 600 .env
+    print_success "Created .env (permissions: 600)"
 
     # Generate docker-compose.override.yml for resource limits
     # Build the override file with conditional WireGuard support
@@ -587,6 +607,13 @@ EOF
 EOF
     fi
 
+    # Add RTL secret if enabled
+    if [[ "$RTL_ENABLED" == "true" ]]; then
+        cat >> docker-compose.override.yml << EOF
+      - rtl_password
+EOF
+    fi
+
     # Define secrets at top level
     cat >> docker-compose.override.yml << EOF
 
@@ -600,6 +627,21 @@ EOF
         cat >> docker-compose.override.yml << EOF
   wg_private_key:
     file: ./secrets/wg_private_key
+EOF
+    fi
+
+    # Add RTL secret definition if enabled
+    if [[ "$RTL_ENABLED" == "true" ]]; then
+        cat >> docker-compose.override.yml << EOF
+  rtl_password:
+    file: ./secrets/rtl_password
+
+# RTL service overrides
+  rtl:
+    secrets:
+      - rtl_password
+    environment:
+      - APP_PASSWORD_FILE=/run/secrets/rtl_password
 EOF
     fi
 
@@ -643,10 +685,11 @@ EOF
     echo "  Backups:     $BACKUP_LOCATION (${BACKUP_RETENTION} days)"
     echo ""
     echo -e "${BOLD}Files Created:${NC}"
-    echo "  ✓ .env"
+    echo "  ✓ .env (mode: 600)"
     echo "  ✓ docker-compose.override.yml"
     echo "  ✓ secrets/bitcoin_rpc_password"
     [[ -n "$WG_PRIVATE_KEY" ]] && echo "  ✓ secrets/wg_private_key"
+    [[ "$RTL_ENABLED" == "true" ]] && echo "  ✓ secrets/rtl_password"
     echo ""
     echo -e "${BOLD}Next Steps:${NC}"
     echo ""

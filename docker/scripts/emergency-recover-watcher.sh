@@ -25,14 +25,17 @@ backup_emergency_recover() {
         local backup_file="$BACKUP_DIR/emergency.recover"
         local versioned_backup="$BACKUP_DIR/emergency.recover.$timestamp"
 
-        # Copy current version
+        # Copy current version with secure permissions
         cp "$WATCHED_FILE" "$backup_file"
+        chmod 400 "$backup_file"  # SECURITY: Read-only, owner only
 
         # Keep a versioned copy (retain last 3)
         cp "$WATCHED_FILE" "$versioned_backup"
+        chmod 400 "$versioned_backup"  # SECURITY: Read-only, owner only
 
-        # Cleanup old versions (keep last 3)
-        ls -t "$BACKUP_DIR"/emergency.recover.* 2>/dev/null | tail -n +4 | xargs -r rm -f
+        # Cleanup old versions (keep last 3) - use -type f to avoid following symlinks
+        find "$BACKUP_DIR" -maxdepth 1 -name 'emergency.recover.*' -type f -printf '%T@ %p\n' 2>/dev/null | \
+            sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -f
 
         log "Backed up emergency.recover ($(stat -c%s "$backup_file") bytes)"
     else
@@ -40,8 +43,9 @@ backup_emergency_recover() {
     fi
 }
 
-# Ensure backup directory exists
+# Ensure backup directory exists with secure permissions
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"  # SECURITY: Restrict access to owner only
 
 # Initial backup
 log "Starting emergency.recover watcher"

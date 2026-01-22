@@ -29,22 +29,45 @@ echo "Starting initialization..."
 # Secret Loading Function
 # -----------------------------------------------------------------------------
 # Reads secrets from Docker secrets files (/run/secrets/) or environment
+# SECURITY: Prefers file-based secrets over environment variables
 load_secret() {
     local var_name="$1"
     local file_var="${var_name}_FILE"
     local secret_value=""
+    local source="none"
 
     # Check for _FILE environment variable pointing to secret
-    if [[ -n "${!file_var:-}" && -f "${!file_var}" ]]; then
-        secret_value=$(cat "${!file_var}")
-        echo "Loaded $var_name from file"
+    if [[ -n "${!file_var:-}" ]]; then
+        if [[ -f "${!file_var}" ]]; then
+            if [[ -r "${!file_var}" ]]; then
+                secret_value=$(cat "${!file_var}")
+                source="file (${!file_var})"
+            else
+                echo "WARNING: Secret file ${!file_var} exists but is not readable"
+                echo "         Check file permissions (should be 600 or 400)"
+            fi
+        else
+            echo "WARNING: ${file_var} set to '${!file_var}' but file does not exist"
+        fi
+    fi
+
     # Check standard Docker secrets location
-    elif [[ -f "/run/secrets/${var_name,,}" ]]; then
+    if [[ -z "$secret_value" && -f "/run/secrets/${var_name,,}" ]]; then
         secret_value=$(cat "/run/secrets/${var_name,,}")
-        echo "Loaded $var_name from Docker secret"
-    # Fall back to environment variable
-    elif [[ -n "${!var_name:-}" ]]; then
+        source="Docker secret"
+    fi
+
+    # Fall back to environment variable (with security warning)
+    if [[ -z "$secret_value" && -n "${!var_name:-}" ]]; then
         secret_value="${!var_name}"
+        source="environment variable"
+        echo "SECURITY WARNING: $var_name loaded from environment variable"
+        echo "                  Environment variables are visible in process listings!"
+        echo "                  Use Docker secrets or _FILE pattern in production."
+    fi
+
+    if [[ -n "$secret_value" ]]; then
+        echo "Loaded $var_name from $source"
     fi
 
     # Export the value
@@ -153,6 +176,9 @@ plugin-dir=/root/.lightning/plugins
 # gRPC plugin (must use different port than Lightning P2P)
 grpc-port=9937
 EOF
+
+# SECURITY: Restrict config file permissions (contains RPC password)
+chmod 600 "$CONFIG_FILE"
 
 # -----------------------------------------------------------------------------
 # Network Mode Configuration (tor/clearnet/hybrid)
@@ -389,30 +415,53 @@ fi
 export LIGHTNING_DIR="$LIGHTNING_DIR"
 
 # -----------------------------------------------------------------------------
-# Wait for Bitcoin RPC
+# Wait for Bitcoin RPC (with exponential backoff)
 # -----------------------------------------------------------------------------
 
 echo "Waiting for Bitcoin RPC at $BITCOIN_RPCHOST:$BITCOIN_RPCPORT..."
 
-MAX_RETRIES=60
+MAX_RETRIES=20
 RETRY_COUNT=0
+SLEEP_TIME=1
+MAX_SLEEP=30
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if curl -s --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
+    # Test RPC connection and verify credentials
+    RPC_RESPONSE=$(curl -s --max-time 10 --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
         --data-binary '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
         -H 'content-type: text/plain;' \
-        "http://$BITCOIN_RPCHOST:$BITCOIN_RPCPORT/" > /dev/null 2>&1; then
+        "http://$BITCOIN_RPCHOST:$BITCOIN_RPCPORT/" 2>&1) || true
+
+    # Check for successful response
+    if echo "$RPC_RESPONSE" | grep -q '"result"'; then
         echo "Bitcoin RPC available"
+        # Extract and display chain info
+        CHAIN=$(echo "$RPC_RESPONSE" | grep -o '"chain":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
+        BLOCKS=$(echo "$RPC_RESPONSE" | grep -o '"blocks":[0-9]*' | cut -d':' -f2 || echo "unknown")
+        echo "  Chain: $CHAIN, Blocks: $BLOCKS"
         break
     fi
 
+    # Check for authentication error (wrong credentials)
+    if echo "$RPC_RESPONSE" | grep -qi "401\|unauthorized\|authentication"; then
+        echo "ERROR: Bitcoin RPC authentication failed - check BITCOIN_RPCUSER and BITCOIN_RPCPASSWORD"
+        exit 1
+    fi
+
     RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "Waiting for Bitcoin RPC... ($RETRY_COUNT/$MAX_RETRIES)"
-    sleep 5
+    echo "Waiting for Bitcoin RPC... ($RETRY_COUNT/$MAX_RETRIES, next retry in ${SLEEP_TIME}s)"
+    sleep "$SLEEP_TIME"
+
+    # Exponential backoff with cap
+    SLEEP_TIME=$((SLEEP_TIME * 2))
+    if [ $SLEEP_TIME -gt $MAX_SLEEP ]; then
+        SLEEP_TIME=$MAX_SLEEP
+    fi
 done
 
 if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
     echo "ERROR: Bitcoin RPC not available after $MAX_RETRIES attempts"
+    echo "Last response: $RPC_RESPONSE"
     exit 1
 fi
 
@@ -454,10 +503,21 @@ fi
 # Ensure supervisor log directory exists
 mkdir -p /var/log/supervisor
 
-# Copy pre-stop script if not present
+# -----------------------------------------------------------------------------
+# Secure Backup Directories
+# -----------------------------------------------------------------------------
+# SECURITY: Backup directories contain sensitive data (channel state, recovery files)
+mkdir -p /backups/database /backups/emergency /backups/plugins
+chmod 700 /backups /backups/database /backups/emergency /backups/plugins
+echo "Backup directories secured with restricted permissions"
+
+# Copy shutdown scripts if not present
 if [ -d /opt/cl-hive/docker/scripts ]; then
     cp /opt/cl-hive/docker/scripts/pre-stop.sh /usr/local/bin/ 2>/dev/null || true
     chmod +x /usr/local/bin/pre-stop.sh 2>/dev/null || true
+
+    cp /opt/cl-hive/docker/scripts/lightningd-wrapper.sh /usr/local/bin/ 2>/dev/null || true
+    chmod +x /usr/local/bin/lightningd-wrapper.sh 2>/dev/null || true
 fi
 
 echo "Initialization complete. Starting services..."

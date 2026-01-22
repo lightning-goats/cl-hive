@@ -27,18 +27,30 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 log_success() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [OK] $1"; }
 log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2; }
 
-# Create backup directory
+# Create backup directory with secure permissions
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"  # SECURITY: Restrict access to owner only
 
-# Python backup function using sqlite3 backup API
+# Python backup function using sqlite3 backup API with timeout
 backup_with_python() {
-    python3 << EOF
+    timeout 60 python3 << 'EOF'
 import sqlite3
 import os
 import sys
+import signal
 
-data_dir = "$DATA_DIR"
-backup_dir = "$BACKUP_DIR"
+# Timeout handler for individual database operations
+class TimeoutError(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Database backup timed out")
+
+# Set per-database timeout (30 seconds)
+DB_TIMEOUT = 30
+
+data_dir = os.environ.get('DATA_DIR', '/data/lightning/bitcoin/bitcoin')
+backup_dir = os.environ.get('BACKUP_DIR', '/backups/plugins')
 
 databases = [
     ("cl_hive.db", "cl-hive"),
@@ -54,20 +66,38 @@ for db_file, name in databases:
         continue
 
     try:
+        # Set alarm for timeout
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(DB_TIMEOUT)
+
         # Use SQLite backup API - safe for live databases
-        src_conn = sqlite3.connect(source)
-        dst_conn = sqlite3.connect(dest)
+        # Connection timeout prevents hanging on locked database
+        src_conn = sqlite3.connect(source, timeout=10.0)
+        dst_conn = sqlite3.connect(dest, timeout=10.0)
         src_conn.backup(dst_conn)
         dst_conn.close()
         src_conn.close()
 
+        # Cancel alarm
+        signal.alarm(0)
+
+        # Set secure permissions on backup
+        os.chmod(dest, 0o600)
+
         size = os.path.getsize(dest)
         size_str = f"{size/1024:.1f}KB" if size < 1024*1024 else f"{size/1024/1024:.1f}MB"
         print(f"[OK] {name} backed up ({size_str})")
+    except TimeoutError:
+        signal.alarm(0)
+        print(f"[ERROR] {name}: backup timed out after {DB_TIMEOUT}s", file=sys.stderr)
     except Exception as e:
+        signal.alarm(0)
         print(f"[ERROR] {name}: {e}", file=sys.stderr)
 EOF
 }
+
+# Export for Python script
+export DATA_DIR BACKUP_DIR
 
 run_backup() {
     log "Starting plugin database backup..."

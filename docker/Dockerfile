@@ -206,7 +206,17 @@ COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/lightning.conf.template /etc/lightning/lightning.conf.template
 COPY cl-hive.conf.sample /etc/lightning/cl-hive.conf
 
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Copy shutdown and utility scripts
+COPY docker/scripts/pre-stop.sh /usr/local/bin/
+COPY docker/scripts/lightningd-wrapper.sh /usr/local/bin/
+COPY docker/scripts/emergency-recover-watcher.sh /usr/local/bin/
+COPY docker/scripts/plugin-db-backup.sh /usr/local/bin/
+
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    /usr/local/bin/pre-stop.sh \
+    /usr/local/bin/lightningd-wrapper.sh \
+    /usr/local/bin/emergency-recover-watcher.sh \
+    /usr/local/bin/plugin-db-backup.sh
 
 # =============================================================================
 # PORTS
