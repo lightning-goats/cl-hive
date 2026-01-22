@@ -138,7 +138,7 @@ class HiveConfig:
     planner_default_channel_sats: int = 5_000_000  # 5M sats default channel size
 
     # Governance (Phase 7) - Failsafe mode limits
-    failsafe_budget_per_day: int = 1_000_000     # 1M sats daily budget (conservative)
+    failsafe_budget_per_day: int = 10_000_000    # 10M sats daily budget (5M per channel at 50%)
     failsafe_actions_per_hour: int = 2           # Max 2 emergency actions per hour
     budget_reserve_pct: float = 0.20             # Reserve 20% of onchain for future expansion
     budget_max_per_channel_pct: float = 0.50     # Max 50% of daily budget per single channel

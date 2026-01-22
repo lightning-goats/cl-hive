@@ -770,8 +770,8 @@ plugin.add_option(
 # Budget Options (Phase 7 - Governance)
 plugin.add_option(
     name='hive-failsafe-budget-per-day',
-    default='1000000',
-    description='Daily budget for failsafe mode actions in sats (default: 1M)',
+    default='10000000',
+    description='Daily budget for failsafe mode actions in sats (default: 10M)',
     dynamic=True
 )
 
@@ -1002,7 +1002,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_max_channel_sats=int(options.get('hive-planner-max-channel-sats', '50000000')),
         planner_default_channel_sats=int(options.get('hive-planner-default-channel-sats', '5000000')),
         # Budget options (failsafe mode)
-        failsafe_budget_per_day=int(options.get('hive-failsafe-budget-per-day', '1000000')),
+        failsafe_budget_per_day=int(options.get('hive-failsafe-budget-per-day', '10000000')),
         budget_reserve_pct=float(options.get('hive-budget-reserve-pct', '0.20')),
         budget_max_per_channel_pct=float(options.get('hive-budget-max-per-channel-pct', '0.50')),
         max_expansion_feerate_perkb=int(options.get('hive-max-expansion-feerate', '5000')),
