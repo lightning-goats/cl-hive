@@ -218,6 +218,15 @@ class ChannelSizer:
     HIGH_CONNECTIVITY_CHANNELS = 50   # Node with 50+ channels = high connectivity
     VERY_HIGH_CONNECTIVITY_CHANNELS = 200  # 200+ = major routing node
 
+    # Mid-size preference thresholds (avoid very large nodes with high minimums)
+    # Nodes with 300+ channels or 500+ BTC often require 5M+ sat minimums
+    PREFER_MID_SIZE = True  # Enable mid-size node preference
+    MID_SIZE_OPTIMAL_CHANNELS_MIN = 30   # Sweet spot lower bound
+    MID_SIZE_OPTIMAL_CHANNELS_MAX = 150  # Sweet spot upper bound
+    MID_SIZE_OPTIMAL_BTC_MIN = 20        # Optimal capacity lower bound (BTC)
+    MID_SIZE_OPTIMAL_BTC_MAX = 200       # Optimal capacity upper bound (BTC)
+    LARGE_NODE_PENALTY = 0.7             # Score multiplier for very large nodes
+
     # Economic assumptions
     EXPECTED_ANNUAL_FEE_RATE = 0.001  # 0.1% annual return on channel capacity
     OPPORTUNITY_COST_RATE = 0.05      # 5% opportunity cost of locked capital
@@ -302,15 +311,29 @@ class ChannelSizer:
 
         # =================================================================
         # Factor 1: Target Capacity Score (0.0 to 2.0)
-        # Larger nodes warrant larger channels for credibility
+        # Mid-sized nodes preferred - they accept smaller channel minimums
         # =================================================================
-        # Baseline: 1 BTC capacity = 1.0 score
-        # Scale logarithmically: 10 BTC = 1.5, 100 BTC = 2.0
         import math
         btc_capacity = target_capacity_sats / 100_000_000
         if btc_capacity <= 0:
             capacity_score = 0.5
+        elif self.PREFER_MID_SIZE:
+            # Mid-size preference: peak score at optimal range, lower for very large
+            if self.MID_SIZE_OPTIMAL_BTC_MIN <= btc_capacity <= self.MID_SIZE_OPTIMAL_BTC_MAX:
+                # Optimal range - full score with slight boost
+                capacity_score = 1.8
+            elif btc_capacity < self.MID_SIZE_OPTIMAL_BTC_MIN:
+                # Smaller than optimal - scale up to optimal range
+                capacity_score = min(1.5, 0.5 + 0.5 * math.log10(max(1, btc_capacity)))
+            elif btc_capacity > self.MID_SIZE_OPTIMAL_BTC_MAX * 5:
+                # Very large node (1000+ BTC) - likely requires 5M+ minimums
+                capacity_score = 1.0 * self.LARGE_NODE_PENALTY
+            else:
+                # Above optimal but not huge - gradual reduction
+                overage_factor = btc_capacity / self.MID_SIZE_OPTIMAL_BTC_MAX
+                capacity_score = max(1.0, 1.8 - 0.2 * math.log10(overage_factor))
         else:
+            # Original behavior: larger is better (logarithmic scale)
             capacity_score = min(2.0, 0.5 + 0.5 * math.log10(max(1, btc_capacity)))
         factors['capacity_score'] = round(capacity_score, 3)
         factors['target_capacity_btc'] = round(btc_capacity, 2)
@@ -332,18 +355,36 @@ class ChannelSizer:
 
         # =================================================================
         # Factor 3: Routing Potential Score (0.0 to 2.0)
-        # More connected nodes = better routing potential
+        # Mid-connectivity nodes preferred for better channel acceptance
         # =================================================================
-        if target_channel_count >= self.VERY_HIGH_CONNECTIVITY_CHANNELS:
-            routing_score = 2.0  # Major routing hub
-        elif target_channel_count >= self.HIGH_CONNECTIVITY_CHANNELS:
-            routing_score = 1.5  # Well-connected node
-        elif target_channel_count >= 20:
-            routing_score = 1.2  # Moderately connected
-        elif target_channel_count >= 10:
-            routing_score = 1.0  # Average
+        if self.PREFER_MID_SIZE:
+            # Mid-size preference: sweet spot at 30-150 channels
+            if self.MID_SIZE_OPTIMAL_CHANNELS_MIN <= target_channel_count <= self.MID_SIZE_OPTIMAL_CHANNELS_MAX:
+                routing_score = 2.0  # Optimal range - well-connected but reasonable minimums
+            elif target_channel_count > self.MID_SIZE_OPTIMAL_CHANNELS_MAX * 2:
+                # Very large hub (300+ channels) - likely high minimums
+                routing_score = 1.2 * self.LARGE_NODE_PENALTY
+            elif target_channel_count > self.MID_SIZE_OPTIMAL_CHANNELS_MAX:
+                # Above optimal (150-300) - still good but not ideal
+                routing_score = 1.5
+            elif target_channel_count >= 20:
+                routing_score = 1.5  # Moderately connected
+            elif target_channel_count >= 10:
+                routing_score = 1.0  # Average
+            else:
+                routing_score = 0.7  # Low connectivity (risky)
         else:
-            routing_score = 0.7  # Low connectivity (risky)
+            # Original behavior: more channels = better
+            if target_channel_count >= self.VERY_HIGH_CONNECTIVITY_CHANNELS:
+                routing_score = 2.0  # Major routing hub
+            elif target_channel_count >= self.HIGH_CONNECTIVITY_CHANNELS:
+                routing_score = 1.5  # Well-connected node
+            elif target_channel_count >= 20:
+                routing_score = 1.2  # Moderately connected
+            elif target_channel_count >= 10:
+                routing_score = 1.0  # Average
+            else:
+                routing_score = 0.7  # Low connectivity (risky)
         factors['routing_score'] = routing_score
         factors['target_channel_count'] = target_channel_count
 
@@ -501,15 +542,28 @@ class ChannelSizer:
         # =================================================================
         reasoning_parts = []
 
-        if capacity_score >= 1.5:
-            reasoning_parts.append(f"large target ({btc_capacity:.1f} BTC)")
-        elif capacity_score <= 0.7:
-            reasoning_parts.append(f"small target ({btc_capacity:.1f} BTC)")
+        if self.PREFER_MID_SIZE:
+            # Mid-size preference reasoning
+            if self.MID_SIZE_OPTIMAL_BTC_MIN <= btc_capacity <= self.MID_SIZE_OPTIMAL_BTC_MAX:
+                reasoning_parts.append(f"optimal mid-size ({btc_capacity:.1f} BTC)")
+            elif btc_capacity > self.MID_SIZE_OPTIMAL_BTC_MAX * 5:
+                reasoning_parts.append(f"very large node ({btc_capacity:.1f} BTC, likely high min)")
+            elif capacity_score >= 1.5:
+                reasoning_parts.append(f"good size ({btc_capacity:.1f} BTC)")
+            elif capacity_score <= 0.7:
+                reasoning_parts.append(f"small target ({btc_capacity:.1f} BTC)")
+        else:
+            if capacity_score >= 1.5:
+                reasoning_parts.append(f"large target ({btc_capacity:.1f} BTC)")
+            elif capacity_score <= 0.7:
+                reasoning_parts.append(f"small target ({btc_capacity:.1f} BTC)")
 
         if share_score >= 1.5:
             reasoning_parts.append(f"underserved ({share_gap*100:.1f}% gap)")
 
-        if routing_score >= 1.5:
+        if self.PREFER_MID_SIZE and self.MID_SIZE_OPTIMAL_CHANNELS_MIN <= target_channel_count <= self.MID_SIZE_OPTIMAL_CHANNELS_MAX:
+            reasoning_parts.append(f"optimal connectivity ({target_channel_count} channels)")
+        elif routing_score >= 1.5:
             reasoning_parts.append(f"high routing potential ({target_channel_count} channels)")
         elif routing_score <= 0.8:
             reasoning_parts.append(f"low connectivity ({target_channel_count} channels)")
