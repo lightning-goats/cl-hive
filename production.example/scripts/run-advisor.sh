@@ -62,13 +62,58 @@ cat > "$MCP_CONFIG_TMP" << MCPEOF
 }
 MCPEOF
 
-# Run Claude with MCP server
-# The proactive advisor runs a complete 9-phase optimization cycle on ALL nodes:
-# 1) Record snapshot 2) Analyze state 3) Check goals 4) Scan opportunities
-# 5) Score with learning 6) Auto-execute safe actions 7) Queue risky actions
-# 8) Measure outcomes 9) Plan next cycle
-# --allowedTools restricts to only hive/revenue/advisor tools for safety
-claude -p "Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_all. After the cycle completes, provide a report with these sections:
+# Auto-approve channel opens (optional - set to true to enable autonomous decisions)
+AUTO_APPROVE_CHANNEL_OPENS="${AUTO_APPROVE_CHANNEL_OPENS:-false}"
+
+# Build the prompt based on configuration
+if [[ "$AUTO_APPROVE_CHANNEL_OPENS" == "true" ]]; then
+    # Autonomous mode: AI automatically approves/rejects channel opens
+    ADVISOR_PROMPT='Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_all. After the cycle completes:
+
+## AUTO-PROCESS CHANNEL OPENS
+For each pending channel_open action on each node, automatically approve or reject based on these criteria:
+
+APPROVE only if ALL conditions met:
+- Target node has >15 active channels (strong connectivity)
+- Target median fee is <500 ppm (quality routing partner)
+- Current on-chain fees are <20 sat/vB
+- Channel size is 2-10M sats
+- Node has <30 total channels AND <40% underwater channels
+- Opening maintains 500k sats on-chain reserve
+- Not a duplicate channel to existing peer
+
+REJECT if ANY condition applies:
+- Target has <10 channels (insufficient connectivity)
+- On-chain fees >30 sat/vB (wait for lower fees)
+- Node already has >30 channels (focus on profitability)
+- Node has >40% underwater channels (fix existing first)
+- Amount below 1M sats or above 10M sats
+- Would create duplicate channel
+- Insufficient on-chain balance for reserve
+
+Use hive_approve_action or hive_reject_action for each pending channel_open.
+
+## REPORT SECTIONS
+After processing actions, provide a report with these sections:
+
+### FLEET HEALTH (use advisor_get_trends and hive_status)
+- Total nodes and their status (online/offline)
+- Fleet-wide capacity and revenue trends (7-day)
+- Hive membership summary (members/neophytes)
+- Any internal competition or coordination issues
+
+### PER-NODE SUMMARIES (for each node)
+1) Node state (capacity, channels, ROC%, underwater%)
+2) Goals progress and strategy adjustments needed
+3) Opportunities found by type and actions taken/queued
+4) Next cycle priorities
+
+### ACTIONS TAKEN
+- List channel opens approved with reasoning
+- List channel opens rejected with reasoning'
+else
+    # Manual review mode: AI only provides recommendations
+    ADVISOR_PROMPT='Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_all. After the cycle completes, provide a report with these sections:
 
 ## FLEET HEALTH (use advisor_get_trends and hive_status)
 - Total nodes and their status (online/offline)
@@ -83,7 +128,16 @@ claude -p "Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_
 4) Next cycle priorities
 
 ## PENDING ACTIONS (check hive_pending_actions on each node)
-- List actions needing human review with your recommendations" \
+- List actions needing human review with your recommendations'
+fi
+
+# Run Claude with MCP server
+# The proactive advisor runs a complete 9-phase optimization cycle on ALL nodes:
+# 1) Record snapshot 2) Analyze state 3) Check goals 4) Scan opportunities
+# 5) Score with learning 6) Auto-execute safe actions 7) Queue risky actions
+# 8) Measure outcomes 9) Plan next cycle
+# --allowedTools restricts to only hive/revenue/advisor tools for safety
+claude -p "$ADVISOR_PROMPT" \
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
