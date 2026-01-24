@@ -9945,6 +9945,15 @@ def hive_settlement_calculate(plugin: Plugin):
     if not database:
         return {"error": "Database not initialized"}
 
+    # Get our pubkey upfront to avoid scoping issues
+    node_pubkey = our_pubkey
+    if not node_pubkey:
+        try:
+            info = safe_plugin.rpc.getinfo()
+            node_pubkey = info.get("id")
+        except Exception:
+            return {"error": "Could not determine our node pubkey"}
+
     # CRITICAL: Validate cl-revenue-ops is available for fee data
     warnings = []
     if not bridge or bridge.status != BridgeStatus.ENABLED:
@@ -9970,7 +9979,7 @@ def hive_settlement_calculate(plugin: Plugin):
 
         # Get fees earned from gossiped fee reports or local revenue-ops
         fees_earned = 0
-        if peer_id == our_pubkey:
+        if peer_id == node_pubkey:
             # For our own node, use local revenue-ops (most accurate)
             if bridge and bridge.status == BridgeStatus.ENABLED:
                 try:
@@ -10090,6 +10099,15 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
     if not database:
         return {"error": "Database not initialized"}
 
+    # Get our pubkey upfront to avoid scoping issues
+    node_pubkey = our_pubkey
+    if not node_pubkey:
+        try:
+            info = safe_plugin.rpc.getinfo()
+            node_pubkey = info.get("id")
+        except Exception:
+            return {"error": "Could not determine our node pubkey"}
+
     # CRITICAL: Validate cl-revenue-ops is available for fee data
     if not bridge or bridge.status != BridgeStatus.ENABLED:
         return {
@@ -10116,7 +10134,7 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
 
         # Get fees earned from gossiped fee reports or local revenue-ops
         fees_earned = 0
-        if peer_id == our_pubkey:
+        if peer_id == node_pubkey:
             # For our own node, use local revenue-ops (most accurate)
             if bridge and bridge.status == BridgeStatus.ENABLED:
                 try:
@@ -10202,14 +10220,6 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
         response["message"] = "No payments required (all members at fair share or below minimum threshold)"
         return response
 
-    # Check that payer has offers registered (to verify they're real members)
-    our_pubkey = None
-    try:
-        info = safe_plugin.rpc.getinfo()
-        our_pubkey = info.get("id")
-    except Exception:
-        pass
-
     # Execute payments - we can only pay from our own node
     executed = []
     skipped = []
@@ -10217,7 +10227,7 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
 
     for payment in payments:
         # We can only execute payments FROM our own node
-        if payment.from_peer != our_pubkey:
+        if payment.from_peer != node_pubkey:
             skipped.append({
                 "from_peer": payment.from_peer[:16] + "...",
                 "to_peer": payment.to_peer[:16] + "...",
