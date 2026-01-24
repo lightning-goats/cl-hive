@@ -643,6 +643,76 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="hive_splice",
+            description="Execute a coordinated splice operation with a hive member. Splices resize channels without closing them. Requires the channel to be with another hive member. The initiating node provides the on-chain funds for splice-in operations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (the node that will provide funds for splice-in)"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID to splice (short_channel_id format like 123x456x0)"
+                    },
+                    "relative_amount": {
+                        "type": "integer",
+                        "description": "Amount in satoshis. Positive = splice-in (add funds), Negative = splice-out (remove funds)"
+                    },
+                    "feerate_per_kw": {
+                        "type": "integer",
+                        "description": "Optional feerate in sat/kw (default: urgent rate)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, preview the operation without executing"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "If true, skip safety warnings for splice-out"
+                    }
+                },
+                "required": ["node", "channel_id", "relative_amount"]
+            }
+        ),
+        Tool(
+            name="hive_splice_status",
+            description="Get status of active splice sessions. Shows ongoing splice operations and their current state.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional specific session ID to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_splice_abort",
+            description="Abort an active splice session. Use this if a splice is stuck or needs to be cancelled.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID to abort"
+                    }
+                },
+                "required": ["node", "session_id"]
+            }
+        ),
+        Tool(
             name="hive_liquidity_intelligence",
             description="Get fleet liquidity intelligence for coordinated decisions. Information sharing only - shows which members need what, enabling coordinated fee/rebalance decisions. No fund movement between nodes.",
             inputSchema={
@@ -2504,6 +2574,12 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_splice_check(arguments)
         elif name == "hive_splice_recommendations":
             result = await handle_splice_recommendations(arguments)
+        elif name == "hive_splice":
+            result = await handle_splice(arguments)
+        elif name == "hive_splice_status":
+            result = await handle_splice_status(arguments)
+        elif name == "hive_splice_abort":
+            result = await handle_splice_abort(arguments)
         elif name == "hive_liquidity_intelligence":
             result = await handle_liquidity_intelligence(arguments)
         # Anticipatory Liquidity tools (Phase 7.1)
@@ -3133,6 +3209,96 @@ async def handle_splice_recommendations(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-splice-recommendations", {"peer_id": peer_id})
+
+
+async def handle_splice(args: Dict) -> Dict:
+    """
+    Execute a coordinated splice operation with a hive member.
+
+    Splices resize channels without closing them:
+    - Positive amount = splice-in (add funds from on-chain)
+    - Negative amount = splice-out (remove funds to on-chain)
+
+    The initiating node provides the on-chain funds for splice-in.
+    """
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    relative_amount = args.get("relative_amount")
+    feerate_per_kw = args.get("feerate_per_kw")
+    dry_run = args.get("dry_run", False)
+    force = args.get("force", False)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {
+        "channel_id": channel_id,
+        "relative_amount": relative_amount,
+        "dry_run": dry_run,
+        "force": force
+    }
+    if feerate_per_kw is not None:
+        params["feerate_per_kw"] = feerate_per_kw
+
+    result = await node.call("hive-splice", params)
+
+    # Add context about the result
+    if result.get("dry_run"):
+        result["ai_note"] = (
+            f"Dry run preview: {result.get('splice_type')} of {result.get('amount_sats'):,} sats "
+            f"on channel {channel_id}. Remove dry_run=true to execute."
+        )
+    elif result.get("success"):
+        result["ai_note"] = (
+            f"Splice initiated successfully. Session: {result.get('session_id')}. "
+            f"Status: {result.get('status')}. Monitor with hive_splice_status."
+        )
+    elif result.get("error"):
+        result["ai_note"] = f"Splice failed: {result.get('message', result.get('error'))}"
+
+    return result
+
+
+async def handle_splice_status(args: Dict) -> Dict:
+    """
+    Get status of active splice sessions.
+
+    Shows ongoing splice operations and their current state.
+    """
+    node_name = args.get("node")
+    session_id = args.get("session_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if session_id:
+        params["session_id"] = session_id
+
+    return await node.call("hive-splice-status", params)
+
+
+async def handle_splice_abort(args: Dict) -> Dict:
+    """
+    Abort an active splice session.
+
+    Use this if a splice is stuck or needs to be cancelled.
+    """
+    node_name = args.get("node")
+    session_id = args.get("session_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-splice-abort", {"session_id": session_id})
+
+    if result.get("success"):
+        result["ai_note"] = f"Splice session {session_id} aborted successfully."
+
+    return result
 
 
 async def handle_liquidity_intelligence(args: Dict) -> Dict:
