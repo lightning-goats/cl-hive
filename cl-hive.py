@@ -4919,7 +4919,11 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Validate payload schema
     if not validate_fee_report(payload):
-        plugin.log(f"[FeeReport] Rejected: invalid schema from {peer_id[:16]}...", level='info')
+        # Log which fields are present/missing for debugging
+        required = ["peer_id", "fees_earned_sats", "period_start", "period_end", "forward_count", "signature"]
+        missing = [f for f in required if f not in payload]
+        present = list(payload.keys()) if isinstance(payload, dict) else []
+        plugin.log(f"[FeeReport] Rejected: invalid schema from {peer_id[:16]}... missing={missing} present={present}", level='info')
         return {"result": "continue"}
 
     # Extract payload fields
