@@ -1200,6 +1200,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     gossip_thread.start()
     plugin.log("cl-hive: Gossip thread started")
 
+    # Start distributed settlement loop thread (Phase 12)
+    settlement_thread = threading.Thread(
+        target=settlement_loop,
+        name="cl-hive-settlement",
+        daemon=True
+    )
+    settlement_thread.start()
+    plugin.log("cl-hive: Settlement thread started")
+
     # Load persisted fee tracking state (Settlement Phase)
     _load_fee_tracking_state()
     plugin.log("cl-hive: Fee tracking state loaded")
@@ -1589,6 +1598,13 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_settlement_offer(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.FEE_REPORT:
             return handle_fee_report(peer_id, msg_payload, plugin)
+        # Phase 12: Distributed Settlement
+        elif msg_type == HiveMessageType.SETTLEMENT_PROPOSE:
+            return handle_settlement_propose(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.SETTLEMENT_READY:
+            return handle_settlement_ready(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.SETTLEMENT_EXECUTED:
+            return handle_settlement_executed(peer_id, msg_payload, plugin)
         # Phase 10: Task Delegation
         elif msg_type == HiveMessageType.TASK_REQUEST:
             return handle_task_request(peer_id, msg_payload, plugin)
@@ -3401,6 +3417,7 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
         return False
 
     target_peer_id = proposal["target_peer_id"]
+    proposal_type = proposal.get("proposal_type", "standard")
 
     # Get all votes
     votes = database.get_ban_votes(proposal_id)
@@ -3417,16 +3434,44 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
     if eligible_count == 0:
         return False
 
-    # Count approve votes from eligible voters
     eligible_voter_ids = set(m["peer_id"] for m in eligible_voters)
+
+    # Count votes from eligible voters
     approve_count = sum(
         1 for v in votes
         if v["vote"] == "approve" and v["voter_peer_id"] in eligible_voter_ids
     )
+    reject_count = sum(
+        1 for v in votes
+        if v["vote"] == "reject" and v["voter_peer_id"] in eligible_voter_ids
+    )
 
-    # Check quorum (51% of eligible voters)
-    quorum_needed = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
-    if approve_count >= quorum_needed:
+    # Determine if ban should execute based on proposal type
+    should_execute = False
+
+    if proposal_type == "settlement_gaming":
+        # REVERSED VOTING: Non-participation = approve (yes to ban)
+        # Members must actively vote "reject" (no) to defend the accused
+        # Ban executes if less than 51% vote "reject"
+        reject_threshold = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
+        # Non-voters are implicit approvals
+        implicit_approvals = eligible_count - reject_count - approve_count
+        total_approvals = approve_count + implicit_approvals
+
+        if reject_count < reject_threshold:
+            # Not enough members defended the accused - ban executes
+            should_execute = True
+            plugin.log(
+                f"cl-hive: Settlement gaming ban - {reject_count} reject votes "
+                f"(needed {reject_threshold} to prevent), {implicit_approvals} non-voters counted as approve"
+            )
+    else:
+        # STANDARD VOTING: Need 51% explicit approve votes
+        quorum_needed = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
+        if approve_count >= quorum_needed:
+            should_execute = True
+
+    if should_execute:
         # Execute ban
         database.update_ban_proposal_status(proposal_id, "approved")
         proposer_id = proposal.get("proposer_peer_id", "quorum_vote")
@@ -3440,7 +3485,8 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
             except Exception:
                 pass
 
-        plugin.log(f"cl-hive: Ban executed for {target_peer_id[:16]}... ({approve_count}/{eligible_count} votes)")
+        vote_info = f"reject={reject_count}" if proposal_type == "settlement_gaming" else f"approve={approve_count}"
+        plugin.log(f"cl-hive: Ban executed for {target_peer_id[:16]}... ({vote_info}/{eligible_count} votes)")
 
         # Broadcast BAN message
         ban_payload = {
@@ -4909,6 +4955,270 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
 
 # =============================================================================
+# PHASE 12: DISTRIBUTED SETTLEMENT MESSAGE HANDLERS
+# =============================================================================
+
+def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SETTLEMENT_PROPOSE message from a hive member.
+
+    When a member proposes a settlement for a period, we verify the data hash
+    against our own gossiped FEE_REPORT data and vote if it matches.
+    """
+    from modules.protocol import (
+        validate_settlement_propose,
+        get_settlement_propose_signing_payload,
+        create_settlement_ready,
+        get_settlement_ready_signing_payload
+    )
+
+    if not settlement_mgr or not database or not state_manager:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_PROPOSE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload schema
+    if not validate_settlement_propose(payload):
+        plugin.log(f"cl-hive: SETTLEMENT_PROPOSE invalid schema from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify proposer matches sender
+    proposer_peer_id = payload.get("proposer_peer_id")
+    if proposer_peer_id != peer_id:
+        plugin.log(
+            f"cl-hive: SETTLEMENT_PROPOSE proposer mismatch from {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify signature
+    signature = payload.get("signature")
+    signing_payload = get_settlement_propose_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.call("checkmessage", {
+            "message": signing_payload,
+            "zbase": signature,
+            "pubkey": proposer_peer_id
+        })
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: SETTLEMENT_PROPOSE invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SETTLEMENT_PROPOSE signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    proposal_id = payload.get("proposal_id")
+    period = payload.get("period")
+    data_hash = payload.get("data_hash")
+    contributions = payload.get("contributions", [])
+
+    plugin.log(
+        f"SETTLEMENT: Received proposal {proposal_id[:16]}... for {period} from {peer_id[:16]}..."
+    )
+
+    # Store the proposal if we don't have one for this period
+    if not database.get_settlement_proposal_by_period(period):
+        database.add_settlement_proposal(
+            proposal_id=proposal_id,
+            period=period,
+            proposer_peer_id=proposer_peer_id,
+            data_hash=data_hash,
+            total_fees_sats=payload.get("total_fees_sats", 0),
+            member_count=payload.get("member_count", 0)
+        )
+
+    # Try to verify and vote
+    vote = settlement_mgr.verify_and_vote(
+        proposal=payload,
+        our_peer_id=our_pubkey,
+        state_manager=state_manager,
+        rpc=safe_plugin.rpc
+    )
+
+    if vote:
+        # Broadcast our vote
+        vote_msg = create_settlement_ready(
+            proposal_id=vote['proposal_id'],
+            voter_peer_id=vote['voter_peer_id'],
+            data_hash=vote['data_hash'],
+            timestamp=vote['timestamp'],
+            signature=vote['signature']
+        )
+        _broadcast_to_members(vote_msg)
+        plugin.log(f"SETTLEMENT: Voted on proposal {proposal_id[:16]}... (hash verified)")
+
+    return {"result": "continue"}
+
+
+def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SETTLEMENT_READY message (vote) from a hive member.
+
+    When we receive a vote, we record it and check if quorum is reached.
+    """
+    from modules.protocol import (
+        validate_settlement_ready,
+        get_settlement_ready_signing_payload
+    )
+
+    if not settlement_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_READY from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload schema
+    if not validate_settlement_ready(payload):
+        plugin.log(f"cl-hive: SETTLEMENT_READY invalid schema from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify voter matches sender
+    voter_peer_id = payload.get("voter_peer_id")
+    if voter_peer_id != peer_id:
+        plugin.log(
+            f"cl-hive: SETTLEMENT_READY voter mismatch from {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify signature
+    signature = payload.get("signature")
+    signing_payload = get_settlement_ready_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.call("checkmessage", {
+            "message": signing_payload,
+            "zbase": signature,
+            "pubkey": voter_peer_id
+        })
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: SETTLEMENT_READY invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SETTLEMENT_READY signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    proposal_id = payload.get("proposal_id")
+    data_hash = payload.get("data_hash")
+
+    # Get the proposal
+    proposal = database.get_settlement_proposal(proposal_id)
+    if not proposal:
+        plugin.log(f"cl-hive: SETTLEMENT_READY for unknown proposal {proposal_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify data hash matches proposal
+    if data_hash != proposal.get("data_hash"):
+        plugin.log(
+            f"cl-hive: SETTLEMENT_READY hash mismatch for {proposal_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Record the vote
+    if database.add_settlement_ready_vote(
+        proposal_id=proposal_id,
+        voter_peer_id=voter_peer_id,
+        data_hash=data_hash,
+        signature=signature
+    ):
+        plugin.log(f"SETTLEMENT: Recorded vote from {peer_id[:16]}... for {proposal_id[:16]}...")
+
+        # Check if quorum reached
+        settlement_mgr.check_quorum_and_mark_ready(
+            proposal_id=proposal_id,
+            member_count=proposal.get("member_count", 0)
+        )
+
+    return {"result": "continue"}
+
+
+def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle SETTLEMENT_EXECUTED message from a hive member.
+
+    When a member confirms they've executed their settlement payment,
+    we record it and check if the settlement is complete.
+    """
+    from modules.protocol import (
+        validate_settlement_executed,
+        get_settlement_executed_signing_payload
+    )
+
+    if not settlement_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_EXECUTED from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload schema
+    if not validate_settlement_executed(payload):
+        plugin.log(f"cl-hive: SETTLEMENT_EXECUTED invalid schema from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify executor matches sender
+    executor_peer_id = payload.get("executor_peer_id")
+    if executor_peer_id != peer_id:
+        plugin.log(
+            f"cl-hive: SETTLEMENT_EXECUTED executor mismatch from {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify signature
+    signature = payload.get("signature")
+    signing_payload = get_settlement_executed_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.call("checkmessage", {
+            "message": signing_payload,
+            "zbase": signature,
+            "pubkey": executor_peer_id
+        })
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: SETTLEMENT_EXECUTED invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SETTLEMENT_EXECUTED signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    proposal_id = payload.get("proposal_id")
+    payment_hash = payload.get("payment_hash")
+    amount_paid = payload.get("amount_paid_sats", 0)
+
+    # Record the execution
+    if database.add_settlement_execution(
+        proposal_id=proposal_id,
+        executor_peer_id=executor_peer_id,
+        signature=signature,
+        payment_hash=payment_hash,
+        amount_paid_sats=amount_paid
+    ):
+        if amount_paid > 0:
+            plugin.log(
+                f"SETTLEMENT: {peer_id[:16]}... executed payment of {amount_paid} sats "
+                f"for {proposal_id[:16]}..."
+            )
+        else:
+            plugin.log(
+                f"SETTLEMENT: {peer_id[:16]}... confirmed execution for {proposal_id[:16]}..."
+            )
+
+        # Check if settlement is complete
+        settlement_mgr.check_and_complete_settlement(proposal_id)
+
+    return {"result": "continue"}
+
+
+# =============================================================================
 # PHASE 10: TASK DELEGATION MESSAGE HANDLERS
 # =============================================================================
 
@@ -5522,6 +5832,373 @@ def fee_intelligence_loop():
 
         # Wait for next cycle
         shutdown_event.wait(FEE_INTELLIGENCE_INTERVAL)
+
+
+# =============================================================================
+# PHASE 12: DISTRIBUTED SETTLEMENT BACKGROUND LOOP
+# =============================================================================
+
+# Settlement check interval (1 hour)
+SETTLEMENT_CHECK_INTERVAL = 3600
+
+
+def settlement_loop():
+    """
+    Background thread for distributed settlement coordination.
+
+    Runs hourly to:
+    1. Check if we should propose settlement for previous week
+    2. Process any pending proposals (auto-vote if hash matches)
+    3. Execute any ready settlements we haven't paid yet
+    4. Cleanup expired proposals
+    """
+    from modules.protocol import (
+        create_settlement_propose,
+        create_settlement_executed,
+        get_settlement_propose_signing_payload,
+        get_settlement_executed_signing_payload
+    )
+
+    # Wait for initialization (2 minutes)
+    shutdown_event.wait(120)
+
+    while not shutdown_event.is_set():
+        try:
+            if not settlement_mgr or not database or not state_manager or not safe_plugin or not our_pubkey:
+                shutdown_event.wait(60)
+                continue
+
+            # Step 1: Check if we should propose settlement for previous week
+            try:
+                previous_period = settlement_mgr.get_previous_period()
+
+                # Only propose if period not settled and no pending proposal
+                if not database.is_period_settled(previous_period):
+                    existing = database.get_settlement_proposal_by_period(previous_period)
+                    if not existing:
+                        # Create and broadcast proposal
+                        proposal = settlement_mgr.create_proposal(
+                            period=previous_period,
+                            our_peer_id=our_pubkey,
+                            state_manager=state_manager,
+                            rpc=safe_plugin.rpc
+                        )
+
+                        if proposal:
+                            # Sign the proposal
+                            signing_payload = get_settlement_propose_signing_payload(proposal)
+                            try:
+                                sig_result = safe_plugin.rpc.signmessage(signing_payload)
+                                signature = sig_result.get('zbase', '')
+                            except Exception as e:
+                                safe_plugin.log(f"SETTLEMENT: Failed to sign proposal: {e}", level='warn')
+                                signature = ''
+
+                            if signature:
+                                # Create and broadcast message
+                                propose_msg = create_settlement_propose(
+                                    proposal_id=proposal['proposal_id'],
+                                    period=proposal['period'],
+                                    proposer_peer_id=proposal['proposer_peer_id'],
+                                    data_hash=proposal['data_hash'],
+                                    total_fees_sats=proposal['total_fees_sats'],
+                                    member_count=proposal['member_count'],
+                                    contributions=proposal['contributions'],
+                                    timestamp=proposal['timestamp'],
+                                    signature=signature
+                                )
+                                _broadcast_to_members(propose_msg)
+                                safe_plugin.log(
+                                    f"SETTLEMENT: Proposed settlement for {previous_period}"
+                                )
+
+                                # Vote on our own proposal
+                                vote = settlement_mgr.verify_and_vote(
+                                    proposal=proposal,
+                                    our_peer_id=our_pubkey,
+                                    state_manager=state_manager,
+                                    rpc=safe_plugin.rpc
+                                )
+                                if vote:
+                                    from modules.protocol import create_settlement_ready
+                                    vote_msg = create_settlement_ready(
+                                        proposal_id=vote['proposal_id'],
+                                        voter_peer_id=vote['voter_peer_id'],
+                                        data_hash=vote['data_hash'],
+                                        timestamp=vote['timestamp'],
+                                        signature=vote['signature']
+                                    )
+                                    _broadcast_to_members(vote_msg)
+            except Exception as e:
+                safe_plugin.log(f"SETTLEMENT: Error proposing settlement: {e}", level='warn')
+
+            # Step 2: Process pending proposals
+            try:
+                pending = database.get_pending_settlement_proposals()
+                for proposal in pending:
+                    proposal_id = proposal.get('proposal_id')
+                    member_count = proposal.get('member_count', 0)
+
+                    # Check if we've voted
+                    if not database.has_voted_settlement(proposal_id, our_pubkey):
+                        # Try to vote
+                        vote = settlement_mgr.verify_and_vote(
+                            proposal=proposal,
+                            our_peer_id=our_pubkey,
+                            state_manager=state_manager,
+                            rpc=safe_plugin.rpc
+                        )
+                        if vote:
+                            from modules.protocol import create_settlement_ready
+                            vote_msg = create_settlement_ready(
+                                proposal_id=vote['proposal_id'],
+                                voter_peer_id=vote['voter_peer_id'],
+                                data_hash=vote['data_hash'],
+                                timestamp=vote['timestamp'],
+                                signature=vote['signature']
+                            )
+                            _broadcast_to_members(vote_msg)
+
+                    # Check if quorum reached
+                    settlement_mgr.check_quorum_and_mark_ready(proposal_id, member_count)
+            except Exception as e:
+                safe_plugin.log(f"SETTLEMENT: Error processing pending: {e}", level='warn')
+
+            # Step 3: Execute ready settlements
+            try:
+                ready = database.get_ready_settlement_proposals()
+                for proposal in ready:
+                    proposal_id = proposal.get('proposal_id')
+
+                    # Check if we've already executed
+                    if database.has_executed_settlement(proposal_id, our_pubkey):
+                        continue
+
+                    # Get contributions from the proposal (we stored them in state)
+                    contributions = settlement_mgr.gather_contributions_from_gossip(
+                        state_manager, proposal.get('period', '')
+                    )
+
+                    # Execute our settlement (this is async but we run it sync here)
+                    import asyncio
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        exec_result = loop.run_until_complete(
+                            settlement_mgr.execute_our_settlement(
+                                proposal=proposal,
+                                contributions=contributions,
+                                our_peer_id=our_pubkey,
+                                rpc=safe_plugin.rpc
+                            )
+                        )
+                        loop.close()
+
+                        if exec_result:
+                            # Broadcast execution confirmation
+                            exec_msg = create_settlement_executed(
+                                proposal_id=exec_result['proposal_id'],
+                                executor_peer_id=exec_result['executor_peer_id'],
+                                timestamp=exec_result['timestamp'],
+                                signature=exec_result['signature'],
+                                payment_hash=exec_result.get('payment_hash'),
+                                amount_paid_sats=exec_result.get('amount_paid_sats')
+                            )
+                            _broadcast_to_members(exec_msg)
+
+                            # Check if settlement is complete
+                            settlement_mgr.check_and_complete_settlement(proposal_id)
+
+                    except Exception as e:
+                        safe_plugin.log(f"SETTLEMENT: Execution error: {e}", level='warn')
+            except Exception as e:
+                safe_plugin.log(f"SETTLEMENT: Error executing ready: {e}", level='warn')
+
+            # Step 4: Cleanup expired proposals
+            try:
+                expired = database.cleanup_expired_settlement_proposals()
+                if expired > 0:
+                    safe_plugin.log(f"SETTLEMENT: Cleaned up {expired} expired proposals")
+            except Exception as e:
+                safe_plugin.log(f"SETTLEMENT: Cleanup error: {e}", level='warn')
+
+            # Step 5: Check for gaming behavior and auto-propose bans
+            try:
+                _check_settlement_gaming_and_propose_bans()
+            except Exception as e:
+                safe_plugin.log(f"SETTLEMENT: Gaming check error: {e}", level='warn')
+
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"SETTLEMENT: Loop error: {e}", level='warn')
+
+        # Wait for next cycle
+        shutdown_event.wait(SETTLEMENT_CHECK_INTERVAL)
+
+
+# Settlement gaming detection thresholds
+SETTLEMENT_GAMING_MIN_PERIODS = 3  # Minimum periods to analyze
+SETTLEMENT_GAMING_LOW_VOTE_THRESHOLD = 30  # Below 30% vote rate = suspicious
+SETTLEMENT_GAMING_LOW_EXEC_THRESHOLD = 30  # Below 30% execution rate = suspicious
+
+
+def _check_settlement_gaming_and_propose_bans():
+    """
+    Check for settlement gaming behavior and propose bans for high-risk members.
+
+    A member is considered high-risk if they:
+    1. Have vote rate < 30% over at least 3 settlement periods
+    2. Have execution rate < 30% over at least 3 settlement periods
+    3. Consistently owe money (negative balance in settlements)
+
+    This protects the hive from members who intentionally skip votes/payments
+    to avoid paying their fair share.
+    """
+    if not database or not our_pubkey or not safe_plugin:
+        return
+
+    # Get recent settled periods
+    settled = database.get_settled_periods(limit=10)
+    period_count = len(settled)
+
+    if period_count < SETTLEMENT_GAMING_MIN_PERIODS:
+        # Not enough history to detect gaming
+        return
+
+    # Get all members
+    all_members = database.get_all_members()
+
+    for member in all_members:
+        peer_id = member['peer_id']
+
+        # Skip ourselves
+        if peer_id == our_pubkey:
+            continue
+
+        # Skip admins (admins handle this via other means)
+        if member.get('tier') == MembershipTier.ADMIN.value:
+            continue
+
+        # Calculate participation rates
+        vote_count = 0
+        exec_count = 0
+        total_owed = 0
+
+        for period in settled:
+            proposal_id = period.get('proposal_id')
+
+            if database.has_voted_settlement(proposal_id, peer_id):
+                vote_count += 1
+
+            if database.has_executed_settlement(proposal_id, peer_id):
+                exec_count += 1
+                # Check execution amount
+                executions = database.get_settlement_executions(proposal_id)
+                for ex in executions:
+                    if ex.get('executor_peer_id') == peer_id:
+                        amount = ex.get('amount_paid_sats', 0)
+                        if amount > 0:
+                            total_owed -= amount
+
+        vote_rate = (vote_count / period_count) * 100 if period_count > 0 else 100
+        exec_rate = (exec_count / period_count) * 100 if period_count > 0 else 100
+
+        # Check if high-risk gaming behavior
+        is_low_vote = vote_rate < SETTLEMENT_GAMING_LOW_VOTE_THRESHOLD
+        is_low_exec = exec_rate < SETTLEMENT_GAMING_LOW_EXEC_THRESHOLD
+        owes_money = total_owed < 0
+
+        # HIGH RISK: Low participation AND owes money
+        if (is_low_vote or is_low_exec) and owes_money:
+            # Check if there's already a pending ban proposal for this member
+            existing = database.get_ban_proposal_for_target(peer_id)
+            if existing and existing.get("status") == "pending":
+                continue  # Already proposed
+
+            # Propose ban
+            reason = (
+                f"Settlement gaming detected: vote_rate={vote_rate:.1f}%, "
+                f"exec_rate={exec_rate:.1f}% over {period_count} periods "
+                f"while owing {abs(total_owed)} sats. "
+                f"Automatic proposal for repeated settlement evasion."
+            )
+
+            safe_plugin.log(
+                f"SETTLEMENT GAMING: Proposing ban for {peer_id[:16]}... "
+                f"(vote={vote_rate:.1f}%, exec={exec_rate:.1f}%, owed={total_owed})",
+                level='warn'
+            )
+
+            # Create ban proposal
+            _propose_settlement_gaming_ban(peer_id, reason)
+
+
+def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
+    """
+    Propose a ban for settlement gaming behavior.
+
+    This is called automatically when a member is detected gaming
+    the settlement system. Uses the standard ban proposal flow.
+    """
+    if not database or not our_pubkey or not safe_plugin:
+        return
+
+    # Verify target is still a member
+    target = database.get_member(target_peer_id)
+    if not target:
+        return
+
+    # Generate proposal ID
+    proposal_id = secrets.token_hex(16)
+    timestamp = int(time.time())
+
+    # Sign the proposal
+    canonical = f"hive:ban_proposal:{proposal_id}:{target_peer_id}:{timestamp}:{reason[:500]}"
+    try:
+        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+    except Exception as e:
+        safe_plugin.log(f"SETTLEMENT: Failed to sign gaming ban proposal: {e}", level='warn')
+        return
+
+    # Store locally - use 'settlement_gaming' proposal_type for reversed voting
+    expires_at = timestamp + BAN_PROPOSAL_TTL_SECONDS
+    database.create_ban_proposal(proposal_id, target_peer_id, our_pubkey,
+                                 reason[:500], timestamp, expires_at,
+                                 proposal_type='settlement_gaming')
+
+    # Add our vote (proposer auto-votes approve)
+    vote_canonical = f"hive:ban_vote:{proposal_id}:approve:{timestamp}"
+    vote_sig = safe_plugin.rpc.signmessage(vote_canonical)["zbase"]
+    database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
+
+    # Broadcast proposal
+    proposal_payload = {
+        "proposal_id": proposal_id,
+        "target_peer_id": target_peer_id,
+        "proposer_peer_id": our_pubkey,
+        "reason": reason[:500],
+        "timestamp": timestamp,
+        "signature": sig
+    }
+    proposal_msg = serialize(HiveMessageType.BAN_PROPOSAL, proposal_payload)
+    _broadcast_to_members(proposal_msg)
+
+    # Also broadcast our vote
+    vote_payload = {
+        "proposal_id": proposal_id,
+        "voter_peer_id": our_pubkey,
+        "vote": "approve",
+        "timestamp": timestamp,
+        "signature": vote_sig
+    }
+    vote_msg = serialize(HiveMessageType.BAN_VOTE, vote_payload)
+    _broadcast_to_members(vote_msg)
+
+    safe_plugin.log(
+        f"SETTLEMENT: Proposed ban for gaming member {target_peer_id[:16]}... "
+        f"(proposal_id={proposal_id[:16]}...)",
+        level='warn'
+    )
 
 
 def gossip_loop():
@@ -9652,6 +10329,148 @@ def hive_settlement_period_details(plugin: Plugin, period_id: int):
     if not settlement_mgr:
         return {"error": "Settlement manager not initialized"}
     return settlement_mgr.get_period_details(period_id)
+
+
+# =============================================================================
+# DISTRIBUTED SETTLEMENT RPC METHODS (Phase 12)
+# =============================================================================
+
+@plugin.method("hive-distributed-settlement-status")
+def hive_distributed_settlement_status(plugin: Plugin):
+    """
+    Get distributed settlement status.
+
+    Shows pending proposals, ready settlements, and recent completions
+    for the decentralized settlement system.
+
+    Returns:
+        Dict with distributed settlement status.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    return settlement_mgr.get_distributed_settlement_status()
+
+
+@plugin.method("hive-distributed-settlement-proposals")
+def hive_distributed_settlement_proposals(plugin: Plugin, status: str = None):
+    """
+    Get settlement proposals with voting status.
+
+    Args:
+        status: Filter by status (pending, ready, completed, expired). Default: all.
+
+    Returns:
+        Dict with proposals and their voting progress.
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if status == 'pending':
+        proposals = database.get_pending_settlement_proposals()
+    elif status == 'ready':
+        proposals = database.get_ready_settlement_proposals()
+    else:
+        # Get all proposals
+        proposals = (
+            database.get_pending_settlement_proposals() +
+            database.get_ready_settlement_proposals()
+        )
+
+    # Enrich with vote counts
+    for prop in proposals:
+        proposal_id = prop.get('proposal_id')
+        prop['vote_count'] = database.count_settlement_ready_votes(proposal_id)
+        votes = database.get_settlement_ready_votes(proposal_id)
+        prop['voters'] = [v.get('voter_peer_id')[:16] + '...' for v in votes]
+
+    return {
+        "proposals": proposals,
+        "total": len(proposals)
+    }
+
+
+@plugin.method("hive-distributed-settlement-participation")
+def hive_distributed_settlement_participation(plugin: Plugin, periods: int = 10):
+    """
+    Get settlement participation rates for all members.
+
+    Identifies nodes that skip votes or fail to execute payments,
+    which may indicate gaming behavior to avoid paying out.
+
+    Args:
+        periods: Number of recent periods to analyze (default: 10)
+
+    Returns:
+        Dict with participation rates per member.
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Get recent settled periods
+    settled = database.get_settled_periods(limit=periods)
+    period_count = len(settled)
+
+    if period_count == 0:
+        return {
+            "members": [],
+            "periods_analyzed": 0,
+            "note": "No settlement history available"
+        }
+
+    # Get all members
+    all_members = database.get_all_members()
+
+    member_stats = []
+    for member in all_members:
+        peer_id = member['peer_id']
+
+        # Count how many times they voted
+        vote_count = 0
+        exec_count = 0
+        total_owed = 0
+
+        for period in settled:
+            proposal_id = period.get('proposal_id')
+
+            # Check if they voted
+            if database.has_voted_settlement(proposal_id, peer_id):
+                vote_count += 1
+
+            # Check if they executed
+            if database.has_executed_settlement(proposal_id, peer_id):
+                exec_count += 1
+
+                # Get their execution to see amount
+                executions = database.get_settlement_executions(proposal_id)
+                for ex in executions:
+                    if ex.get('executor_peer_id') == peer_id:
+                        amount = ex.get('amount_paid_sats', 0)
+                        if amount > 0:
+                            total_owed -= amount  # They paid
+
+        vote_rate = round((vote_count / period_count) * 100, 1) if period_count > 0 else 0
+        exec_rate = round((exec_count / period_count) * 100, 1) if period_count > 0 else 0
+
+        member_stats.append({
+            "peer_id": peer_id,
+            "tier": member.get('tier', 'unknown'),
+            "periods_analyzed": period_count,
+            "votes_cast": vote_count,
+            "vote_rate": vote_rate,
+            "executions": exec_count,
+            "execution_rate": exec_rate,
+            "total_paid": abs(total_owed) if total_owed < 0 else 0,
+            "participation_score": round((vote_rate + exec_rate) / 2, 1)
+        })
+
+    # Sort by participation score (lowest first to highlight suspects)
+    member_stats.sort(key=lambda x: x.get('participation_score', 100))
+
+    return {
+        "members": member_stats,
+        "periods_analyzed": period_count,
+        "total_members": len(member_stats)
+    }
 
 
 # =============================================================================

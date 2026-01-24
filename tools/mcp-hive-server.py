@@ -2526,6 +2526,57 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node", "period_id"]
             }
+        ),
+        # Phase 12: Distributed Settlement
+        Tool(
+            name="distributed_settlement_status",
+            description="Get distributed settlement status including pending proposals, ready settlements, and participation. Shows which nodes have voted and executed their payments.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="distributed_settlement_proposals",
+            description="Get all settlement proposals with voting status. Shows proposal details, vote counts, and quorum progress.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: pending, ready, completed, expired (optional)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="distributed_settlement_participation",
+            description="Get settlement participation rates for all members. Identifies nodes that consistently skip votes or fail to execute payments - potential gaming behavior.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "periods": {
+                        "type": "integer",
+                        "description": "Number of recent periods to analyze (default: 10)"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -2769,6 +2820,13 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_settlement_history(arguments)
         elif name == "settlement_period_details":
             result = await handle_settlement_period_details(arguments)
+        # Phase 12: Distributed Settlement
+        elif name == "distributed_settlement_status":
+            result = await handle_distributed_settlement_status(arguments)
+        elif name == "distributed_settlement_proposals":
+            result = await handle_distributed_settlement_proposals(arguments)
+        elif name == "distributed_settlement_participation":
+            result = await handle_distributed_settlement_participation(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -6130,6 +6188,120 @@ async def handle_settlement_period_details(args: Dict) -> Dict:
         result = await node.call("hive-settlement-period-details", {"period_id": period_id})
     except Exception as e:
         return {"error": f"Failed to get period details: {e}"}
+
+    return result
+
+
+# =============================================================================
+# Distributed Settlement Handlers (Phase 12)
+# =============================================================================
+
+async def handle_distributed_settlement_status(args: Dict) -> Dict:
+    """Get distributed settlement status including proposals and participation."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-distributed-settlement-status", {})
+    except Exception as e:
+        return {"error": f"Failed to get distributed settlement status: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    pending = result.get("pending_proposals", 0)
+    ready = result.get("ready_proposals", 0)
+    recent = result.get("recent_settlements", 0)
+
+    result["ai_note"] = (
+        f"Distributed settlement status: {pending} pending proposal(s), "
+        f"{ready} ready to execute, {recent} recent settlement(s). "
+        "Pending proposals await votes from quorum (51%). "
+        "Ready proposals have reached quorum and are executing payments."
+    )
+
+    return result
+
+
+async def handle_distributed_settlement_proposals(args: Dict) -> Dict:
+    """Get settlement proposals with voting status."""
+    node_name = args.get("node")
+    status_filter = args.get("status")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        params = {}
+        if status_filter:
+            params["status"] = status_filter
+        result = await node.call("hive-distributed-settlement-proposals", params)
+    except Exception as e:
+        return {"error": f"Failed to get settlement proposals: {e}"}
+
+    if "error" in result:
+        return result
+
+    proposals = result.get("proposals", [])
+    for prop in proposals:
+        vote_count = prop.get("vote_count", 0)
+        member_count = prop.get("member_count", 0)
+        quorum_needed = (member_count // 2) + 1 if member_count > 0 else 1
+        prop["quorum_progress"] = f"{vote_count}/{quorum_needed}"
+        prop["quorum_pct"] = round((vote_count / quorum_needed) * 100, 1) if quorum_needed > 0 else 0
+
+    result["ai_note"] = f"Found {len(proposals)} settlement proposal(s). Quorum is 51% of members."
+
+    return result
+
+
+async def handle_distributed_settlement_participation(args: Dict) -> Dict:
+    """Get settlement participation rates to identify gaming behavior."""
+    node_name = args.get("node")
+    periods = args.get("periods", 10)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-distributed-settlement-participation", {"periods": periods})
+    except Exception as e:
+        return {"error": f"Failed to get participation data: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Analyze for gaming behavior
+    members = result.get("members", [])
+    suspects = []
+    for m in members:
+        vote_rate = m.get("vote_rate", 100)
+        exec_rate = m.get("execution_rate", 100)
+        # Flag members with low participation who owe money
+        if vote_rate < 50 or exec_rate < 50:
+            owes_money = m.get("total_owed", 0) < 0
+            if owes_money:
+                suspects.append({
+                    "peer_id": m.get("peer_id", "")[:16] + "...",
+                    "vote_rate": vote_rate,
+                    "execution_rate": exec_rate,
+                    "total_owed": m.get("total_owed", 0),
+                    "risk": "HIGH" if vote_rate < 30 and owes_money else "MEDIUM"
+                })
+
+    result["gaming_suspects"] = suspects
+    result["ai_note"] = (
+        f"Analyzed {len(members)} member(s) over {periods} period(s). "
+        f"Found {len(suspects)} potential gaming suspect(s). "
+        "Low vote/execution rates combined with owing money indicates gaming behavior. "
+        "Consider proposing ban for HIGH risk members."
+    )
 
     return result
 

@@ -680,3 +680,571 @@ class SettlementManager:
             LIMIT ?
         """, (peer_id, limit)).fetchall()
         return [dict(row) for row in rows]
+
+    # =========================================================================
+    # DISTRIBUTED SETTLEMENT (Phase 12)
+    # =========================================================================
+
+    @staticmethod
+    def get_period_string(timestamp: Optional[int] = None) -> str:
+        """
+        Get the YYYY-WW period string for a given timestamp.
+
+        Args:
+            timestamp: Unix timestamp (defaults to now)
+
+        Returns:
+            Period string in YYYY-WW format (ISO week)
+        """
+        import datetime
+        if timestamp is None:
+            timestamp = int(time.time())
+        dt = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
+        iso_year, iso_week, _ = dt.isocalendar()
+        return f"{iso_year}-{iso_week:02d}"
+
+    @staticmethod
+    def get_previous_period() -> str:
+        """Get the period string for the previous week."""
+        import datetime
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        prev_week = now - datetime.timedelta(weeks=1)
+        iso_year, iso_week, _ = prev_week.isocalendar()
+        return f"{iso_year}-{iso_week:02d}"
+
+    @staticmethod
+    def calculate_settlement_hash(
+        period: str,
+        contributions: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Calculate the canonical hash for settlement data.
+
+        This ensures all nodes calculate the same amounts by using
+        a deterministic hash of the contribution data.
+
+        Args:
+            period: Settlement period (YYYY-WW)
+            contributions: List of contribution dicts with peer_id, fees_earned, capacity
+
+        Returns:
+            SHA256 hash (64 hex chars)
+        """
+        import hashlib
+
+        # Sort contributions by peer_id for determinism
+        sorted_contribs = sorted(contributions, key=lambda x: x.get('peer_id', ''))
+
+        # Build canonical string
+        canonical_parts = [period]
+        for c in sorted_contribs:
+            peer_id = c.get('peer_id', '')
+            fees = c.get('fees_earned', 0)
+            capacity = c.get('capacity', 0)
+            uptime = c.get('uptime', 100)
+            canonical_parts.append(f"{peer_id}:{fees}:{capacity}:{uptime}")
+
+        canonical_string = "|".join(canonical_parts)
+        return hashlib.sha256(canonical_string.encode()).hexdigest()
+
+    def gather_contributions_from_gossip(
+        self,
+        state_manager,
+        period: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Gather contribution data from gossiped FEE_REPORT messages.
+
+        This uses the state_manager to get fee data that has been
+        gossiped by other members via FEE_REPORT messages.
+
+        Args:
+            state_manager: HiveStateManager with gossiped fee data
+            period: Settlement period (for filtering)
+
+        Returns:
+            List of contribution dicts with peer_id, fees_earned, capacity, uptime
+        """
+        contributions = []
+
+        # Get all members
+        all_members = self.db.get_all_members()
+
+        for member in all_members:
+            peer_id = member['peer_id']
+
+            # Get gossiped fee data from state manager
+            fee_data = state_manager.get_peer_fees(peer_id)
+
+            # Get capacity from state
+            peer_state = state_manager.get_peer_state(peer_id)
+
+            contributions.append({
+                'peer_id': peer_id,
+                'fees_earned': fee_data.get('fees_earned_sats', 0),
+                'capacity': peer_state.capacity_sats if peer_state else 0,
+                'uptime': int(member.get('uptime_pct', 100)),
+                'forward_count': fee_data.get('forward_count', 0),
+            })
+
+        return contributions
+
+    def create_proposal(
+        self,
+        period: str,
+        our_peer_id: str,
+        state_manager,
+        rpc
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a settlement proposal for a given period.
+
+        This gathers contribution data from gossiped FEE_REPORT messages,
+        calculates the canonical hash, and creates the proposal.
+
+        Args:
+            period: Settlement period (YYYY-WW)
+            our_peer_id: Our node's public key
+            state_manager: HiveStateManager with gossiped fee data
+            rpc: RPC proxy for signing
+
+        Returns:
+            Proposal dict if created, None if period already has proposal
+        """
+        import secrets
+
+        # Check if period already has a proposal
+        existing = self.db.get_settlement_proposal_by_period(period)
+        if existing:
+            self.plugin.log(
+                f"Settlement proposal already exists for {period}",
+                level='debug'
+            )
+            return None
+
+        # Check if period is already settled
+        if self.db.is_period_settled(period):
+            self.plugin.log(
+                f"Period {period} already settled",
+                level='debug'
+            )
+            return None
+
+        # Gather contribution data from gossip
+        contributions = self.gather_contributions_from_gossip(state_manager, period)
+
+        if not contributions:
+            self.plugin.log("No contributions to settle", level='debug')
+            return None
+
+        # Calculate canonical hash
+        data_hash = self.calculate_settlement_hash(period, contributions)
+
+        # Calculate totals
+        total_fees = sum(c.get('fees_earned', 0) for c in contributions)
+        member_count = len(contributions)
+
+        # Generate proposal ID
+        proposal_id = secrets.token_hex(16)
+        timestamp = int(time.time())
+
+        # Create proposal in database
+        if not self.db.add_settlement_proposal(
+            proposal_id=proposal_id,
+            period=period,
+            proposer_peer_id=our_peer_id,
+            data_hash=data_hash,
+            total_fees_sats=total_fees,
+            member_count=member_count
+        ):
+            return None
+
+        self.plugin.log(
+            f"Created settlement proposal {proposal_id[:16]}... for {period}: "
+            f"{total_fees} sats, {member_count} members"
+        )
+
+        return {
+            'proposal_id': proposal_id,
+            'period': period,
+            'proposer_peer_id': our_peer_id,
+            'data_hash': data_hash,
+            'total_fees_sats': total_fees,
+            'member_count': member_count,
+            'contributions': contributions,
+            'timestamp': timestamp,
+        }
+
+    def verify_and_vote(
+        self,
+        proposal: Dict[str, Any],
+        our_peer_id: str,
+        state_manager,
+        rpc
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Verify a settlement proposal's data hash and vote if it matches.
+
+        This independently calculates the data hash from gossiped FEE_REPORT
+        data and votes if it matches the proposal.
+
+        Args:
+            proposal: Proposal dict from SETTLEMENT_PROPOSE message
+            our_peer_id: Our node's public key
+            state_manager: HiveStateManager with gossiped fee data
+            rpc: RPC proxy for signing
+
+        Returns:
+            Vote dict if vote cast, None if hash mismatch or already voted
+        """
+        proposal_id = proposal.get('proposal_id')
+        period = proposal.get('period')
+        proposed_hash = proposal.get('data_hash')
+
+        # Check if we already voted
+        if self.db.has_voted_settlement(proposal_id, our_peer_id):
+            self.plugin.log(
+                f"Already voted on proposal {proposal_id[:16]}...",
+                level='debug'
+            )
+            return None
+
+        # Check if period already settled
+        if self.db.is_period_settled(period):
+            self.plugin.log(
+                f"Period {period} already settled, skipping vote",
+                level='debug'
+            )
+            return None
+
+        # Gather our own contribution data and calculate hash
+        our_contributions = self.gather_contributions_from_gossip(state_manager, period)
+        our_hash = self.calculate_settlement_hash(period, our_contributions)
+
+        # Verify hash matches
+        if our_hash != proposed_hash:
+            self.plugin.log(
+                f"Hash mismatch for proposal {proposal_id[:16]}...: "
+                f"ours={our_hash[:16]}... theirs={proposed_hash[:16]}...",
+                level='warn'
+            )
+            return None
+
+        timestamp = int(time.time())
+
+        # Sign the vote
+        from modules.protocol import get_settlement_ready_signing_payload
+        vote_payload = {
+            'proposal_id': proposal_id,
+            'voter_peer_id': our_peer_id,
+            'data_hash': our_hash,
+            'timestamp': timestamp,
+        }
+        signing_payload = get_settlement_ready_signing_payload(vote_payload)
+
+        try:
+            sig_result = rpc.signmessage(signing_payload)
+            signature = sig_result.get('zbase', '')
+        except Exception as e:
+            self.plugin.log(f"Failed to sign settlement vote: {e}", level='warn')
+            return None
+
+        # Record vote in database
+        if not self.db.add_settlement_ready_vote(
+            proposal_id=proposal_id,
+            voter_peer_id=our_peer_id,
+            data_hash=our_hash,
+            signature=signature
+        ):
+            return None
+
+        self.plugin.log(
+            f"Voted on settlement proposal {proposal_id[:16]}... (hash verified)"
+        )
+
+        return {
+            'proposal_id': proposal_id,
+            'voter_peer_id': our_peer_id,
+            'data_hash': our_hash,
+            'timestamp': timestamp,
+            'signature': signature,
+        }
+
+    def check_quorum_and_mark_ready(
+        self,
+        proposal_id: str,
+        member_count: int
+    ) -> bool:
+        """
+        Check if a proposal has reached quorum (51%) and mark it ready.
+
+        Args:
+            proposal_id: Proposal to check
+            member_count: Total number of members in the proposal
+
+        Returns:
+            True if quorum reached and status updated
+        """
+        vote_count = self.db.count_settlement_ready_votes(proposal_id)
+        quorum_needed = (member_count // 2) + 1
+
+        if vote_count >= quorum_needed:
+            proposal = self.db.get_settlement_proposal(proposal_id)
+            if proposal and proposal.get('status') == 'pending':
+                self.db.update_settlement_proposal_status(proposal_id, 'ready')
+                self.plugin.log(
+                    f"Settlement proposal {proposal_id[:16]}... reached quorum "
+                    f"({vote_count}/{member_count})"
+                )
+                return True
+
+        return False
+
+    def calculate_our_balance(
+        self,
+        proposal: Dict[str, Any],
+        contributions: List[Dict[str, Any]],
+        our_peer_id: str
+    ) -> Tuple[int, Optional[str]]:
+        """
+        Calculate our balance in a settlement (positive = owed, negative = owe).
+
+        Args:
+            proposal: Proposal dict
+            contributions: List of contribution dicts
+            our_peer_id: Our node's public key
+
+        Returns:
+            Tuple of (balance_sats, creditor_peer_id or None)
+        """
+        # Convert to MemberContribution objects
+        member_contributions = [
+            MemberContribution(
+                peer_id=c['peer_id'],
+                capacity_sats=c.get('capacity', 0),
+                forwards_sats=c.get('forward_count', 0) * 100000,  # Estimate
+                fees_earned_sats=c.get('fees_earned', 0),
+                uptime_pct=c.get('uptime', 100),
+            )
+            for c in contributions
+        ]
+
+        # Calculate fair shares
+        results = self.calculate_fair_shares(member_contributions)
+
+        # Find our result
+        our_result = None
+        for result in results:
+            if result.peer_id == our_peer_id:
+                our_result = result
+                break
+
+        if not our_result:
+            return (0, None)
+
+        # If we owe money (negative balance), find who to pay
+        if our_result.balance < -MIN_PAYMENT_SATS:
+            # Find member with highest positive balance (most owed)
+            creditors = [r for r in results if r.balance > MIN_PAYMENT_SATS]
+            if creditors:
+                creditors.sort(key=lambda x: x.balance, reverse=True)
+                return (our_result.balance, creditors[0].peer_id)
+
+        return (our_result.balance, None)
+
+    async def execute_our_settlement(
+        self,
+        proposal: Dict[str, Any],
+        contributions: List[Dict[str, Any]],
+        our_peer_id: str,
+        rpc
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Execute our settlement payment if we owe money.
+
+        Args:
+            proposal: Proposal dict
+            contributions: List of contribution dicts
+            our_peer_id: Our node's public key
+            rpc: RPC proxy for payment
+
+        Returns:
+            Execution result dict if payment made, None otherwise
+        """
+        proposal_id = proposal.get('proposal_id')
+
+        # Check if already executed
+        if self.db.has_executed_settlement(proposal_id, our_peer_id):
+            self.plugin.log(
+                f"Already executed settlement for {proposal_id[:16]}...",
+                level='debug'
+            )
+            return None
+
+        # Calculate our balance
+        balance, creditor_peer_id = self.calculate_our_balance(
+            proposal, contributions, our_peer_id
+        )
+
+        timestamp = int(time.time())
+
+        if balance >= -MIN_PAYMENT_SATS:
+            # We don't owe money (or owe less than dust)
+            # Still record execution to confirm participation
+            from modules.protocol import get_settlement_executed_signing_payload
+            exec_payload = {
+                'proposal_id': proposal_id,
+                'executor_peer_id': our_peer_id,
+                'payment_hash': '',
+                'amount_paid_sats': 0,
+                'timestamp': timestamp,
+            }
+            signing_payload = get_settlement_executed_signing_payload(exec_payload)
+            sig_result = rpc.signmessage(signing_payload)
+            signature = sig_result.get('zbase', '')
+
+            self.db.add_settlement_execution(
+                proposal_id=proposal_id,
+                executor_peer_id=our_peer_id,
+                signature=signature,
+                payment_hash=None,
+                amount_paid_sats=0
+            )
+
+            self.plugin.log(
+                f"Confirmed settlement execution (no payment needed, balance={balance})"
+            )
+
+            return {
+                'proposal_id': proposal_id,
+                'executor_peer_id': our_peer_id,
+                'payment_hash': None,
+                'amount_paid_sats': 0,
+                'timestamp': timestamp,
+                'signature': signature,
+            }
+
+        # We owe money - get creditor's BOLT12 offer
+        creditor_offer = self.get_offer(creditor_peer_id)
+        if not creditor_offer:
+            self.plugin.log(
+                f"No BOLT12 offer for creditor {creditor_peer_id[:16]}...",
+                level='warn'
+            )
+            return None
+
+        # Amount to pay (absolute value of negative balance)
+        amount_to_pay = abs(balance)
+
+        # Create and execute payment
+        payment = SettlementPayment(
+            from_peer=our_peer_id,
+            to_peer=creditor_peer_id,
+            amount_sats=amount_to_pay,
+            bolt12_offer=creditor_offer
+        )
+
+        payment = await self.execute_payment(payment)
+
+        if payment.status == 'completed':
+            from modules.protocol import get_settlement_executed_signing_payload
+            exec_payload = {
+                'proposal_id': proposal_id,
+                'executor_peer_id': our_peer_id,
+                'payment_hash': payment.payment_hash or '',
+                'amount_paid_sats': amount_to_pay,
+                'timestamp': timestamp,
+            }
+            signing_payload = get_settlement_executed_signing_payload(exec_payload)
+            sig_result = rpc.signmessage(signing_payload)
+            signature = sig_result.get('zbase', '')
+
+            self.db.add_settlement_execution(
+                proposal_id=proposal_id,
+                executor_peer_id=our_peer_id,
+                signature=signature,
+                payment_hash=payment.payment_hash,
+                amount_paid_sats=amount_to_pay
+            )
+
+            self.plugin.log(
+                f"Executed settlement payment: {amount_to_pay} sats to "
+                f"{creditor_peer_id[:16]}... (hash={payment.payment_hash[:16]}...)"
+            )
+
+            return {
+                'proposal_id': proposal_id,
+                'executor_peer_id': our_peer_id,
+                'payment_hash': payment.payment_hash,
+                'amount_paid_sats': amount_to_pay,
+                'timestamp': timestamp,
+                'signature': signature,
+            }
+
+        else:
+            self.plugin.log(
+                f"Settlement payment failed: {payment.error}",
+                level='warn'
+            )
+            return None
+
+    def check_and_complete_settlement(self, proposal_id: str) -> bool:
+        """
+        Check if all members have executed and complete the settlement.
+
+        Args:
+            proposal_id: Proposal to check
+
+        Returns:
+            True if settlement completed
+        """
+        proposal = self.db.get_settlement_proposal(proposal_id)
+        if not proposal:
+            return False
+
+        if proposal.get('status') != 'ready':
+            return False
+
+        period = proposal.get('period')
+        member_count = proposal.get('member_count', 0)
+        total_fees = proposal.get('total_fees_sats', 0)
+
+        # Get all executions
+        executions = self.db.get_settlement_executions(proposal_id)
+        exec_count = len(executions)
+
+        if exec_count >= member_count:
+            # All members have confirmed - mark as complete
+            self.db.update_settlement_proposal_status(proposal_id, 'completed')
+
+            # Mark period as settled
+            total_distributed = sum(e.get('amount_paid_sats', 0) for e in executions)
+            self.db.mark_period_settled(period, proposal_id, total_distributed)
+
+            self.plugin.log(
+                f"Settlement {proposal_id[:16]}... completed: "
+                f"{total_distributed} sats distributed for {period}"
+            )
+            return True
+
+        return False
+
+    def get_distributed_settlement_status(self) -> Dict[str, Any]:
+        """
+        Get current distributed settlement status for monitoring.
+
+        Returns:
+            Status dict with pending/ready proposals, recent settlements
+        """
+        pending = self.db.get_pending_settlement_proposals()
+        ready = self.db.get_ready_settlement_proposals()
+        settled = self.db.get_settled_periods(limit=5)
+
+        return {
+            'pending_proposals': len(pending),
+            'ready_proposals': len(ready),
+            'recent_settlements': len(settled),
+            'pending': pending,
+            'ready': ready,
+            'settled_periods': settled,
+        }

@@ -228,9 +228,17 @@ class HiveDatabase:
                 reason TEXT NOT NULL,
                 proposed_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending'
+                status TEXT NOT NULL DEFAULT 'pending',
+                proposal_type TEXT NOT NULL DEFAULT 'standard'
             )
         """)
+        # Add proposal_type column if upgrading from older schema
+        try:
+            conn.execute(
+                "ALTER TABLE ban_proposals ADD COLUMN proposal_type TEXT NOT NULL DEFAULT 'standard'"
+            )
+        except Exception:
+            pass  # Column already exists
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ban_votes (
@@ -906,6 +914,76 @@ class HiveDatabase:
             "ON splice_sessions(timeout_at) WHERE status NOT IN ('completed', 'aborted', 'failed')"
         )
 
+        # =====================================================================
+        # DISTRIBUTED SETTLEMENT TABLES (Phase 12)
+        # =====================================================================
+
+        # Settlement proposals - one proposal per period
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_proposals (
+                proposal_id TEXT PRIMARY KEY,
+                period TEXT NOT NULL UNIQUE,
+                proposer_peer_id TEXT NOT NULL,
+                proposed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                data_hash TEXT NOT NULL,
+                total_fees_sats INTEGER NOT NULL,
+                member_count INTEGER NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_settlement_proposals_period "
+            "ON settlement_proposals(period)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_settlement_proposals_status "
+            "ON settlement_proposals(status)"
+        )
+
+        # Settlement ready votes - quorum tracking (51%)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_ready_votes (
+                proposal_id TEXT NOT NULL,
+                voter_peer_id TEXT NOT NULL,
+                data_hash TEXT NOT NULL,
+                voted_at INTEGER NOT NULL,
+                signature TEXT NOT NULL,
+                PRIMARY KEY (proposal_id, voter_peer_id)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_settlement_votes_proposal "
+            "ON settlement_ready_votes(proposal_id)"
+        )
+
+        # Settlement execution confirmations
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_executions (
+                proposal_id TEXT NOT NULL,
+                executor_peer_id TEXT NOT NULL,
+                payment_hash TEXT,
+                amount_paid_sats INTEGER,
+                executed_at INTEGER NOT NULL,
+                signature TEXT NOT NULL,
+                PRIMARY KEY (proposal_id, executor_peer_id)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_settlement_exec_proposal "
+            "ON settlement_executions(proposal_id)"
+        )
+
+        # Settled periods - prevent double settlement (critical!)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settled_periods (
+                period TEXT PRIMARY KEY,
+                proposal_id TEXT NOT NULL,
+                settled_at INTEGER NOT NULL,
+                total_distributed_sats INTEGER NOT NULL
+            )
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -1451,17 +1529,32 @@ class HiveDatabase:
 
     def create_ban_proposal(self, proposal_id: str, target_peer_id: str,
                            proposer_peer_id: str, reason: str,
-                           proposed_at: int, expires_at: int) -> bool:
-        """Create a new ban proposal."""
+                           proposed_at: int, expires_at: int,
+                           proposal_type: str = 'standard') -> bool:
+        """
+        Create a new ban proposal.
+
+        Args:
+            proposal_id: Unique proposal identifier
+            target_peer_id: Member to ban
+            proposer_peer_id: Member proposing the ban
+            reason: Reason for ban
+            proposed_at: Unix timestamp
+            expires_at: Unix timestamp when proposal expires
+            proposal_type: 'standard' or 'settlement_gaming'
+                - standard: Normal quorum voting (51% approve to ban)
+                - settlement_gaming: Reversed voting (non-votes = approve,
+                  must actively vote 'reject' to prevent ban)
+        """
         conn = self._get_connection()
         try:
             conn.execute("""
                 INSERT INTO ban_proposals
                 (proposal_id, target_peer_id, proposer_peer_id, reason,
-                 proposed_at, expires_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                 proposed_at, expires_at, status, proposal_type)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
             """, (proposal_id, target_peer_id, proposer_peer_id, reason,
-                  proposed_at, expires_at))
+                  proposed_at, expires_at, proposal_type))
             conn.commit()
             return True
         except Exception:
@@ -4954,3 +5047,325 @@ class HiveDatabase:
             DELETE FROM splice_sessions WHERE session_id = ?
         """, (session_id,))
         return result.rowcount > 0
+
+    # =========================================================================
+    # DISTRIBUTED SETTLEMENT OPERATIONS (Phase 12)
+    # =========================================================================
+
+    def add_settlement_proposal(
+        self,
+        proposal_id: str,
+        period: str,
+        proposer_peer_id: str,
+        data_hash: str,
+        total_fees_sats: int,
+        member_count: int,
+        expires_in_seconds: int = 86400  # 24 hours
+    ) -> bool:
+        """
+        Add a new settlement proposal.
+
+        Args:
+            proposal_id: Unique proposal identifier
+            period: Settlement period (YYYY-WW format)
+            proposer_peer_id: Peer who proposed this settlement
+            data_hash: Canonical hash of settlement data for verification
+            total_fees_sats: Total fees to distribute
+            member_count: Number of participating members
+            expires_in_seconds: Time until proposal expires
+
+        Returns:
+            True if created, False if proposal for this period already exists
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        expires_at = now + expires_in_seconds
+
+        try:
+            conn.execute("""
+                INSERT INTO settlement_proposals
+                (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
+                 status, data_hash, total_fees_sats, member_count)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """, (proposal_id, period, proposer_peer_id, now, expires_at,
+                  data_hash, total_fees_sats, member_count))
+            return True
+        except sqlite3.IntegrityError:
+            # Period already has a proposal
+            return False
+
+    def get_settlement_proposal(self, proposal_id: str) -> Optional[Dict[str, Any]]:
+        """Get a settlement proposal by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM settlement_proposals WHERE proposal_id = ?",
+            (proposal_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_settlement_proposal_by_period(self, period: str) -> Optional[Dict[str, Any]]:
+        """Get a settlement proposal by period (YYYY-WW)."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM settlement_proposals WHERE period = ?",
+            (period,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_settlement_proposals(self) -> List[Dict[str, Any]]:
+        """Get all pending settlement proposals."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM settlement_proposals
+            WHERE status = 'pending'
+            ORDER BY proposed_at ASC
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_ready_settlement_proposals(self) -> List[Dict[str, Any]]:
+        """Get all ready-to-execute settlement proposals."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM settlement_proposals
+            WHERE status = 'ready'
+            ORDER BY proposed_at ASC
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_settlement_proposal_status(
+        self, proposal_id: str, status: str
+    ) -> bool:
+        """Update a settlement proposal's status."""
+        conn = self._get_connection()
+        result = conn.execute("""
+            UPDATE settlement_proposals SET status = ? WHERE proposal_id = ?
+        """, (status, proposal_id))
+        return result.rowcount > 0
+
+    def add_settlement_ready_vote(
+        self,
+        proposal_id: str,
+        voter_peer_id: str,
+        data_hash: str,
+        signature: str
+    ) -> bool:
+        """
+        Add a ready vote for a settlement proposal.
+
+        Args:
+            proposal_id: Proposal being voted on
+            voter_peer_id: Peer casting the vote
+            data_hash: Hash voter calculated (must match proposal)
+            signature: Voter's signature
+
+        Returns:
+            True if vote added, False if already voted
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO settlement_ready_votes
+                (proposal_id, voter_peer_id, data_hash, voted_at, signature)
+                VALUES (?, ?, ?, ?, ?)
+            """, (proposal_id, voter_peer_id, data_hash, now, signature))
+            return True
+        except sqlite3.IntegrityError:
+            return False  # Already voted
+
+    def get_settlement_ready_votes(self, proposal_id: str) -> List[Dict[str, Any]]:
+        """Get all ready votes for a proposal."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM settlement_ready_votes WHERE proposal_id = ?
+        """, (proposal_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_settlement_ready_votes(self, proposal_id: str) -> int:
+        """Count ready votes for a proposal."""
+        conn = self._get_connection()
+        result = conn.execute("""
+            SELECT COUNT(*) FROM settlement_ready_votes WHERE proposal_id = ?
+        """, (proposal_id,)).fetchone()
+        return result[0] if result else 0
+
+    def has_voted_settlement(self, proposal_id: str, voter_peer_id: str) -> bool:
+        """Check if a peer has already voted on a proposal."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT 1 FROM settlement_ready_votes
+            WHERE proposal_id = ? AND voter_peer_id = ?
+        """, (proposal_id, voter_peer_id)).fetchone()
+        return row is not None
+
+    def add_settlement_execution(
+        self,
+        proposal_id: str,
+        executor_peer_id: str,
+        signature: str,
+        payment_hash: Optional[str] = None,
+        amount_paid_sats: Optional[int] = None
+    ) -> bool:
+        """
+        Record a settlement execution by a member.
+
+        Args:
+            proposal_id: Proposal being executed
+            executor_peer_id: Peer who executed their payment
+            signature: Signature proving execution
+            payment_hash: Payment hash if payment was made
+            amount_paid_sats: Amount paid in sats
+
+        Returns:
+            True if recorded, False if already executed
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO settlement_executions
+                (proposal_id, executor_peer_id, payment_hash, amount_paid_sats,
+                 executed_at, signature)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (proposal_id, executor_peer_id, payment_hash, amount_paid_sats,
+                  now, signature))
+            return True
+        except sqlite3.IntegrityError:
+            return False  # Already executed
+
+    def get_settlement_executions(self, proposal_id: str) -> List[Dict[str, Any]]:
+        """Get all execution records for a proposal."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM settlement_executions WHERE proposal_id = ?
+        """, (proposal_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_executed_settlement(
+        self, proposal_id: str, executor_peer_id: str
+    ) -> bool:
+        """Check if a peer has already executed their settlement payment."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT 1 FROM settlement_executions
+            WHERE proposal_id = ? AND executor_peer_id = ?
+        """, (proposal_id, executor_peer_id)).fetchone()
+        return row is not None
+
+    def is_period_settled(self, period: str) -> bool:
+        """Check if a period has already been settled."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT 1 FROM settled_periods WHERE period = ?",
+            (period,)
+        ).fetchone()
+        return row is not None
+
+    def mark_period_settled(
+        self,
+        period: str,
+        proposal_id: str,
+        total_distributed_sats: int
+    ) -> bool:
+        """
+        Mark a settlement period as complete.
+
+        Args:
+            period: Period that was settled (YYYY-WW)
+            proposal_id: Proposal that completed the settlement
+            total_distributed_sats: Total sats distributed
+
+        Returns:
+            True if marked, False if already settled
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO settled_periods
+                (period, proposal_id, settled_at, total_distributed_sats)
+                VALUES (?, ?, ?, ?)
+            """, (period, proposal_id, now, total_distributed_sats))
+            return True
+        except sqlite3.IntegrityError:
+            return False  # Already settled
+
+    def get_settled_periods(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recently settled periods."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM settled_periods
+            ORDER BY settled_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def cleanup_expired_settlement_proposals(self) -> int:
+        """
+        Mark expired settlement proposals as 'expired'.
+
+        Returns:
+            Number of proposals cleaned up
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        result = conn.execute("""
+            UPDATE settlement_proposals
+            SET status = 'expired'
+            WHERE status = 'pending'
+            AND expires_at < ?
+        """, (now,))
+
+        return result.rowcount
+
+    def prune_old_settlement_data(self, older_than_days: int = 90) -> int:
+        """
+        Remove old settlement data (proposals, votes, executions).
+
+        Args:
+            older_than_days: Remove data older than this many days
+
+        Returns:
+            Total number of rows deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        total = 0
+
+        # Get old proposal IDs first
+        old_proposals = conn.execute("""
+            SELECT proposal_id FROM settlement_proposals
+            WHERE proposed_at < ?
+        """, (cutoff,)).fetchall()
+
+        old_ids = [row[0] for row in old_proposals]
+
+        if old_ids:
+            placeholders = ",".join("?" * len(old_ids))
+
+            # Delete executions
+            result = conn.execute(
+                f"DELETE FROM settlement_executions WHERE proposal_id IN ({placeholders})",
+                old_ids
+            )
+            total += result.rowcount
+
+            # Delete votes
+            result = conn.execute(
+                f"DELETE FROM settlement_ready_votes WHERE proposal_id IN ({placeholders})",
+                old_ids
+            )
+            total += result.rowcount
+
+            # Delete proposals
+            result = conn.execute(
+                f"DELETE FROM settlement_proposals WHERE proposal_id IN ({placeholders})",
+                old_ids
+            )
+            total += result.rowcount
+
+        return total

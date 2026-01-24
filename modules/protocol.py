@@ -116,6 +116,11 @@ class HiveMessageType(IntEnum):
     SPLICE_SIGNED = 32843         # Final signed PSBT/txid
     SPLICE_ABORT = 32845          # Abort splice operation
 
+    # Phase 12: Distributed Settlement
+    SETTLEMENT_PROPOSE = 32847    # Propose settlement for a period
+    SETTLEMENT_READY = 32849      # Vote that data hash matches (quorum)
+    SETTLEMENT_EXECUTED = 32851   # Confirm payment execution
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -3788,3 +3793,303 @@ def create_splice_abort(
         return None
 
     return serialize(HiveMessageType.SPLICE_ABORT, payload)
+
+
+# =============================================================================
+# PHASE 12: DISTRIBUTED SETTLEMENT MESSAGES
+# =============================================================================
+
+def validate_settlement_propose(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SETTLEMENT_PROPOSE payload schema.
+
+    Args:
+        payload: Decoded SETTLEMENT_PROPOSE payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    required = ["proposal_id", "period", "proposer_peer_id", "timestamp",
+                "data_hash", "total_fees_sats", "member_count",
+                "contributions", "signature"]
+
+    for field in required:
+        if field not in payload:
+            return False
+
+    # Validate types
+    if not isinstance(payload["proposal_id"], str) or len(payload["proposal_id"]) > 64:
+        return False
+    if not isinstance(payload["period"], str) or len(payload["period"]) > 10:
+        return False
+    if not _valid_pubkey(payload["proposer_peer_id"]):
+        return False
+    if not isinstance(payload["timestamp"], int) or payload["timestamp"] < 0:
+        return False
+    if not isinstance(payload["data_hash"], str) or len(payload["data_hash"]) != 64:
+        return False
+    if not isinstance(payload["total_fees_sats"], int) or payload["total_fees_sats"] < 0:
+        return False
+    if not isinstance(payload["member_count"], int) or payload["member_count"] < 1:
+        return False
+    if not isinstance(payload["contributions"], list):
+        return False
+    if not isinstance(payload["signature"], str) or len(payload["signature"]) < 10:
+        return False
+
+    # Validate contributions list (limit to prevent DoS)
+    if len(payload["contributions"]) > 100:
+        return False
+
+    for contrib in payload["contributions"]:
+        if not isinstance(contrib, dict):
+            return False
+        if not _valid_pubkey(contrib.get("peer_id", "")):
+            return False
+        if not isinstance(contrib.get("fees_earned", 0), int):
+            return False
+        if not isinstance(contrib.get("capacity", 0), int):
+            return False
+
+    return True
+
+
+def validate_settlement_ready(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SETTLEMENT_READY payload schema.
+
+    Args:
+        payload: Decoded SETTLEMENT_READY payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    required = ["proposal_id", "voter_peer_id", "data_hash", "timestamp", "signature"]
+
+    for field in required:
+        if field not in payload:
+            return False
+
+    if not isinstance(payload["proposal_id"], str) or len(payload["proposal_id"]) > 64:
+        return False
+    if not _valid_pubkey(payload["voter_peer_id"]):
+        return False
+    if not isinstance(payload["data_hash"], str) or len(payload["data_hash"]) != 64:
+        return False
+    if not isinstance(payload["timestamp"], int) or payload["timestamp"] < 0:
+        return False
+    if not isinstance(payload["signature"], str) or len(payload["signature"]) < 10:
+        return False
+
+    return True
+
+
+def validate_settlement_executed(payload: Dict[str, Any]) -> bool:
+    """
+    Validate SETTLEMENT_EXECUTED payload schema.
+
+    Args:
+        payload: Decoded SETTLEMENT_EXECUTED payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    required = ["proposal_id", "executor_peer_id", "timestamp", "signature"]
+
+    for field in required:
+        if field not in payload:
+            return False
+
+    if not isinstance(payload["proposal_id"], str) or len(payload["proposal_id"]) > 64:
+        return False
+    if not _valid_pubkey(payload["executor_peer_id"]):
+        return False
+    if not isinstance(payload["timestamp"], int) or payload["timestamp"] < 0:
+        return False
+    if not isinstance(payload["signature"], str) or len(payload["signature"]) < 10:
+        return False
+
+    # Optional fields
+    if "payment_hash" in payload:
+        if not isinstance(payload["payment_hash"], str):
+            return False
+    if "amount_paid_sats" in payload:
+        if not isinstance(payload["amount_paid_sats"], int):
+            return False
+
+    return True
+
+
+def get_settlement_propose_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SETTLEMENT_PROPOSE messages.
+
+    The signature covers the core fields that define the proposal.
+    """
+    signing_fields = {
+        "proposal_id": payload.get("proposal_id", ""),
+        "period": payload.get("period", ""),
+        "proposer_peer_id": payload.get("proposer_peer_id", ""),
+        "data_hash": payload.get("data_hash", ""),
+        "total_fees_sats": payload.get("total_fees_sats", 0),
+        "member_count": payload.get("member_count", 0),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def get_settlement_ready_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SETTLEMENT_READY messages.
+
+    The signature covers the voter's hash confirmation.
+    """
+    signing_fields = {
+        "proposal_id": payload.get("proposal_id", ""),
+        "voter_peer_id": payload.get("voter_peer_id", ""),
+        "data_hash": payload.get("data_hash", ""),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def get_settlement_executed_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing SETTLEMENT_EXECUTED messages.
+
+    The signature covers the execution confirmation.
+    """
+    signing_fields = {
+        "proposal_id": payload.get("proposal_id", ""),
+        "executor_peer_id": payload.get("executor_peer_id", ""),
+        "payment_hash": payload.get("payment_hash", ""),
+        "amount_paid_sats": payload.get("amount_paid_sats", 0),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def create_settlement_propose(
+    proposal_id: str,
+    period: str,
+    proposer_peer_id: str,
+    data_hash: str,
+    total_fees_sats: int,
+    member_count: int,
+    contributions: List[Dict[str, Any]],
+    timestamp: int,
+    signature: str
+) -> bytes:
+    """
+    Create a SETTLEMENT_PROPOSE message.
+
+    This message proposes a settlement for a given period using canonical
+    fee data from gossiped FEE_REPORT messages.
+
+    Args:
+        proposal_id: Unique identifier for this proposal
+        period: Settlement period (YYYY-WW format)
+        proposer_peer_id: Node proposing the settlement
+        data_hash: Canonical hash of contribution data for verification
+        total_fees_sats: Total fees to distribute
+        member_count: Number of participating members
+        contributions: List of member contribution dicts
+        timestamp: Unix timestamp of proposal
+        signature: Proposer's signature
+
+    Returns:
+        Serialized SETTLEMENT_PROPOSE message
+    """
+    payload = {
+        "proposal_id": proposal_id,
+        "period": period,
+        "proposer_peer_id": proposer_peer_id,
+        "data_hash": data_hash,
+        "total_fees_sats": total_fees_sats,
+        "member_count": member_count,
+        "contributions": contributions,
+        "timestamp": timestamp,
+        "signature": signature
+    }
+    return serialize(HiveMessageType.SETTLEMENT_PROPOSE, payload)
+
+
+def create_settlement_ready(
+    proposal_id: str,
+    voter_peer_id: str,
+    data_hash: str,
+    timestamp: int,
+    signature: str
+) -> bytes:
+    """
+    Create a SETTLEMENT_READY message.
+
+    This message votes that the sender has verified the data_hash matches
+    their own calculation from gossiped FEE_REPORT data.
+
+    Args:
+        proposal_id: Proposal being voted on
+        voter_peer_id: Node casting the vote
+        data_hash: Hash the voter calculated (must match proposal)
+        timestamp: Unix timestamp of vote
+        signature: Voter's signature
+
+    Returns:
+        Serialized SETTLEMENT_READY message
+    """
+    payload = {
+        "proposal_id": proposal_id,
+        "voter_peer_id": voter_peer_id,
+        "data_hash": data_hash,
+        "timestamp": timestamp,
+        "signature": signature
+    }
+    return serialize(HiveMessageType.SETTLEMENT_READY, payload)
+
+
+def create_settlement_executed(
+    proposal_id: str,
+    executor_peer_id: str,
+    timestamp: int,
+    signature: str,
+    payment_hash: Optional[str] = None,
+    amount_paid_sats: Optional[int] = None
+) -> bytes:
+    """
+    Create a SETTLEMENT_EXECUTED message.
+
+    This message confirms that the sender has executed their settlement
+    payment (if they owed money).
+
+    Args:
+        proposal_id: Proposal being executed
+        executor_peer_id: Node that executed payment
+        timestamp: Unix timestamp of execution
+        signature: Executor's signature
+        payment_hash: Payment hash (if payment was made)
+        amount_paid_sats: Amount paid (if payment was made)
+
+    Returns:
+        Serialized SETTLEMENT_EXECUTED message
+    """
+    payload = {
+        "proposal_id": proposal_id,
+        "executor_peer_id": executor_peer_id,
+        "timestamp": timestamp,
+        "signature": signature
+    }
+    if payment_hash is not None:
+        payload["payment_hash"] = payment_hash
+    if amount_paid_sats is not None:
+        payload["amount_paid_sats"] = amount_paid_sats
+
+    return serialize(HiveMessageType.SETTLEMENT_EXECUTED, payload)
