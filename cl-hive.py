@@ -2642,9 +2642,14 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
 
         if broadcast_count > 0:
             safe_plugin.log(
-                f"cl-hive: Fee report broadcast: {fees_earned} sats, "
-                f"{forward_count} forwards -> {broadcast_count} members",
-                level="debug"
+                f"[FeeReport] Broadcast: {fees_earned} sats, "
+                f"{forward_count} forwards -> {broadcast_count} member(s)",
+                level="info"
+            )
+        else:
+            safe_plugin.log(
+                f"[FeeReport] No members to broadcast to (found {len(members)} total)",
+                level="warn"
             )
 
         # Also update our own state in state_manager
@@ -4909,12 +4914,12 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
     if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: FEE_REPORT from non-member {peer_id[:16]}...", level='debug')
+        plugin.log(f"[FeeReport] Rejected: non-member or banned {peer_id[:16]}...", level='info')
         return {"result": "continue"}
 
     # Validate payload schema
     if not validate_fee_report(payload):
-        plugin.log(f"cl-hive: FEE_REPORT invalid schema from {peer_id[:16]}...", level='debug')
+        plugin.log(f"[FeeReport] Rejected: invalid schema from {peer_id[:16]}...", level='info')
         return {"result": "continue"}
 
     # Extract payload fields
