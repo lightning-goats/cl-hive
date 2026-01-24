@@ -10662,7 +10662,8 @@ def hive_fee_reports(plugin: Plugin, period: str = None):
 
     from modules.settlement import SettlementManager
 
-    if period:
+    # Handle "latest" as a special case to get most recent per peer
+    if period and period.lower() != "latest":
         reports = database.get_fee_reports_for_period(period)
     else:
         reports = database.get_latest_fee_reports()
