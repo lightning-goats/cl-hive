@@ -1736,7 +1736,8 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
             contrib_list.append({
                 "member_id": c.member_id[:16] + "..." if c.member_id else "",
                 "member_id_full": c.member_id,
-                "capacity_sats": c.capacity_sats,
+                "capacity_sats": c.total_capacity_sats,
+                "weighted_capacity_sats": c.weighted_capacity_sats,
                 "uptime_pct": round(c.uptime_pct * 100, 1),
                 "pool_share": round(c.pool_share * 100, 2),
             })
