@@ -451,26 +451,48 @@ class SpliceManager:
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_INIT_RECEIVED, psbt=psbt)
 
         # Call splice_update with their PSBT - use full hex channel_id
-        try:
-            update_result = rpc.call("splice_update", {
-                "channel_id": full_channel_id,
-                "psbt": psbt
-            })
-            our_psbt = update_result.get("psbt")
-            commitments_secured = update_result.get("commitments_secured", False)
+        # Retry with delays because the HIVE custom message may arrive before
+        # CLN's internal splice handshake (STFU + splice_init) completes
+        max_retries = 10
+        retry_delay = 0.5  # seconds
+        our_psbt = None
+        commitments_secured = False
+        last_error = None
 
-            if not our_psbt:
-                raise Exception("No PSBT returned from splice_update")
+        for attempt in range(max_retries):
+            try:
+                update_result = rpc.call("splice_update", {
+                    "channel_id": full_channel_id,
+                    "psbt": psbt
+                })
+                our_psbt = update_result.get("psbt")
+                commitments_secured = update_result.get("commitments_secured", False)
 
-        except Exception as e:
-            self._log(f"splice_update failed: {e}", level='error')
+                if not our_psbt:
+                    raise Exception("No PSBT returned from splice_update")
+                break  # Success
+
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                # Check if CLN is still busy with splice handshake
+                if "waiting on previous splice command" in error_str.lower() or "code': 355" in error_str:
+                    if attempt < max_retries - 1:
+                        self._log(f"splice_update: CLN busy, retry {attempt + 1}/{max_retries} in {retry_delay}s")
+                        time.sleep(retry_delay)
+                        continue
+                # Other error - don't retry
+                break
+
+        if our_psbt is None:
+            self._log(f"splice_update failed after {max_retries} retries: {last_error}", level='error')
             self.db.update_splice_session(
                 session_id,
                 status=SPLICE_STATUS_FAILED,
-                error_message=str(e)
+                error_message=str(last_error)
             )
             self._send_reject(sender_id, session_id, SPLICE_REJECT_DECLINED, rpc)
-            return {"error": "splice_update_failed", "message": str(e)}
+            return {"error": "splice_update_failed", "message": str(last_error)}
 
         # Update session with our PSBT
         self.db.update_splice_session(
