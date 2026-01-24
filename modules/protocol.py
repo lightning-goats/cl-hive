@@ -3139,7 +3139,7 @@ def create_task_request(
     signing_payload = get_task_request_signing_payload(payload)
     try:
         sign_result = rpc.signmessage(signing_payload)
-        payload["signature"] = sign_result.get("signature", "")
+        payload["signature"] = sign_result.get("zbase", "")
     except Exception:
         return None
 
@@ -3192,7 +3192,7 @@ def create_task_response(
     signing_payload = get_task_response_signing_payload(payload)
     try:
         sign_result = rpc.signmessage(signing_payload)
-        payload["signature"] = sign_result.get("signature", "")
+        payload["signature"] = sign_result.get("zbase", "")
     except Exception:
         return None
 
@@ -3609,7 +3609,7 @@ def create_splice_init_request(
     signing_payload = get_splice_init_request_signing_payload(payload)
     try:
         sign_result = rpc.signmessage(signing_payload)
-        payload["signature"] = sign_result.get("signature", "")
+        payload["signature"] = sign_result.get("zbase", "")
     except Exception:
         return None
 
@@ -3657,7 +3657,7 @@ def create_splice_init_response(
     signing_payload = get_splice_init_response_signing_payload(payload)
     try:
         sign_result = rpc.signmessage(signing_payload)
-        payload["signature"] = sign_result.get("signature", "")
+        payload["signature"] = sign_result.get("zbase", "")
     except Exception:
         return None
 
@@ -3699,7 +3699,7 @@ def create_splice_update(
     signing_payload = get_splice_update_signing_payload(payload)
     try:
         sign_result = rpc.signmessage(signing_payload)
-        payload["signature"] = sign_result.get("signature", "")
+        payload["signature"] = sign_result.get("zbase", "")
     except Exception:
         return None
 
@@ -3744,7 +3744,7 @@ def create_splice_signed(
     signing_payload = get_splice_signed_signing_payload(payload)
     try:
         sign_result = rpc.signmessage(signing_payload)
-        payload["signature"] = sign_result.get("signature", "")
+        payload["signature"] = sign_result.get("zbase", "")
     except Exception:
         return None
 
@@ -3783,7 +3783,7 @@ def create_splice_abort(
     signing_payload = get_splice_abort_signing_payload(payload)
     try:
         sign_result = rpc.signmessage(signing_payload)
-        payload["signature"] = sign_result.get("signature", "")
+        payload["signature"] = sign_result.get("zbase", "")
     except Exception:
         return None
 

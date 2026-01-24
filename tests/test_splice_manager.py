@@ -584,7 +584,7 @@ class TestSpliceManager:
     ):
         """Should fail if no channel exists with peer."""
         mock_database.get_member.return_value = {"peer_id": sample_pubkey, "tier": "member"}
-        mock_rpc.listpeerchannels.return_value = {"channels": []}
+        mock_rpc.call.return_value = {"channels": []}
 
         result = splice_manager.initiate_splice(
             peer_id=sample_pubkey,
@@ -613,10 +613,11 @@ class TestSpliceManager:
     ):
         """Dry run should return preview without executing."""
         mock_database.get_member.return_value = {"peer_id": sample_pubkey, "tier": "member"}
-        mock_rpc.listpeerchannels.return_value = {
+        mock_rpc.call.return_value = {
             "channels": [{
                 "peer_id": sample_pubkey,
                 "short_channel_id": sample_channel_id,
+                "channel_id": "abc123def456",
                 "state": "CHANNELD_NORMAL"
             }]
         }
@@ -639,10 +640,11 @@ class TestSpliceManager:
     ):
         """Splice-out should be blocked if safety check fails."""
         mock_database.get_member.return_value = {"peer_id": sample_pubkey, "tier": "member"}
-        mock_rpc.listpeerchannels.return_value = {
+        mock_rpc.call.return_value = {
             "channels": [{
                 "peer_id": sample_pubkey,
                 "short_channel_id": sample_channel_id,
+                "channel_id": "abc123def456",
                 "state": "CHANNELD_NORMAL"
             }]
         }
