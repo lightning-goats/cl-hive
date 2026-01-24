@@ -2,6 +2,30 @@
 
 All notable changes to cl-hive will be documented in this file.
 
+## [1.9.0] - 2026-01-24
+
+### Added
+- **Distributed Settlement System**: Fully decentralized settlement with proposal/vote/execute consensus
+  - Any member can propose settlement for completed weeks
+  - Members auto-vote when data hash matches (quorum: 51%)
+  - Each node pays their share via BOLT12 offers
+  - Period-based idempotency prevents double settlement
+- **FEE_REPORT Gossip**: Nodes broadcast fee earnings for canonical settlement calculations
+- **Uptime Tracking**: Automatic uptime percentage calculation from peer presence data
+- **Docker Update Documentation**: Step-by-step guide for updating Docker deployments
+
+### Fixed
+- **ISO Week Parsing**: Fixed week boundary calculations using `fromisocalendar()`
+- **Settlement Fee Discovery**: Now checks database fee_reports before in-memory state
+- **Pool Snapshot RPC**: Fixed handling of `List[MemberContribution]` return type
+- **Uptime in Fair Share**: Fixed 0% uptime by syncing from peer_presence to hive_members
+- **Backfill Column Names**: Fixed `hive-backfill-fees` to use correct schema columns
+- **Period Parameter**: `hive-fee-reports period=latest` now recognized as special case
+
+### Changed
+- **Settlement Weights**: 30% capacity, 60% routing volume, 10% uptime (updated from 40/40/20)
+- Uptime synced on startup and hourly via maintenance loop
+
 ## [1.7.1] - 2026-01-22
 
 ### Fixed
