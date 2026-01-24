@@ -156,6 +156,12 @@ class CycleResult:
     outcomes_measured: int = 0
     learning_summary: Dict[str, Any] = field(default_factory=dict)
 
+    # Settlement
+    settlement_checked: bool = False
+    settlement_period: Optional[str] = None
+    settlement_executed: bool = False
+    settlement_result: Optional[Dict[str, Any]] = None
+
     # Planning
     next_cycle_priorities: List[str] = field(default_factory=list)
 
@@ -180,6 +186,10 @@ class CycleResult:
             "queued_count": len(self.queued_for_review),
             "skipped_count": len(self.skipped),
             "outcomes_measured": self.outcomes_measured,
+            "settlement_checked": self.settlement_checked,
+            "settlement_period": self.settlement_period,
+            "settlement_executed": self.settlement_executed,
+            "settlement_result": self.settlement_result,
             "next_cycle_priorities": self.next_cycle_priorities,
             "errors": self.errors
         }
@@ -370,8 +380,25 @@ class ProactiveAdvisor:
             if outcomes:
                 logger.info(f"  Success rate: {success_count}/{len(outcomes)} ({100*success_count/len(outcomes):.0f}%)")
 
-            # Phase 9: Plan next cycle
-            logger.info("[Phase 9] Planning next cycle priorities...")
+            # Phase 9: Weekly settlement (if new week)
+            logger.info("[Phase 9] Checking weekly settlement...")
+            settlement_result = await self._check_weekly_settlement(node_name)
+            result.settlement_checked = True
+            result.settlement_period = settlement_result.get("period")
+            result.settlement_executed = settlement_result.get("executed", False)
+            result.settlement_result = settlement_result
+            if result.settlement_executed:
+                logger.info(f"  ✓ Settlement executed for period {result.settlement_period}")
+                payments = settlement_result.get("payments_executed", 0)
+                total = settlement_result.get("total_distributed_sats", 0)
+                logger.info(f"    Payments: {payments}, Total distributed: {total:,} sats")
+            elif settlement_result.get("skipped"):
+                logger.info(f"  Settlement skipped: {settlement_result.get('reason', 'already settled')}")
+            else:
+                logger.info(f"  No settlement needed this cycle")
+
+            # Phase 10: Plan next cycle
+            logger.info("[Phase 10] Planning next cycle priorities...")
             result.next_cycle_priorities = self._plan_next_cycle(
                 state, goal_status, outcomes
             )
@@ -410,6 +437,144 @@ class ProactiveAdvisor:
             )
         except Exception:
             pass  # Non-critical
+
+    async def _check_weekly_settlement(self, node_name: str) -> Dict[str, Any]:
+        """
+        Check if weekly settlement is needed and execute if so.
+
+        Settlement is triggered when:
+        1. We're in a new week (current period != last settled period)
+        2. The previous week hasn't been settled yet
+
+        Returns:
+            Dict with settlement status and results
+        """
+        try:
+            # Get current period (YYYY-WW format)
+            now = datetime.now()
+            current_period = f"{now.year}-{now.isocalendar()[1]:02d}"
+
+            # Calculate previous period
+            # Go back 7 days to ensure we're in the previous week
+            from datetime import timedelta
+            prev_date = now - timedelta(days=7)
+            previous_period = f"{prev_date.year}-{prev_date.isocalendar()[1]:02d}"
+
+            # Check if previous period was already settled
+            try:
+                history = await self.mcp.call(
+                    "settlement_history",
+                    {"node": node_name, "limit": 5}
+                )
+                settled_periods = [
+                    p.get("period") for p in history.get("settlement_periods", [])
+                    if p.get("status") == "completed"
+                ]
+            except Exception:
+                settled_periods = []
+
+            if previous_period in settled_periods:
+                return {
+                    "skipped": True,
+                    "reason": f"Period {previous_period} already settled",
+                    "period": previous_period,
+                    "current_period": current_period
+                }
+
+            # Only settle on first few days of new week to avoid multiple attempts
+            # Monday = 0, so settle on Mon/Tue/Wed (0, 1, 2)
+            if now.weekday() > 2:
+                return {
+                    "skipped": True,
+                    "reason": f"Settlement window passed (day {now.weekday()}, only Mon-Wed)",
+                    "period": previous_period,
+                    "current_period": current_period
+                }
+
+            logger.info(f"  Initiating settlement for period {previous_period}...")
+
+            # Step 1: Calculate settlement (dry run to see fair shares)
+            logger.info("  Step 1: Calculating fair shares...")
+            try:
+                calc_result = await self.mcp.call(
+                    "settlement_calculate",
+                    {"node": node_name}
+                )
+                if "error" in calc_result:
+                    return {
+                        "skipped": True,
+                        "reason": f"Calculation failed: {calc_result.get('error')}",
+                        "period": previous_period
+                    }
+
+                members = calc_result.get("members", [])
+                total_fees = calc_result.get("total_fees_sats", 0)
+                logger.info(f"    Total fees: {total_fees:,} sats across {len(members)} members")
+
+                # Log fair shares
+                for m in members:
+                    balance = m.get("balance_sats", 0)
+                    direction = "receives" if balance > 0 else "pays"
+                    logger.info(f"    {m.get('peer_id', '')[:16]}...: {direction} {abs(balance):,} sats")
+
+            except Exception as e:
+                logger.error(f"  Settlement calculation failed: {e}")
+                return {
+                    "skipped": True,
+                    "reason": f"Calculation error: {str(e)}",
+                    "period": previous_period
+                }
+
+            # Step 2: Execute settlement (for real)
+            logger.info("  Step 2: Executing settlement payments...")
+            try:
+                exec_result = await self.mcp.call(
+                    "settlement_execute",
+                    {"node": node_name, "dry_run": False}
+                )
+
+                if "error" in exec_result:
+                    return {
+                        "executed": False,
+                        "reason": f"Execution failed: {exec_result.get('error')}",
+                        "period": previous_period,
+                        "calculation": calc_result
+                    }
+
+                payments = exec_result.get("payments", [])
+                successful = [p for p in payments if p.get("status") == "success"]
+                failed = [p for p in payments if p.get("status") != "success"]
+                total_distributed = sum(p.get("amount_sats", 0) for p in successful)
+
+                logger.info(f"    Payments: {len(successful)} successful, {len(failed)} failed")
+                logger.info(f"    Total distributed: {total_distributed:,} sats")
+
+                return {
+                    "executed": True,
+                    "period": previous_period,
+                    "current_period": current_period,
+                    "payments_executed": len(successful),
+                    "payments_failed": len(failed),
+                    "total_distributed_sats": total_distributed,
+                    "calculation": calc_result,
+                    "execution": exec_result
+                }
+
+            except Exception as e:
+                logger.error(f"  Settlement execution failed: {e}")
+                return {
+                    "executed": False,
+                    "reason": f"Execution error: {str(e)}",
+                    "period": previous_period,
+                    "calculation": calc_result
+                }
+
+        except Exception as e:
+            logger.error(f"  Weekly settlement check failed: {e}")
+            return {
+                "skipped": True,
+                "reason": f"Check failed: {str(e)}"
+            }
 
     async def _analyze_node_state(self, node_name: str) -> Dict[str, Any]:
         """
