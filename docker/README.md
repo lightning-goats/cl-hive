@@ -267,6 +267,35 @@ docker-compose exec cln lightning-cli revenue-status
 
 ### Upgrade
 
+There are two upgrade methods:
+
+#### Hot Upgrade (Recommended for plugin updates)
+
+Updates cl-hive and cl-revenue-ops without rebuilding the Docker image. Fast and minimal downtime.
+
+```bash
+# Check for available updates
+./scripts/hot-upgrade.sh --check
+
+# Upgrade all plugins (pulls git changes and restarts lightningd)
+./scripts/hot-upgrade.sh
+
+# Upgrade only cl-hive
+./scripts/hot-upgrade.sh hive
+
+# Upgrade only cl-revenue-ops
+./scripts/hot-upgrade.sh revenue
+```
+
+**How it works:**
+- cl-hive is mounted from the host, so `git pull` updates it immediately
+- Restarts lightningd via supervisorctl to load new plugin code
+- No image rebuild required
+
+#### Full Upgrade (For Core Lightning or system updates)
+
+Rebuilds the Docker image. Use when upgrading Core Lightning, system packages, or after major changes.
+
 ```bash
 # Preview upgrade
 ./scripts/upgrade.sh --dry-run
@@ -489,7 +518,8 @@ docker/
 ├── scripts/
 │   ├── backup.sh               # Automated backups
 │   ├── restore.sh              # Restore from backup
-│   ├── upgrade.sh              # Safe upgrades
+│   ├── upgrade.sh              # Full image upgrades
+│   ├── hot-upgrade.sh          # Quick plugin updates (no rebuild)
 │   ├── rollback.sh             # Rollback to backup
 │   ├── pre-stop.sh             # Graceful shutdown
 │   └── validate-config.sh      # Configuration validation
