@@ -2966,7 +2966,6 @@ async def handle_onboard_new_members(args: Dict) -> Dict:
     support when new members join the hive.
     """
     import time
-    from advisor_db import AdvisorDB
 
     node_name = args.get("node")
     dry_run = args.get("dry_run", False)
@@ -2978,8 +2977,8 @@ async def handle_onboard_new_members(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Initialize advisor DB for onboarding tracking
-    db = AdvisorDB()
+    # Initialize advisor DB for onboarding tracking (uses configured ADVISOR_DB_PATH)
+    db = ensure_advisor_db()
 
     # Gather required data
     try:
