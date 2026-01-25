@@ -7,8 +7,7 @@
 # This script generates a rune with all permissions needed for:
 # - Hive plugin operations (hive-*)
 # - Revenue-ops plugin operations (revenue-*)
-# - Core CLN queries (getinfo, listfunds, listpeerchannels, etc.)
-# - Peer intelligence (listnodes, listchannels, listpeers)
+# - Core CLN queries (getinfo, list*, etc.)
 # - Fee management (setchannel)
 #
 # The rune can be used in nodes.production.json for the MCP server.
@@ -20,41 +19,30 @@ NODE_NAME="${1:-default}"
 echo "Generating MCP rune for node: $NODE_NAME"
 echo ""
 
-# Define restrictions - each array element is an OR condition
-# Multiple elements in the array mean ANY of these methods are allowed
-RESTRICTIONS='[
-  ["method^hive-"],
-  ["method^revenue-"],
-  ["method=getinfo"],
-  ["method=listfunds"],
-  ["method=listpeerchannels"],
-  ["method=setchannel"],
-  ["method=feerates"],
-  ["method=listinvoices"],
-  ["method=listpays"],
-  ["method=listnodes"],
-  ["method=listchannels"],
-  ["method=listpeers"],
-  ["method=plugin"]
-]'
+# IMPORTANT: All alternatives must be in a SINGLE inner array to be ORed.
+# Multiple inner arrays are ANDed together (all must match).
+# Format: [["alt1", "alt2", "alt3"]] means alt1 OR alt2 OR alt3
+#
+# We use "method/list" to match all list* methods (listnodes, listchannels, etc.)
+RESTRICTIONS='[["method^hive-", "method^revenue-", "method=getinfo", "method/list", "method=setchannel", "method=feerates", "method=plugin"]]'
 
-# Compact the JSON for the command
-COMPACT_RESTRICTIONS=$(echo "$RESTRICTIONS" | jq -c .)
-
-echo "Restrictions:"
-echo "$RESTRICTIONS" | jq .
+echo "Restrictions (ORed alternatives):"
+echo "  - method^hive-      : methods starting with 'hive-'"
+echo "  - method^revenue-   : methods starting with 'revenue-'"
+echo "  - method=getinfo    : getinfo method"
+echo "  - method/list       : methods containing 'list' (listfunds, listnodes, etc.)"
+echo "  - method=setchannel : setchannel method"
+echo "  - method=feerates   : feerates method"
+echo "  - method=plugin     : plugin management"
 echo ""
 
 # Check if we can access lightning-cli
 if command -v lightning-cli &> /dev/null; then
     echo "Generating rune via lightning-cli..."
     echo ""
-    echo "Command:"
-    echo "  lightning-cli createrune restrictions='$COMPACT_RESTRICTIONS'"
-    echo ""
 
     # Generate the rune
-    RESULT=$(lightning-cli createrune restrictions="$COMPACT_RESTRICTIONS" 2>&1) || {
+    RESULT=$(lightning-cli createrune "restrictions=$RESTRICTIONS" 2>&1) || {
         echo "Error: Failed to create rune"
         echo "$RESULT"
         echo ""
@@ -82,25 +70,25 @@ if command -v lightning-cli &> /dev/null; then
 else
     echo "lightning-cli not found. Run this command on your CLN node:"
     echo ""
-    echo "  lightning-cli createrune restrictions='$COMPACT_RESTRICTIONS'"
+    echo "  lightning-cli createrune 'restrictions=$RESTRICTIONS'"
     echo ""
     echo "Or via docker:"
     echo ""
-    echo "  docker exec <container> lightning-cli createrune restrictions='$COMPACT_RESTRICTIONS'"
+    echo "  docker exec <container> lightning-cli createrune 'restrictions=$RESTRICTIONS'"
     echo ""
 fi
 
-echo "Permissions granted by this rune:"
-echo "  - hive-*:          All hive plugin methods"
-echo "  - revenue-*:       All revenue-ops methods"
-echo "  - getinfo:         Node identity and status"
-echo "  - listfunds:       On-chain and channel balances"
+echo "Methods allowed by this rune:"
+echo "  - hive-*:           All hive plugin methods"
+echo "  - revenue-*:        All revenue-ops methods"
+echo "  - getinfo:          Node identity and status"
+echo "  - listfunds:        On-chain and channel balances"
 echo "  - listpeerchannels: Channel details"
-echo "  - setchannel:      Fee adjustments"
-echo "  - feerates:        On-chain fee estimates"
-echo "  - listinvoices:    Invoice queries"
-echo "  - listpays:        Payment history"
-echo "  - listnodes:       Network graph - node info"
-echo "  - listchannels:    Network graph - channel info"
-echo "  - listpeers:       Connected peer info"
-echo "  - plugin:          Plugin management"
+echo "  - listnodes:        Network graph - node info"
+echo "  - listchannels:     Network graph - channel info"
+echo "  - listpeers:        Connected peer info"
+echo "  - listinvoices:     Invoice queries"
+echo "  - listpays:         Payment history"
+echo "  - setchannel:       Fee adjustments"
+echo "  - feerates:         On-chain fee estimates"
+echo "  - plugin:           Plugin management"
