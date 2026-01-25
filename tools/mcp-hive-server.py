@@ -404,6 +404,42 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="hive_onboard_new_members",
+            description="""Detect new hive members and generate strategic channel suggestions.
+
+Runs independently of the advisor cycle to provide immediate onboarding support when new members join.
+
+**What it does:**
+1. Scans hive membership for neophytes and recently joined members (< 30 days)
+2. Checks if each new member has been "onboarded" (received suggestions before)
+3. For un-onboarded members, generates channel suggestions:
+   - Existing fleet members should open channels TO the new member
+   - New member should open channels to strategic targets (valuable corridors, exchanges)
+4. Creates pending_actions entries for channel open suggestions
+5. Marks members as onboarded to avoid repeat suggestions
+
+**When to use:**
+- Run periodically (e.g., hourly) via cron independent of advisor
+- Run manually after a new member joins
+- Run after promoting a neophyte to member
+
+**Returns:** Summary of new members found and suggestions created.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to run onboarding check from"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, report suggestions without creating pending_actions (default: false)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="hive_propose_promotion",
             description="Propose a neophyte for early promotion to member status. Any member can propose a neophyte for promotion before the 90-day probation period completes. When a majority (51%) of active members approve, the neophyte is promoted.",
             inputSchema={
@@ -2596,6 +2632,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_reject_action(arguments)
         elif name == "hive_members":
             result = await handle_members(arguments)
+        elif name == "hive_onboard_new_members":
+            result = await handle_onboard_new_members(arguments)
         elif name == "hive_propose_promotion":
             result = await handle_propose_promotion(arguments)
         elif name == "hive_vote_promotion":
@@ -2918,6 +2956,193 @@ async def handle_members(args: Dict) -> Dict:
         return {"error": "No nodes available"}
 
     return await node.call("hive-members")
+
+
+async def handle_onboard_new_members(args: Dict) -> Dict:
+    """
+    Detect new hive members and generate strategic channel suggestions.
+
+    Runs independently of the advisor cycle to provide immediate onboarding
+    support when new members join the hive.
+    """
+    import time
+    from advisor_db import AdvisorDB
+
+    node_name = args.get("node")
+    dry_run = args.get("dry_run", False)
+
+    if not node_name:
+        return {"error": "node is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Initialize advisor DB for onboarding tracking
+    db = AdvisorDB()
+
+    # Gather required data
+    try:
+        members_data = await node.call("hive-members")
+        node_info = await node.call("getinfo")
+        channels_data = await node.call("listpeerchannels")
+    except Exception as e:
+        return {"error": f"Failed to gather node data: {e}"}
+
+    our_pubkey = node_info.get("id", "")
+    members_list = members_data.get("members", [])
+
+    # Get our current peers
+    our_peers = set()
+    for ch in channels_data.get("channels", []):
+        peer_id = ch.get("peer_id")
+        if peer_id:
+            our_peers.add(peer_id)
+
+    # Try to get positioning data for strategic targets
+    positioning = {}
+    try:
+        positioning = await handle_positioning_summary({"node": node_name})
+    except Exception:
+        pass  # Positioning data is optional
+
+    valuable_corridors = positioning.get("valuable_corridors", [])
+    exchange_gaps = positioning.get("exchange_gaps", [])
+
+    # Find new members that need onboarding
+    new_members_found = []
+    suggestions_created = []
+    already_onboarded = []
+
+    for member in members_list:
+        member_pubkey = member.get("pubkey") or member.get("peer_id")
+        member_alias = member.get("alias", "")
+        tier = member.get("tier", "unknown")
+        joined_at = member.get("joined_at", 0)
+
+        if not member_pubkey:
+            continue
+
+        # Skip ourselves
+        if member_pubkey == our_pubkey:
+            continue
+
+        # Check if this is a new member (neophyte or recently joined)
+        is_neophyte = tier == "neophyte"
+        is_recent = False
+        if joined_at:
+            age_days = (time.time() - joined_at) / 86400
+            is_recent = age_days < 30
+
+        # Skip if not new
+        if not is_neophyte and not is_recent:
+            continue
+
+        # Check if already onboarded
+        if db.is_member_onboarded(member_pubkey):
+            already_onboarded.append({
+                "pubkey": member_pubkey[:16] + "...",
+                "alias": member_alias,
+                "tier": tier
+            })
+            continue
+
+        new_members_found.append({
+            "pubkey": member_pubkey,
+            "alias": member_alias,
+            "tier": tier,
+            "is_neophyte": is_neophyte,
+            "age_days": (time.time() - joined_at) / 86400 if joined_at else None
+        })
+
+        # Generate suggestions for this new member
+
+        # 1. Suggest we open a channel to them (if we don't have one)
+        if member_pubkey not in our_peers:
+            suggestion = {
+                "type": "open_channel_to_new_member",
+                "target_pubkey": member_pubkey,
+                "target_alias": member_alias,
+                "target_tier": tier,
+                "recommended_size_sats": 3000000,  # 3M sats default
+                "reasoning": f"New {tier} member joined hive. Opening a channel strengthens fleet connectivity."
+            }
+
+            if not dry_run:
+                # Create pending_action for this suggestion
+                try:
+                    await node.call("hive-queue-action", {
+                        "action_type": "channel_open",
+                        "target": member_pubkey,
+                        "context": {
+                            "onboarding": True,
+                            "new_member_alias": member_alias,
+                            "new_member_tier": tier,
+                            "suggested_amount_sats": 3000000,
+                            "reasoning": suggestion["reasoning"]
+                        }
+                    })
+                    suggestion["pending_action_created"] = True
+                except Exception as e:
+                    suggestion["pending_action_created"] = False
+                    suggestion["error"] = str(e)
+
+            suggestions_created.append(suggestion)
+
+        # 2. Suggest strategic targets for the new member
+        for corridor in valuable_corridors[:2]:
+            target_peer = corridor.get("target_peer") or corridor.get("destination_peer_id")
+            if not target_peer:
+                continue
+
+            score = corridor.get("value_score", 0)
+            if score < 0.3:
+                continue
+
+            suggestion = {
+                "type": "suggest_target_for_new_member",
+                "new_member_pubkey": member_pubkey[:16] + "...",
+                "new_member_alias": member_alias,
+                "suggested_target": target_peer[:16] + "...",
+                "corridor_value_score": score,
+                "reasoning": f"New member could strengthen fleet coverage of high-value corridor (score: {score:.2f})"
+            }
+            suggestions_created.append(suggestion)
+
+        # 3. Suggest exchange connections for the new member
+        for exchange in exchange_gaps[:1]:
+            exchange_pubkey = exchange.get("pubkey")
+            exchange_name = exchange.get("name", "Unknown Exchange")
+
+            if not exchange_pubkey:
+                continue
+
+            suggestion = {
+                "type": "suggest_exchange_for_new_member",
+                "new_member_pubkey": member_pubkey[:16] + "...",
+                "new_member_alias": member_alias,
+                "suggested_exchange": exchange_name,
+                "exchange_pubkey": exchange_pubkey[:16] + "...",
+                "reasoning": f"Fleet lacks connection to {exchange_name}. New member could fill this gap."
+            }
+            suggestions_created.append(suggestion)
+
+        # Mark as onboarded (unless dry run)
+        if not dry_run:
+            db.mark_member_onboarded(member_pubkey)
+
+    return {
+        "node": node_name,
+        "dry_run": dry_run,
+        "new_members_found": len(new_members_found),
+        "new_members": new_members_found,
+        "suggestions_created": len(suggestions_created),
+        "suggestions": suggestions_created,
+        "already_onboarded": len(already_onboarded),
+        "already_onboarded_members": already_onboarded,
+        "summary": f"Found {len(new_members_found)} new members, created {len(suggestions_created)} suggestions"
+                   + (" (dry run - no actions taken)" if dry_run else "")
+    }
 
 
 async def handle_propose_promotion(args: Dict) -> Dict:
