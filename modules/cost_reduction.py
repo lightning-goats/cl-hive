@@ -1630,18 +1630,20 @@ class CostReductionManager:
         Returns:
             Dict with route details and execution result (or preview if dry_run)
         """
-        if not self.rpc:
+        if not self.plugin or not self.plugin.rpc:
             return {"error": "RPC not available"}
+
+        rpc = self.plugin.rpc
 
         amount_msat = amount_sats * 1000
 
         try:
             # Get our own node info
-            info = self.rpc.getinfo()
+            info = rpc.getinfo()
             our_id = info['id']
 
             # Get channel info for from_channel and to_channel
-            channels = self.rpc.listpeerchannels()['channels']
+            channels = rpc.listpeerchannels()['channels']
 
             from_chan = None
             to_chan = None
@@ -1678,7 +1680,7 @@ class CostReductionManager:
 
                 # Get hive members
                 try:
-                    members_result = self.rpc.call("hive-members")
+                    members_result = rpc.call("hive-members")
                     members = members_result.get('members', [])
                 except Exception:
                     return {"error": "Failed to get hive members. Is cl-hive plugin loaded?"}
@@ -1732,7 +1734,7 @@ class CostReductionManager:
             # Get the channel between from_peer and to_peer
             try:
                 # Try to find channel via listchannels
-                listchannels = self.rpc.listchannels(source=from_peer)
+                listchannels = rpc.listchannels(source=from_peer)
                 intermediate_channel = None
                 for lc in listchannels.get('channels', []):
                     if lc.get('destination') == to_peer:
@@ -1800,7 +1802,7 @@ class CostReductionManager:
             # 1. Create invoice for ourselves
             import secrets
             label = f"hive-rebalance-{int(time.time())}-{secrets.token_hex(4)}"
-            invoice = self.rpc.invoice(
+            invoice = rpc.invoice(
                 amount_msat=amount_msat,
                 label=label,
                 description="Hive circular rebalance"
@@ -1813,7 +1815,7 @@ class CostReductionManager:
 
             # 2. Send via explicit route
             try:
-                sendpay_result = self.rpc.sendpay(
+                sendpay_result = rpc.sendpay(
                     route=route,
                     payment_hash=payment_hash,
                     payment_secret=payment_secret,
@@ -1822,7 +1824,7 @@ class CostReductionManager:
                 result["sendpay_result"] = sendpay_result
 
                 # 3. Wait for completion
-                waitsendpay_result = self.rpc.waitsendpay(
+                waitsendpay_result = rpc.waitsendpay(
                     payment_hash=payment_hash,
                     timeout=60
                 )
@@ -1837,7 +1839,7 @@ class CostReductionManager:
 
                 # Clean up the invoice
                 try:
-                    self.rpc.delinvoice(label=label, status="unpaid")
+                    rpc.delinvoice(label=label, status="unpaid")
                 except Exception:
                     pass
 
