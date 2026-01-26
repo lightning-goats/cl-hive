@@ -13,7 +13,7 @@ Design Pattern:
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -3046,3 +3046,160 @@ def positioning_status(ctx: HiveContext) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get positioning status: {e}"}
+
+
+# =============================================================================
+# NETWORK METRICS COMMANDS
+# =============================================================================
+
+def network_metrics(ctx: HiveContext, member_id: str = None) -> Dict[str, Any]:
+    """
+    Get network position metrics for hive members.
+
+    These metrics include centrality, unique peers, bridge score, hive centrality,
+    and rebalance hub scores. Used for fair share calculations and routing optimization.
+
+    Args:
+        ctx: HiveContext
+        member_id: Specific member pubkey (omit for all members)
+
+    Returns:
+        Dict with network metrics for the specified member(s).
+    """
+    from . import network_metrics as nm
+
+    calculator = nm.get_calculator()
+    if not calculator:
+        return {"error": "Network metrics calculator not initialized"}
+
+    try:
+        if member_id:
+            metrics = calculator.get_member_metrics(member_id)
+            if not metrics:
+                return {"error": f"No metrics available for member {member_id[:16]}..."}
+            return {"metrics": metrics.to_dict()}
+        else:
+            all_metrics = calculator.get_all_metrics()
+            members = [m.to_dict() for m in all_metrics.values()]
+            # Sort by rebalance hub score for consistency
+            members.sort(key=lambda x: x.get("rebalance_hub_score", 0), reverse=True)
+            return {
+                "member_count": len(members),
+                "members": members
+            }
+
+    except Exception as e:
+        return {"error": f"Failed to get network metrics: {e}"}
+
+
+def rebalance_hubs(
+    ctx: HiveContext,
+    top_n: int = 3,
+    exclude_members: List[str] = None
+) -> Dict[str, Any]:
+    """
+    Get the best zero-fee rebalance intermediaries in the hive.
+
+    Nodes with high hive centrality make good rebalance hubs because they
+    have channels to many other hive members. Routing rebalances through
+    these nodes is free (0 ppm fees within hive).
+
+    Args:
+        ctx: HiveContext
+        top_n: Number of top hubs to return (default: 3)
+        exclude_members: Member IDs to exclude (e.g., source/dest of rebalance)
+
+    Returns:
+        Dict with ranked list of best rebalance hubs.
+    """
+    from . import network_metrics as nm
+
+    calculator = nm.get_calculator()
+    if not calculator:
+        return {"error": "Network metrics calculator not initialized"}
+
+    try:
+        hubs = calculator.get_rebalance_hubs(top_n=top_n, exclude_members=exclude_members)
+        hub_list = []
+        for hub in hubs:
+            hub_dict = hub.to_dict()
+            # Get alias if available from state manager
+            if ctx.state_manager:
+                state = ctx.state_manager.get_peer_state(hub.member_id)
+                if state and hasattr(state, 'alias') and state.alias:
+                    hub_dict['alias'] = state.alias
+            hub_list.append(hub_dict)
+
+        return {
+            "count": len(hub_list),
+            "hubs": hub_list
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get rebalance hubs: {e}"}
+
+
+def rebalance_path(
+    ctx: HiveContext,
+    source_member: str,
+    dest_member: str,
+    max_hops: int = 2
+) -> Dict[str, Any]:
+    """
+    Find the optimal zero-fee path for internal hive rebalancing.
+
+    Finds a path through the hive's internal network from source to destination.
+    All channels between hive members have 0 ppm fees, so internal rebalancing
+    through these paths is free.
+
+    Args:
+        ctx: HiveContext
+        source_member: Source member pubkey
+        dest_member: Destination member pubkey
+        max_hops: Maximum number of hops (default: 2)
+
+    Returns:
+        Dict with path information including intermediaries.
+    """
+    from . import network_metrics as nm
+
+    calculator = nm.get_calculator()
+    if not calculator:
+        return {"error": "Network metrics calculator not initialized"}
+
+    try:
+        path = calculator.find_best_rebalance_path(
+            source_member=source_member,
+            dest_member=dest_member,
+            max_hops=max_hops
+        )
+
+        if not path:
+            return {
+                "path_found": False,
+                "path": [],
+                "hop_count": 0,
+                "note": f"No path within {max_hops} hops between these members"
+            }
+
+        # Enrich path with aliases
+        enriched_path = []
+        for peer_id in path:
+            node_info = {"peer_id": peer_id}
+            if ctx.state_manager:
+                state = ctx.state_manager.get_peer_state(peer_id)
+                if state and hasattr(state, 'alias') and state.alias:
+                    node_info['alias'] = state.alias
+            enriched_path.append(node_info)
+
+        return {
+            "path_found": True,
+            "path": enriched_path,
+            "hop_count": len(path) - 1,
+            "source": enriched_path[0] if enriched_path else None,
+            "destination": enriched_path[-1] if enriched_path else None,
+            "intermediaries": enriched_path[1:-1] if len(enriched_path) > 2 else []
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to find rebalance path: {e}"}

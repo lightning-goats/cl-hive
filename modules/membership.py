@@ -9,6 +9,8 @@ import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from . import network_metrics
+
 
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
 BAN_QUORUM_THRESHOLD = 0.51  # 51% quorum for ban proposals
@@ -31,13 +33,15 @@ class MembershipTier(str, Enum):
 class MembershipManager:
     """Membership logic and promotion evaluation."""
 
-    def __init__(self, db, state_manager, contribution_mgr, bridge, config, plugin=None):
+    def __init__(self, db, state_manager, contribution_mgr, bridge, config, plugin=None,
+                 metrics_calculator=None):
         self.db = db
         self.state_manager = state_manager
         self.contribution_mgr = contribution_mgr
         self.bridge = bridge
         self.config = config
         self.plugin = plugin
+        self.metrics_calculator = metrics_calculator
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -147,6 +151,22 @@ class MembershipManager:
         return forwarded / received
 
     def get_unique_peers(self, peer_id: str) -> List[str]:
+        """
+        Get external peers that only this member connects to.
+
+        Uses shared NetworkMetricsCalculator if available for cached,
+        consistent results across all modules.
+        """
+        # Try shared calculator first (preferred)
+        calculator = self.metrics_calculator or network_metrics.get_calculator()
+        if calculator:
+            return calculator.get_unique_peers(peer_id)
+
+        # Fallback: local calculation
+        return self._calculate_unique_peers_local(peer_id)
+
+    def _calculate_unique_peers_local(self, peer_id: str) -> List[str]:
+        """Local fallback for unique peers calculation."""
         peer_state = self.state_manager.get_peer_state(peer_id)
         if not peer_state:
             return []

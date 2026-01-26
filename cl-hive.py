@@ -94,6 +94,7 @@ from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
 from modules.task_manager import TaskManager
 from modules.splice_manager import SpliceManager
 from modules.relay import RelayManager
+from modules import network_metrics
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -159,6 +160,10 @@ from modules.rpc_commands import (
     report_flow_intensity as rpc_report_flow_intensity,
     positioning_summary as rpc_positioning_summary,
     positioning_status as rpc_positioning_status,
+    # Network Metrics
+    network_metrics as rpc_network_metrics,
+    rebalance_hubs as rpc_rebalance_hubs,
+    rebalance_path as rpc_rebalance_path,
 )
 
 # Initialize the plugin
@@ -1313,6 +1318,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     routing_pool.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Routing pool initialized (collective economics)")
+
+    # Initialize Network Metrics Calculator (shared module)
+    network_metrics.init_calculator(
+        state_manager=state_manager,
+        database=database,
+        plugin=safe_plugin
+    )
+    plugin.log("cl-hive: Network metrics calculator initialized")
 
     # Initialize Settlement Manager (BOLT12 revenue distribution)
     global settlement_mgr
@@ -12473,6 +12486,78 @@ def hive_pool_record_revenue(plugin: Plugin, amount_sats: int,
         amount_sats=amount_sats,
         channel_id=channel_id,
         payment_hash=payment_hash
+    )
+
+
+# =============================================================================
+# NETWORK METRICS COMMANDS
+# =============================================================================
+
+@plugin.method("hive-network-metrics")
+def hive_network_metrics(plugin: Plugin, member_id: str = None):
+    """
+    Get network position metrics for hive members.
+
+    Returns centrality, unique peers, bridge scores, hive centrality, and
+    rebalance hub scores. These metrics are used for fair share calculations
+    and routing optimization.
+
+    Args:
+        member_id: Specific member pubkey (omit for all members)
+
+    Returns:
+        Dict with network metrics for the specified member(s).
+    """
+    return rpc_network_metrics(_get_hive_context(), member_id=member_id)
+
+
+@plugin.method("hive-rebalance-hubs")
+def hive_rebalance_hubs(plugin: Plugin, top_n: int = 3, exclude_members: str = None):
+    """
+    Get the best zero-fee rebalance intermediaries in the hive.
+
+    Nodes with high hive centrality make good rebalance hubs because they
+    have channels to many other hive members. Routing rebalances through
+    these nodes is free (0 ppm fees within hive).
+
+    Args:
+        top_n: Number of top hubs to return (default: 3)
+        exclude_members: Comma-separated member IDs to exclude
+
+    Returns:
+        Dict with ranked list of best rebalance hubs.
+    """
+    exclude_list = exclude_members.split(",") if exclude_members else None
+    return rpc_rebalance_hubs(
+        _get_hive_context(),
+        top_n=top_n,
+        exclude_members=exclude_list
+    )
+
+
+@plugin.method("hive-rebalance-path")
+def hive_rebalance_path(plugin: Plugin, source_member: str, dest_member: str,
+                        max_hops: int = 2):
+    """
+    Find the optimal zero-fee path for internal hive rebalancing.
+
+    Finds a path through the hive's internal network from source to destination.
+    All channels between hive members have 0 ppm fees, so internal rebalancing
+    through these paths is free.
+
+    Args:
+        source_member: Source member pubkey
+        dest_member: Destination member pubkey
+        max_hops: Maximum number of hops (default: 2)
+
+    Returns:
+        Dict with path information including intermediaries.
+    """
+    return rpc_rebalance_path(
+        _get_hive_context(),
+        source_member=source_member,
+        dest_member=dest_member,
+        max_hops=max_hops
     )
 
 

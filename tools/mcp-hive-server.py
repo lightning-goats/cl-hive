@@ -2738,6 +2738,117 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node"]
             }
+        ),
+        Tool(
+            name="hive_network_metrics",
+            description="""Get network position metrics for hive members.
+
+**Metrics provided:**
+- **external_centrality**: Betweenness centrality approximation (routing importance)
+- **unique_peers**: External peers only this member connects to
+- **bridge_score**: Ratio indicating bridge function (0-1, higher = connects more unique peers)
+- **hive_centrality**: Internal fleet connectivity (0-1, higher = more fleet connections)
+- **hive_reachability**: Fraction of fleet reachable in 1-2 hops
+- **rebalance_hub_score**: Suitability as internal rebalance intermediary
+
+**Use cases:**
+- Pool share calculation (position contributes 20% of share)
+- Identifying best rebalance hub nodes
+- Promotion eligibility evaluation
+- Strategic channel planning""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query from"
+                    },
+                    "member_id": {
+                        "type": "string",
+                        "description": "Specific member pubkey (optional, omit for all members)"
+                    },
+                    "force_refresh": {
+                        "type": "boolean",
+                        "description": "Bypass cache and recalculate (default: false)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_rebalance_hubs",
+            description="""Get best members to use as zero-fee rebalance intermediaries.
+
+High hive_centrality nodes make excellent rebalance hubs because:
+- They have direct connections to many fleet members
+- They can route rebalances between otherwise disconnected members
+- Zero-fee hive channels make them cost-effective paths
+
+**Returns** top N members ranked by rebalance_hub_score with:
+- Hub score and hive centrality
+- Number of fleet connections
+- Fleet reachability percentage
+- Rationale for recommendation
+- Suggested use (zero_fee_intermediary or backup_path)
+
+**Use for:**
+- Planning internal fleet rebalances
+- Identifying which members should maintain high liquidity
+- Optimizing rebalance routing paths""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query from"
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of top hubs to return (default: 3)"
+                    },
+                    "exclude_members": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Member pubkeys to exclude (e.g., rebalance source/dest)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_rebalance_path",
+            description="""Find optimal path for internal hive rebalance between two members.
+
+For zero-fee hive rebalances, finds the best route through high-centrality
+intermediary nodes when direct path isn't available.
+
+**Returns:**
+- Path as list of member pubkeys (source -> intermediaries -> dest)
+- Or null if no path found within max_hops
+
+**Use before** executing internal rebalances to find cheapest route.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query from"
+                    },
+                    "source_member": {
+                        "type": "string",
+                        "description": "Starting member pubkey"
+                    },
+                    "dest_member": {
+                        "type": "string",
+                        "description": "Destination member pubkey"
+                    },
+                    "max_hops": {
+                        "type": "integer",
+                        "description": "Maximum intermediaries (default: 2)"
+                    }
+                },
+                "required": ["node", "source_member", "dest_member"]
+            }
         )
     ]
 
@@ -3001,6 +3112,13 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_distributed_settlement_proposals(arguments)
         elif name == "distributed_settlement_participation":
             result = await handle_distributed_settlement_participation(arguments)
+        # Network Metrics
+        elif name == "hive_network_metrics":
+            result = await handle_network_metrics(arguments)
+        elif name == "hive_rebalance_hubs":
+            result = await handle_rebalance_hubs(arguments)
+        elif name == "hive_rebalance_path":
+            result = await handle_rebalance_path(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -6897,6 +7015,155 @@ async def handle_distributed_settlement_participation(args: Dict) -> Dict:
         "Low vote/execution rates combined with owing money indicates gaming behavior. "
         "Consider proposing ban for HIGH risk members."
     )
+
+    return result
+
+
+# =============================================================================
+# Network Metrics Handlers
+# =============================================================================
+
+async def handle_network_metrics(args: Dict) -> Dict:
+    """Get network position metrics for hive members."""
+    node_name = args.get("node")
+    member_id = args.get("member_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        params = {}
+        if member_id:
+            params["member_id"] = member_id
+
+        result = await node.call("hive-network-metrics", params)
+    except Exception as e:
+        return {"error": f"Failed to get network metrics: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    if member_id:
+        metrics = result.get("metrics", {})
+        hive_centrality = metrics.get("hive_centrality", 0)
+        rebalance_hub_score = metrics.get("rebalance_hub_score", 0)
+
+        if rebalance_hub_score > 0.7:
+            hub_note = "Excellent rebalance hub - ideal for zero-fee internal routing."
+        elif rebalance_hub_score > 0.4:
+            hub_note = "Good rebalance hub - useful for internal routing."
+        else:
+            hub_note = "Limited as rebalance hub - fewer internal connections."
+
+        result["ai_note"] = (
+            f"Member hive centrality: {hive_centrality:.1%}, "
+            f"rebalance hub score: {rebalance_hub_score:.2f}. "
+            f"{hub_note}"
+        )
+    else:
+        members = result.get("members", [])
+        top_hubs = sorted(members, key=lambda m: m.get("rebalance_hub_score", 0), reverse=True)[:3]
+        hub_names = [m.get("alias", m.get("member_id", "")[:16]) for m in top_hubs]
+        result["ai_note"] = (
+            f"Analyzed {len(members)} member(s). "
+            f"Top rebalance hubs: {', '.join(hub_names)}. "
+            "Use hive_rebalance_hubs for detailed routing recommendations."
+        )
+
+    return result
+
+
+async def handle_rebalance_hubs(args: Dict) -> Dict:
+    """Get the best zero-fee rebalance intermediaries in the hive."""
+    node_name = args.get("node")
+    top_n = args.get("top_n", 3)
+    exclude = args.get("exclude_members")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        params = {"top_n": top_n}
+        if exclude:
+            params["exclude_members"] = exclude
+
+        result = await node.call("hive-rebalance-hubs", params)
+    except Exception as e:
+        return {"error": f"Failed to get rebalance hubs: {e}"}
+
+    if "error" in result:
+        return result
+
+    hubs = result.get("hubs", [])
+    if hubs:
+        best_hub = hubs[0]
+        result["ai_note"] = (
+            f"Found {len(hubs)} suitable rebalance hub(s). "
+            f"Best hub: {best_hub.get('alias', best_hub.get('member_id', '')[:16])} "
+            f"with {best_hub.get('hive_peer_count', 0)} hive connections and "
+            f"score {best_hub.get('rebalance_hub_score', 0):.2f}. "
+            "Route internal rebalances through these nodes for zero-fee liquidity shifts."
+        )
+    else:
+        result["ai_note"] = (
+            "No suitable rebalance hubs found. "
+            "Fleet may need more internal channel connections."
+        )
+
+    return result
+
+
+async def handle_rebalance_path(args: Dict) -> Dict:
+    """Find the optimal zero-fee path for internal rebalancing."""
+    node_name = args.get("node")
+    source = args.get("source_member")
+    dest = args.get("dest_member")
+    max_hops = args.get("max_hops", 2)
+
+    if not source or not dest:
+        return {"error": "source_member and dest_member are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-rebalance-path", {
+            "source_member": source,
+            "dest_member": dest,
+            "max_hops": max_hops
+        })
+    except Exception as e:
+        return {"error": f"Failed to find rebalance path: {e}"}
+
+    if "error" in result:
+        return result
+
+    path = result.get("path", [])
+    if path:
+        hop_count = len(path) - 1
+        via_hubs = path[1:-1] if len(path) > 2 else []
+        if via_hubs:
+            hub_names = [h.get("alias", h.get("peer_id", "")[:16]) for h in via_hubs]
+            result["ai_note"] = (
+                f"Found {hop_count}-hop zero-fee path via {', '.join(hub_names)}. "
+                "All channels between hive members have 0 ppm fees. "
+                "Rebalancing through this path costs nothing in routing fees."
+            )
+        else:
+            result["ai_note"] = (
+                "Direct channel exists between source and destination. "
+                "No intermediaries needed - direct zero-fee rebalance possible."
+            )
+    else:
+        result["ai_note"] = (
+            f"No path found within {max_hops} hops. "
+            "Members may not be connected through the internal hive network. "
+            "Consider opening channels between these members or through shared hubs."
+        )
 
     return result
 

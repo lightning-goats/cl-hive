@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
+from . import network_metrics
+
 
 # =============================================================================
 # CONSTANTS
@@ -121,7 +123,8 @@ class RoutingPool:
         database,
         plugin,
         state_manager=None,
-        health_aggregator=None
+        health_aggregator=None,
+        metrics_calculator=None
     ):
         """
         Initialize the routing pool.
@@ -131,11 +134,13 @@ class RoutingPool:
             plugin: Plugin instance for RPC/logging
             state_manager: StateManager for member state (optional)
             health_aggregator: HealthScoreAggregator for health data (optional)
+            metrics_calculator: NetworkMetricsCalculator for position metrics (optional)
         """
         self.db = database
         self.plugin = plugin
         self.state_manager = state_manager
         self.health_aggregator = health_aggregator
+        self.metrics_calculator = metrics_calculator
 
         # Our pubkey (set later)
         self.our_pubkey: Optional[str] = None
@@ -638,14 +643,32 @@ class RoutingPool:
         """
         Get position metrics for a member.
 
-        Calculates:
-        - centrality: Approximated betweenness centrality based on topology size
-                     and connectivity relative to fleet average
-        - unique_peers: Number of external peers only this member connects to
-        - bridge_score: Ratio of unique peers to total peers (bridge function)
+        Uses the shared NetworkMetricsCalculator if available for cached,
+        fleet-wide consistent calculations. Falls back to local calculation
+        if calculator not initialized.
 
         Returns:
             (centrality, unique_peers, bridge_score)
+        """
+        # Try shared calculator first (preferred - cached and consistent)
+        calculator = self.metrics_calculator or network_metrics.get_calculator()
+        if calculator:
+            metrics = calculator.get_member_metrics(member_id)
+            if metrics:
+                return (
+                    metrics.external_centrality,
+                    metrics.unique_peers,
+                    metrics.bridge_score
+                )
+
+        # Fallback: local calculation if calculator unavailable
+        return self._calculate_position_metrics_local(member_id)
+
+    def _calculate_position_metrics_local(self, member_id: str) -> Tuple[float, int, float]:
+        """
+        Local fallback calculation for position metrics.
+
+        Used when NetworkMetricsCalculator is not available.
         """
         centrality = 0.01  # Default low centrality
         unique_peers = 0
@@ -666,7 +689,6 @@ class RoutingPool:
         # Collect all other members' topologies to find unique peers
         all_members = self.db.get_all_members() if self.db else []
         other_members_peers = set()
-        total_fleet_peers = set()
         topology_sizes = []
 
         for member in all_members:
@@ -679,7 +701,6 @@ class RoutingPool:
                 continue
 
             other_topology = set(getattr(other_state, 'topology', []) or [])
-            total_fleet_peers.update(other_topology)
             topology_sizes.append(len(other_topology))
 
             if other_id != member_id:
@@ -690,22 +711,15 @@ class RoutingPool:
         unique_peers = len(unique_peer_set)
 
         # Calculate bridge score (ratio of unique to total connections)
-        # Higher = more "bridge-like" - connecting otherwise disconnected parts
         if len(member_topology) > 0:
             bridge_score = min(1.0, unique_peers / len(member_topology))
 
-        # Approximate betweenness centrality:
-        # - Based on topology size relative to fleet average
-        # - Members with more connections are likely more central
-        # - Weighted by unique peer contribution (bridges have higher centrality)
+        # Approximate betweenness centrality
         if topology_sizes:
             avg_topology_size = sum(topology_sizes) / len(topology_sizes)
             if avg_topology_size > 0:
-                # Base centrality from relative connectivity
                 relative_connectivity = len(member_topology) / avg_topology_size
-                # Boost for unique peer connections (bridge function)
                 bridge_boost = 1.0 + (bridge_score * 0.5)
-                # Normalize to typical centrality range (0.001 - 0.1)
                 centrality = min(MAX_CENTRALITY, 0.01 * relative_connectivity * bridge_boost)
 
         return (centrality, unique_peers, bridge_score)
