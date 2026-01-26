@@ -3082,6 +3082,63 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
     return sent_count
 
 
+def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
+    """
+    Broadcast a promotion vote as a VOUCH message for cross-node sync.
+
+    This enables the manual promotion system to sync votes across nodes
+    by reusing the existing VOUCH message infrastructure.
+
+    Args:
+        target_peer_id: The neophyte being voted for
+        voter_peer_id: The member casting the vote
+
+    Returns:
+        True if broadcast was successful
+    """
+    if not membership_mgr or not safe_plugin or not database:
+        return False
+
+    # Use a deterministic request_id so all nodes reference the same promotion
+    request_id = f"manual_{target_peer_id[:32]}"
+
+    # Create and sign the vouch
+    vouch_ts = int(time.time())
+    canonical = membership_mgr.build_vouch_message(target_peer_id, request_id, vouch_ts)
+
+    try:
+        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+    except Exception as e:
+        safe_plugin.log(f"Failed to sign promotion vote: {e}", level='warn')
+        return False
+
+    # Store locally in vouch table (so it's counted for regular promotion flow)
+    database.add_promotion_vouch(target_peer_id, request_id, voter_peer_id, sig, vouch_ts)
+
+    # Also ensure promotion request exists
+    requests = database.get_promotion_requests(target_peer_id)
+    has_request = any(r.get("request_id") == request_id for r in requests)
+    if not has_request:
+        database.add_promotion_request(target_peer_id, request_id, status="pending")
+
+    # Broadcast VOUCH message
+    vouch_payload = {
+        "target_pubkey": target_peer_id,
+        "request_id": request_id,
+        "timestamp": vouch_ts,
+        "voucher_pubkey": voter_peer_id,
+        "sig": sig
+    }
+    vouch_msg = serialize(HiveMessageType.VOUCH, vouch_payload)
+    sent = _broadcast_to_members(vouch_msg)
+
+    safe_plugin.log(
+        f"Broadcast promotion vote for {target_peer_id[:16]}... to {sent} members",
+        level='debug'
+    )
+    return sent > 0
+
+
 def _is_relayed_message(payload: Dict[str, Any]) -> bool:
     """Check if message was relayed (not direct from origin)."""
     relay_data = payload.get("_relay", {})
@@ -8766,7 +8823,13 @@ def hive_propose_promotion(plugin: Plugin, target_peer_id: str,
     Permission: Member only
     """
     from modules.rpc_commands import propose_promotion
-    return propose_promotion(_get_hive_context(), target_peer_id, proposer_peer_id)
+    result = propose_promotion(_get_hive_context(), target_peer_id, proposer_peer_id)
+
+    # Broadcast vote as VOUCH for cross-node sync
+    if result.get("success") and membership_mgr and our_pubkey:
+        _broadcast_promotion_vote(target_peer_id, proposer_peer_id or our_pubkey)
+
+    return result
 
 
 @plugin.method("hive-vote-promotion")
@@ -8782,7 +8845,13 @@ def hive_vote_promotion(plugin: Plugin, target_peer_id: str,
     Permission: Member only
     """
     from modules.rpc_commands import vote_promotion
-    return vote_promotion(_get_hive_context(), target_peer_id, voter_peer_id)
+    result = vote_promotion(_get_hive_context(), target_peer_id, voter_peer_id)
+
+    # Broadcast vote as VOUCH for cross-node sync
+    if result.get("success") and membership_mgr and our_pubkey:
+        _broadcast_promotion_vote(target_peer_id, voter_peer_id or our_pubkey)
+
+    return result
 
 
 @plugin.method("hive-pending-promotions")
@@ -8812,6 +8881,57 @@ def hive_execute_promotion(plugin: Plugin, target_peer_id: str):
     """
     from modules.rpc_commands import execute_promotion
     return execute_promotion(_get_hive_context(), target_peer_id)
+
+
+@plugin.method("hive-sync-promotion")
+def hive_sync_promotion(plugin: Plugin, target_peer_id: str):
+    """
+    Sync promotion votes for a neophyte to other nodes.
+
+    Broadcasts all local votes for this neophyte as VOUCH messages,
+    enabling nodes that missed earlier votes to catch up.
+
+    Args:
+        target_peer_id: The neophyte whose promotion to sync
+
+    Returns:
+        Dict with sync status and vote count.
+
+    Permission: Member only
+    """
+    if not config or not config.membership_enabled:
+        return {"error": "membership_disabled"}
+    if not membership_mgr or not our_pubkey or not database:
+        return {"error": "membership_unavailable"}
+
+    # Check our tier
+    our_tier = membership_mgr.get_tier(our_pubkey)
+    if our_tier not in (MembershipTier.MEMBER.value,):
+        return {"error": "permission_denied", "required_tier": "member"}
+
+    # Check target exists
+    target = database.get_member(target_peer_id)
+    if not target:
+        return {"error": "peer_not_found", "peer_id": target_peer_id}
+
+    # Broadcast our vote for this target
+    success = _broadcast_promotion_vote(target_peer_id, our_pubkey)
+
+    # Get current vouch count
+    request_id = f"manual_{target_peer_id[:32]}"
+    vouches = database.get_promotion_vouches(target_peer_id, request_id)
+    active_members = membership_mgr.get_active_members()
+    quorum = membership_mgr.calculate_quorum(len(active_members))
+
+    return {
+        "success": success,
+        "target_peer_id": target_peer_id,
+        "request_id": request_id,
+        "vouches_broadcast": 1 if success else 0,
+        "total_local_vouches": len(vouches),
+        "quorum_required": quorum,
+        "quorum_reached": len(vouches) >= quorum
+    }
 
 
 @plugin.method("hive-topology")
