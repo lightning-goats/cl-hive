@@ -1163,6 +1163,44 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sync uptime: {e}", level="warn")
 
+    # HIVE_SAFETY: Scan existing channels to hive members and enforce 0 fee
+    # This catches cases where fees were set before joining the hive or by external tools
+    try:
+        hive_members = {m["peer_id"] for m in database.get_all_members()}
+        if hive_members:
+            channels = safe_plugin.rpc.listpeerchannels()
+            fixed_count = 0
+            for peer in channels.get("channels", []):
+                peer_id = peer.get("peer_id")
+                if peer_id not in hive_members:
+                    continue
+                # Check if this is our channel (we set fees on our end)
+                fee_base = peer.get("fee_base_msat", 0)
+                fee_ppm = peer.get("fee_proportional_millionths", 0)
+                channel_id = peer.get("short_channel_id")
+                if channel_id and (fee_base > 0 or fee_ppm > 0):
+                    try:
+                        safe_plugin.rpc.setchannel(
+                            id=channel_id,
+                            feebase=0,
+                            feeppm=0
+                        )
+                        fixed_count += 1
+                        plugin.log(
+                            f"cl-hive: HIVE_SAFETY: Fixed non-zero fee on channel {channel_id} to member {peer_id[:16]}... "
+                            f"(was {fee_base}msat base, {fee_ppm}ppm)",
+                            level='info'
+                        )
+                    except Exception as e:
+                        plugin.log(
+                            f"cl-hive: HIVE_SAFETY: Failed to fix fee on {channel_id}: {e}",
+                            level='warn'
+                        )
+            if fixed_count > 0:
+                plugin.log(f"cl-hive: HIVE_SAFETY: Fixed fees on {fixed_count} hive member channel(s)")
+    except Exception as e:
+        plugin.log(f"cl-hive: HIVE_SAFETY startup scan failed: {e}", level="warn")
+
     # Initialize DecisionEngine (Phase 7)
     global decision_engine
     decision_engine = DecisionEngine(database=database, plugin=safe_plugin)
@@ -9552,6 +9590,27 @@ def hive_channel_opened(plugin: Plugin, peer_id: str, channel_id: str,
     # Check if peer is a hive member (internal channel)
     member = database.get_member(peer_id)
     is_hive_internal = member is not None and not database.is_banned(peer_id)
+
+    # HIVE SAFETY: Immediately set 0 fee for hive member channels
+    if is_hive_internal and safe_plugin:
+        try:
+            # Set both base fee and ppm to 0 for hive internal channels
+            safe_plugin.rpc.setchannel(
+                id=channel_id,
+                feebase=0,
+                feeppm=0
+            )
+            plugin.log(
+                f"cl-hive: HIVE_SAFETY: Set 0 fee on channel {channel_id} to fleet member {peer_id[:16]}...",
+                level='info'
+            )
+            result["fee_action"] = "set_zero_fee"
+        except Exception as e:
+            plugin.log(
+                f"cl-hive: Warning: Failed to set 0 fee on hive channel {channel_id}: {e}",
+                level='warn'
+            )
+            result["fee_action"] = f"failed: {e}"
 
     # Broadcast to all hive members
     broadcast_count = broadcast_peer_available(
