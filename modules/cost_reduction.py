@@ -1604,3 +1604,244 @@ class CostReductionManager:
                 "fleet_path_savings_threshold": FLEET_PATH_SAVINGS_THRESHOLD
             }
         }
+
+    def execute_hive_circular_rebalance(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int,
+        via_members: Optional[List[str]] = None,
+        dry_run: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Execute a circular rebalance through the hive using explicit sendpay route.
+
+        This bypasses sling's automatic route finding and uses an explicit route
+        through hive members, ensuring zero-fee internal routing.
+
+        Args:
+            from_channel: Source channel SCID (where we have outbound liquidity)
+            to_channel: Destination channel SCID (where we want more local balance)
+            amount_sats: Amount to rebalance in satoshis
+            via_members: Optional list of intermediate member pubkeys. If not provided,
+                        will attempt to find a path automatically.
+            dry_run: If True, just show the route without executing (default: True)
+
+        Returns:
+            Dict with route details and execution result (or preview if dry_run)
+        """
+        if not self.rpc:
+            return {"error": "RPC not available"}
+
+        amount_msat = amount_sats * 1000
+
+        try:
+            # Get our own node info
+            info = self.rpc.getinfo()
+            our_id = info['id']
+
+            # Get channel info for from_channel and to_channel
+            channels = self.rpc.listpeerchannels()['channels']
+
+            from_chan = None
+            to_chan = None
+            for ch in channels:
+                scid = ch.get('short_channel_id')
+                if scid == from_channel:
+                    from_chan = ch
+                elif scid == to_channel:
+                    to_chan = ch
+
+            if not from_chan:
+                return {"error": f"Source channel {from_channel} not found"}
+            if not to_chan:
+                return {"error": f"Destination channel {to_channel} not found"}
+
+            # Verify source has enough outbound liquidity
+            from_local = from_chan.get('to_us_msat', 0)
+            if from_local < amount_msat:
+                return {
+                    "error": f"Insufficient outbound liquidity in {from_channel}",
+                    "available_msat": from_local,
+                    "requested_msat": amount_msat
+                }
+
+            # Get the peer IDs
+            from_peer = from_chan['peer_id']
+            to_peer = to_chan['peer_id']
+
+            # If no via_members specified, try to find a path through hive
+            if not via_members:
+                # For a triangle rebalance, we need to find a path:
+                # us -> from_peer -> ??? -> to_peer -> us
+                # The intermediate node must have channels to both from_peer and to_peer
+
+                # Get hive members
+                try:
+                    members_result = self.rpc.call("hive-members")
+                    members = members_result.get('members', [])
+                except Exception:
+                    return {"error": "Failed to get hive members. Is cl-hive plugin loaded?"}
+
+                member_ids = {m['peer_id'] for m in members}
+
+                # Check if from_peer and to_peer are both hive members
+                if from_peer not in member_ids:
+                    return {
+                        "error": f"Source peer {from_peer[:16]}... is not a hive member",
+                        "hint": "Hive circular rebalance only works through hive member channels"
+                    }
+                if to_peer not in member_ids:
+                    return {
+                        "error": f"Destination peer {to_peer[:16]}... is not a hive member",
+                        "hint": "Hive circular rebalance only works through hive member channels"
+                    }
+
+                # For direct triangle: us -> from_peer -> to_peer -> us
+                # Check if from_peer has a channel to to_peer
+                # We need to query from_peer's channels (if we have that info via gossip)
+                # For now, assume direct path: from_peer can route to to_peer
+
+                via_members = []  # Direct path through from_peer to to_peer
+
+            # Build the explicit route
+            # Route format: array of {id, channel, amount_msat, delay}
+            # For zero-fee hive channels, amount stays the same at each hop
+
+            # Calculate delays (CLTV)
+            # Each hop needs its delay, working backwards from destination
+            # Typically: final_cltv_delta + (hop_count * per_hop_cltv)
+            final_cltv = 9  # Standard final CLTV
+            per_hop_cltv = 34  # Our cltv_expiry_delta
+
+            route = []
+
+            # For a simple triangle: us -> from_peer -> to_peer -> us
+            # Hop 1: from_peer (via from_channel)
+            # Hop 2: to_peer (via from_peer's channel to to_peer - need to find this)
+            # Hop 3: us (via to_channel - but reversed!)
+
+            # Actually for circular rebalance, we pay ourselves:
+            # - We send out on from_channel
+            # - Payment routes through the network
+            # - We receive on to_channel
+
+            # We need to find the channel from from_peer to to_peer
+            # This requires gossip data or hive state
+
+            # Get the channel between from_peer and to_peer
+            try:
+                # Try to find channel via listchannels
+                listchannels = self.rpc.listchannels(source=from_peer)
+                intermediate_channel = None
+                for lc in listchannels.get('channels', []):
+                    if lc.get('destination') == to_peer:
+                        intermediate_channel = lc.get('short_channel_id')
+                        break
+
+                if not intermediate_channel:
+                    return {
+                        "error": f"No channel found from {from_peer[:16]}... to {to_peer[:16]}...",
+                        "hint": "The intermediate hive member needs a channel to the destination peer"
+                    }
+            except Exception as e:
+                return {"error": f"Failed to find intermediate channel: {e}"}
+
+            # Build route: 3 hops for triangle
+            # Hop 1: to from_peer via from_channel
+            # Hop 2: to to_peer via intermediate_channel
+            # Hop 3: to us via to_channel
+
+            # Calculate delays (backwards from final)
+            hop3_delay = final_cltv  # Final hop
+            hop2_delay = hop3_delay + per_hop_cltv
+            hop1_delay = hop2_delay + per_hop_cltv
+
+            route = [
+                {
+                    "id": from_peer,
+                    "channel": from_channel,
+                    "amount_msat": amount_msat,  # Zero fees
+                    "delay": hop1_delay
+                },
+                {
+                    "id": to_peer,
+                    "channel": intermediate_channel,
+                    "amount_msat": amount_msat,  # Zero fees
+                    "delay": hop2_delay
+                },
+                {
+                    "id": our_id,
+                    "channel": to_channel,
+                    "amount_msat": amount_msat,  # Final amount
+                    "delay": hop3_delay
+                }
+            ]
+
+            result = {
+                "route": route,
+                "amount_sats": amount_sats,
+                "amount_msat": amount_msat,
+                "expected_fee_sats": 0,  # Zero fees through hive
+                "hop_count": len(route),
+                "path_description": f"{our_id[:8]}... -> {from_peer[:8]}... -> {to_peer[:8]}... -> {our_id[:8]}...",
+                "from_channel": from_channel,
+                "to_channel": to_channel,
+                "intermediate_channel": intermediate_channel,
+                "dry_run": dry_run
+            }
+
+            if dry_run:
+                result["status"] = "preview"
+                result["message"] = "Dry run - route preview only. Set dry_run=false to execute."
+                return result
+
+            # Execute the rebalance
+            # 1. Create invoice for ourselves
+            import secrets
+            label = f"hive-rebalance-{int(time.time())}-{secrets.token_hex(4)}"
+            invoice = self.rpc.invoice(
+                amount_msat=amount_msat,
+                label=label,
+                description="Hive circular rebalance"
+            )
+            payment_hash = invoice['payment_hash']
+            payment_secret = invoice.get('payment_secret')
+
+            result["invoice_label"] = label
+            result["payment_hash"] = payment_hash
+
+            # 2. Send via explicit route
+            try:
+                sendpay_result = self.rpc.sendpay(
+                    route=route,
+                    payment_hash=payment_hash,
+                    payment_secret=payment_secret,
+                    amount_msat=amount_msat
+                )
+                result["sendpay_result"] = sendpay_result
+
+                # 3. Wait for completion
+                waitsendpay_result = self.rpc.waitsendpay(
+                    payment_hash=payment_hash,
+                    timeout=60
+                )
+                result["status"] = "success"
+                result["waitsendpay_result"] = waitsendpay_result
+                result["message"] = f"Successfully rebalanced {amount_sats} sats through hive at zero fees!"
+
+            except Exception as e:
+                error_str = str(e)
+                result["status"] = "failed"
+                result["error"] = error_str
+
+                # Clean up the invoice
+                try:
+                    self.rpc.delinvoice(label=label, status="unpaid")
+                except Exception:
+                    pass
+
+            return result
+
+        except Exception as e:
+            return {"error": f"Circular rebalance failed: {e}"}

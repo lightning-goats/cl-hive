@@ -2651,6 +2651,47 @@ def cost_reduction_status(ctx: HiveContext) -> Dict[str, Any]:
         return {"error": f"Failed to get cost reduction status: {e}"}
 
 
+def execute_hive_circular_rebalance(
+    ctx: HiveContext,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int,
+    via_members: list = None,
+    dry_run: bool = True
+) -> Dict[str, Any]:
+    """
+    Execute a circular rebalance through the hive using explicit sendpay route.
+
+    This bypasses sling's automatic route finding and uses an explicit route
+    through hive members, ensuring zero-fee internal routing.
+
+    Args:
+        ctx: HiveContext
+        from_channel: Source channel SCID (where we have outbound liquidity)
+        to_channel: Destination channel SCID (where we want more local balance)
+        amount_sats: Amount to rebalance in satoshis
+        via_members: Optional list of intermediate member pubkeys
+        dry_run: If True, just show the route without executing (default: True)
+
+    Returns:
+        Dict with route details and execution result (or preview if dry_run)
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        return ctx.cost_reduction_mgr.execute_hive_circular_rebalance(
+            from_channel=from_channel,
+            to_channel=to_channel,
+            amount_sats=amount_sats,
+            via_members=via_members,
+            dry_run=dry_run
+        )
+
+    except Exception as e:
+        return {"error": f"Failed to execute hive circular rebalance: {e}"}
+
+
 # =============================================================================
 # CHANNEL RATIONALIZATION COMMANDS
 # =============================================================================

@@ -146,6 +146,7 @@ from modules.rpc_commands import (
     record_rebalance_outcome as rpc_record_rebalance_outcome,
     circular_flow_status as rpc_circular_flow_status,
     cost_reduction_status as rpc_cost_reduction_status,
+    execute_hive_circular_rebalance as rpc_execute_hive_circular_rebalance,
     # Channel Rationalization
     coverage_analysis as rpc_coverage_analysis,
     close_recommendations as rpc_close_recommendations,
@@ -13969,6 +13970,49 @@ def hive_cost_reduction_status(plugin: Plugin):
         Dict with cost reduction status.
     """
     return rpc_cost_reduction_status(_get_hive_context())
+
+
+@plugin.method("hive-execute-circular-rebalance")
+def hive_execute_circular_rebalance(
+    plugin: Plugin,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int,
+    via_members: list = None,
+    dry_run: bool = True
+):
+    """
+    Execute a circular rebalance through the hive using explicit sendpay route.
+
+    This bypasses sling's automatic route finding and uses an explicit route
+    through hive members, ensuring zero-fee internal routing. The route goes:
+    us -> from_channel_peer -> to_channel_peer -> us
+
+    Args:
+        from_channel: Source channel SCID (where we have outbound liquidity)
+        to_channel: Destination channel SCID (where we want more local balance)
+        amount_sats: Amount to rebalance in satoshis
+        via_members: Optional list of intermediate member pubkeys
+        dry_run: If True, just show the route without executing (default: True)
+
+    Returns:
+        Dict with route details and execution result (or preview if dry_run)
+
+    Example:
+        # Preview the route:
+        lightning-cli hive-execute-circular-rebalance 933128x1345x0 933882x99x0 50000
+
+        # Execute the rebalance:
+        lightning-cli hive-execute-circular-rebalance 933128x1345x0 933882x99x0 50000 null false
+    """
+    return rpc_execute_hive_circular_rebalance(
+        _get_hive_context(),
+        from_channel=from_channel,
+        to_channel=to_channel,
+        amount_sats=amount_sats,
+        via_members=via_members,
+        dry_run=dry_run
+    )
 
 
 # =============================================================================

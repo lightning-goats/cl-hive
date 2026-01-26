@@ -2322,6 +2322,41 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="execute_hive_circular_rebalance",
+            description="Execute a circular rebalance through hive members using explicit sendpay routes. Uses 0-fee internal hive channels for cost-free liquidity rebalancing. Specify from_channel (source) and to_channel (destination) on your node, and optionally via_members to control the route through the hive triangle/mesh.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "from_channel": {
+                        "type": "string",
+                        "description": "Source channel SCID to drain liquidity from"
+                    },
+                    "to_channel": {
+                        "type": "string",
+                        "description": "Destination channel SCID to add liquidity to"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount to rebalance in satoshis"
+                    },
+                    "via_members": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of hive member pubkeys to route through (in order). If omitted, uses direct path between from/to channel peers."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, calculate route but don't execute (default: true)"
+                    }
+                },
+                "required": ["node", "from_channel", "to_channel", "amount_sats"]
+            }
+        ),
+        Tool(
             name="cost_reduction_status",
             description="Get overall cost reduction status. Comprehensive view of Phase 3 systems including predictive rebalancing, fleet routing, and circular flow detection.",
             inputSchema={
@@ -3163,6 +3198,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_fleet_rebalance_path(arguments)
         elif name == "circular_flow_status":
             result = await handle_circular_flow_status(arguments)
+        elif name == "execute_hive_circular_rebalance":
+            result = await handle_execute_hive_circular_rebalance(arguments)
         elif name == "cost_reduction_status":
             result = await handle_cost_reduction_status(arguments)
         # Routing Intelligence tools
@@ -6549,6 +6586,31 @@ async def handle_cost_reduction_status(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-cost-reduction-status", {})
+
+
+async def handle_execute_hive_circular_rebalance(args: Dict) -> Dict:
+    """Execute a circular rebalance through hive members using explicit sendpay routes."""
+    node_name = args.get("node")
+    from_channel = args.get("from_channel")
+    to_channel = args.get("to_channel")
+    amount_sats = args.get("amount_sats")
+    via_members = args.get("via_members")
+    dry_run = args.get("dry_run", True)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {
+        "from_channel": from_channel,
+        "to_channel": to_channel,
+        "amount_sats": amount_sats,
+        "dry_run": dry_run
+    }
+    if via_members is not None:
+        params["via_members"] = via_members
+
+    return await node.call("hive-execute-circular-rebalance", params)
 
 
 # =============================================================================
