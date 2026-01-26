@@ -3100,7 +3100,8 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
         return False
 
     # Use a deterministic request_id so all nodes reference the same promotion
-    request_id = f"manual_{target_peer_id[:32]}"
+    # Must be hex-only (protocol validation requires [0-9a-f] only)
+    request_id = target_peer_id[2:34]  # First 32 hex chars after "03" prefix
 
     # Create and sign the vouch
     vouch_ts = int(time.time())
@@ -8918,7 +8919,7 @@ def hive_sync_promotion(plugin: Plugin, target_peer_id: str):
     success = _broadcast_promotion_vote(target_peer_id, our_pubkey)
 
     # Get current vouch count
-    request_id = f"manual_{target_peer_id[:32]}"
+    request_id = target_peer_id[2:34]  # First 32 hex chars after "03" prefix
     vouches = database.get_promotion_vouches(target_peer_id, request_id)
     active_members = membership_mgr.get_active_members()
     quorum = membership_mgr.calculate_quorum(len(active_members))
