@@ -59,6 +59,35 @@ SATURATION_PCT_THRESHOLD = 0.80       # >80% local = saturation risk
 MAX_PREDICTIONS_PER_CHANNEL = 5       # Max predictions cached per channel
 PREDICTION_STALE_HOURS = 1            # Refresh predictions hourly
 
+# =============================================================================
+# INTRA-DAY PATTERN DETECTION SETTINGS (Kalman-Enhanced)
+# =============================================================================
+# Intra-day patterns detect recurring flow within each day (morning surge,
+# lunch lull, evening peak, overnight recovery) using Kalman velocity.
+
+# Time buckets for intra-day analysis
+INTRADAY_BUCKETS = {
+    "early_morning": (5, 8),    # 05:00-08:00 UTC
+    "morning": (8, 12),         # 08:00-12:00 UTC
+    "afternoon": (12, 17),      # 12:00-17:00 UTC
+    "evening": (17, 21),        # 17:00-21:00 UTC
+    "night": (21, 24),          # 21:00-00:00 UTC
+    "overnight": (0, 5),        # 00:00-05:00 UTC
+}
+
+# Kalman-enhanced pattern detection
+INTRADAY_MIN_SAMPLES_PER_BUCKET = 5           # Min samples per time bucket
+INTRADAY_VELOCITY_ONSET_HOURS = 2             # Predict pattern onset this far ahead
+INTRADAY_REGIME_CHANGE_THRESHOLD = 2.5        # Std devs for regime change detection
+INTRADAY_PATTERN_DECAY_DAYS = 7               # Half-life for pattern confidence decay
+INTRADAY_KALMAN_WEIGHT = 0.6                  # Weight for Kalman confidence vs sample count
+
+# Pattern classification thresholds
+INTRADAY_SURGE_VELOCITY = 0.02                # >2%/hr = surge
+INTRADAY_DRAIN_VELOCITY = -0.02               # <-2%/hr = drain
+INTRADAY_ACTIVE_THRESHOLD = 0.01              # >1%/hr magnitude = active period
+INTRADAY_QUIET_THRESHOLD = 0.005              # <0.5%/hr magnitude = quiet period
+
 
 # =============================================================================
 # ENUMS
@@ -283,6 +312,158 @@ class KalmanVelocityReport:
             "is_regime_change": self.is_regime_change,
             "timestamp": self.timestamp,
             "age_seconds": int(time.time()) - self.timestamp
+        }
+
+
+# =============================================================================
+# INTRA-DAY PATTERN DATACLASSES
+# =============================================================================
+
+class IntraDayPhase(Enum):
+    """Phase of the day based on typical flow patterns."""
+    EARLY_MORNING = "early_morning"   # 05:00-08:00 - Pre-market positioning
+    MORNING = "morning"               # 08:00-12:00 - Active trading hours
+    AFTERNOON = "afternoon"           # 12:00-17:00 - Lunch lull to afternoon
+    EVENING = "evening"               # 17:00-21:00 - Evening peak
+    NIGHT = "night"                   # 21:00-00:00 - Wind down
+    OVERNIGHT = "overnight"           # 00:00-05:00 - Low activity, rebalance window
+
+
+class PatternType(Enum):
+    """Type of intra-day pattern detected."""
+    SURGE = "surge"           # High inbound velocity (>2%/hr)
+    DRAIN = "drain"           # High outbound velocity (<-2%/hr)
+    ACTIVE = "active"         # Significant flow in either direction
+    QUIET = "quiet"           # Low flow period
+    TRANSITION = "transition" # Changing between states
+
+
+@dataclass
+class IntraDayPattern:
+    """
+    Kalman-enhanced intra-day flow pattern.
+
+    Represents a recurring pattern within a specific time bucket,
+    enhanced with Kalman velocity estimates for better prediction.
+    """
+    channel_id: str
+    phase: IntraDayPhase
+    pattern_type: PatternType
+    hour_start: int                    # Start hour (0-23)
+    hour_end: int                      # End hour (0-23)
+
+    # Kalman-enhanced metrics
+    avg_velocity: float                # Average velocity during this phase (%/hr)
+    velocity_std: float                # Velocity standard deviation
+    kalman_confidence: float           # Confidence from Kalman uncertainty
+    sample_confidence: float           # Confidence from sample count
+
+    # Pattern statistics
+    sample_count: int                  # Number of observations
+    avg_flow_magnitude: int            # Average absolute flow (sats)
+    consistency: float                 # How consistent the pattern is (0-1)
+
+    # Regime detection
+    is_regime_stable: bool = True      # False if recent regime change detected
+    regime_change_count: int = 0       # Times pattern has shifted recently
+
+    # Timing
+    detected_at: int = 0
+    last_confirmed: int = 0            # Last time pattern was observed
+
+    def __post_init__(self):
+        now = int(time.time())
+        if self.detected_at == 0:
+            self.detected_at = now
+        if self.last_confirmed == 0:
+            self.last_confirmed = now
+
+    @property
+    def combined_confidence(self) -> float:
+        """Combined confidence from Kalman and sample count."""
+        return (
+            INTRADAY_KALMAN_WEIGHT * self.kalman_confidence +
+            (1 - INTRADAY_KALMAN_WEIGHT) * self.sample_confidence
+        )
+
+    @property
+    def is_actionable(self) -> bool:
+        """Whether this pattern is reliable enough to act on."""
+        return (
+            self.combined_confidence >= PATTERN_CONFIDENCE_THRESHOLD and
+            self.is_regime_stable and
+            self.sample_count >= INTRADAY_MIN_SAMPLES_PER_BUCKET
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "channel_id": self.channel_id,
+            "phase": self.phase.value,
+            "pattern_type": self.pattern_type.value,
+            "hours": f"{self.hour_start:02d}:00-{self.hour_end:02d}:00",
+            "avg_velocity_pct_hr": round(self.avg_velocity * 100, 3),
+            "velocity_std": round(self.velocity_std, 4),
+            "kalman_confidence": round(self.kalman_confidence, 3),
+            "sample_confidence": round(self.sample_confidence, 3),
+            "combined_confidence": round(self.combined_confidence, 3),
+            "sample_count": self.sample_count,
+            "avg_flow_magnitude_sats": self.avg_flow_magnitude,
+            "consistency": round(self.consistency, 3),
+            "is_regime_stable": self.is_regime_stable,
+            "is_actionable": self.is_actionable,
+            "detected_at": self.detected_at,
+            "last_confirmed": self.last_confirmed
+        }
+
+
+@dataclass
+class IntraDayForecast:
+    """
+    Forecast for upcoming intra-day pattern.
+
+    Predicts what will happen in the next few hours based on
+    detected patterns and current Kalman velocity.
+    """
+    channel_id: str
+    current_phase: IntraDayPhase
+    next_phase: IntraDayPhase
+    hours_until_transition: float
+
+    # Predictions
+    expected_velocity: float           # Expected velocity in next phase
+    velocity_confidence: float         # Confidence in velocity prediction
+    expected_direction: str            # "inbound", "outbound", "balanced"
+
+    # Recommended actions
+    recommended_action: str            # "preposition", "raise_fees", "lower_fees", "monitor"
+    action_urgency: str                # "immediate", "soon", "planned", "none"
+    optimal_action_window: Tuple[int, int]  # (start_hour, end_hour) for action
+
+    # Risk assessment
+    depletion_risk_increase: float     # How much depletion risk will increase
+    saturation_risk_increase: float    # How much saturation risk will increase
+
+    forecast_at: int = 0
+
+    def __post_init__(self):
+        if self.forecast_at == 0:
+            self.forecast_at = int(time.time())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "channel_id": self.channel_id,
+            "current_phase": self.current_phase.value,
+            "next_phase": self.next_phase.value,
+            "hours_until_transition": round(self.hours_until_transition, 1),
+            "expected_velocity_pct_hr": round(self.expected_velocity * 100, 3),
+            "velocity_confidence": round(self.velocity_confidence, 3),
+            "expected_direction": self.expected_direction,
+            "recommended_action": self.recommended_action,
+            "action_urgency": self.action_urgency,
+            "optimal_action_window": f"{self.optimal_action_window[0]:02d}:00-{self.optimal_action_window[1]:02d}:00",
+            "depletion_risk_increase": round(self.depletion_risk_increase, 3),
+            "saturation_risk_increase": round(self.saturation_risk_increase, 3),
+            "forecast_at": self.forecast_at
         }
 
 
@@ -742,6 +923,424 @@ class AnticipatoryLiquidityManager:
             ))
 
         return patterns
+
+    # =========================================================================
+    # INTRA-DAY PATTERN DETECTION (Kalman-Enhanced)
+    # =========================================================================
+
+    def detect_intraday_patterns(
+        self,
+        channel_id: str,
+        force_refresh: bool = False
+    ) -> List[IntraDayPattern]:
+        """
+        Detect Kalman-enhanced intra-day flow patterns.
+
+        Analyzes flow data to find recurring patterns within each day,
+        using Kalman velocity estimates for improved confidence and
+        earlier pattern onset detection.
+
+        Args:
+            channel_id: Channel SCID
+            force_refresh: Force recalculation even if cached
+
+        Returns:
+            List of IntraDayPattern objects for each time bucket
+        """
+        now = int(time.time())
+        cache_key = f"intraday_{channel_id}"
+
+        # Check cache
+        if not force_refresh and hasattr(self, '_intraday_cache'):
+            cached = self._intraday_cache.get(cache_key)
+            if cached and (now - cached.get('time', 0)) < PREDICTION_STALE_HOURS * 3600:
+                return cached.get('patterns', [])
+
+        # Load flow history
+        samples = self.load_flow_history(channel_id)
+        if len(samples) < MIN_PATTERN_SAMPLES:
+            return []
+
+        # Get Kalman data if available
+        kalman_data = self._get_kalman_consensus_velocity(channel_id)
+        kalman_confidence = 0.5  # Default without Kalman
+        is_regime_change = False
+
+        if kalman_data is not None:
+            # Get full Kalman report for uncertainty
+            reports = self._kalman_velocities.get(channel_id, [])
+            if reports:
+                valid_reports = [r for r in reports if not r.is_stale()]
+                if valid_reports:
+                    avg_uncertainty = sum(r.uncertainty for r in valid_reports) / len(valid_reports)
+                    # Convert uncertainty to confidence (lower uncertainty = higher confidence)
+                    kalman_confidence = max(0.3, min(0.95, 1.0 - avg_uncertainty * 5))
+                    is_regime_change = any(r.is_regime_change for r in valid_reports)
+
+        patterns = []
+
+        # Analyze each time bucket
+        for phase_name, (hour_start, hour_end) in INTRADAY_BUCKETS.items():
+            phase = IntraDayPhase(phase_name)
+            pattern = self._analyze_intraday_bucket(
+                channel_id=channel_id,
+                samples=samples,
+                phase=phase,
+                hour_start=hour_start,
+                hour_end=hour_end,
+                kalman_confidence=kalman_confidence,
+                is_regime_change=is_regime_change
+            )
+            if pattern:
+                patterns.append(pattern)
+
+        # Cache results
+        if not hasattr(self, '_intraday_cache'):
+            self._intraday_cache: Dict[str, Dict] = {}
+        self._intraday_cache[cache_key] = {
+            'time': now,
+            'patterns': patterns
+        }
+
+        self._log(
+            f"Detected {len(patterns)} intra-day patterns for {channel_id[:12]}...",
+            level="debug"
+        )
+
+        return patterns
+
+    def _analyze_intraday_bucket(
+        self,
+        channel_id: str,
+        samples: List[HourlyFlowSample],
+        phase: IntraDayPhase,
+        hour_start: int,
+        hour_end: int,
+        kalman_confidence: float,
+        is_regime_change: bool
+    ) -> Optional[IntraDayPattern]:
+        """
+        Analyze a specific time bucket for patterns.
+
+        Args:
+            channel_id: Channel SCID
+            samples: All flow samples
+            phase: IntraDayPhase enum
+            hour_start: Start hour of bucket
+            hour_end: End hour of bucket
+            kalman_confidence: Confidence from Kalman filter
+            is_regime_change: Whether regime change was detected
+
+        Returns:
+            IntraDayPattern or None if insufficient data
+        """
+        # Filter samples to this time bucket
+        if hour_end > hour_start:
+            bucket_samples = [
+                s for s in samples
+                if hour_start <= s.hour < hour_end
+            ]
+        else:
+            # Handle overnight bucket (wraps around midnight)
+            bucket_samples = [
+                s for s in samples
+                if s.hour >= hour_start or s.hour < hour_end
+            ]
+
+        if len(bucket_samples) < INTRADAY_MIN_SAMPLES_PER_BUCKET:
+            return None
+
+        # Calculate velocities for each sample
+        # Velocity = net_flow / capacity (approximated from flow magnitude)
+        velocities = []
+        flow_magnitudes = []
+
+        for sample in bucket_samples:
+            magnitude = abs(sample.net_flow_sats)
+            flow_magnitudes.append(magnitude)
+
+            # Estimate velocity as fraction of typical capacity
+            # (we don't have capacity here, so use relative metric)
+            if magnitude > 0:
+                direction = 1 if sample.net_flow_sats > 0 else -1
+                # Normalize by assuming 10M sat typical capacity
+                velocity = (sample.net_flow_sats / 10_000_000)
+                velocities.append(velocity)
+
+        if not velocities:
+            return None
+
+        # Calculate statistics
+        avg_velocity = sum(velocities) / len(velocities)
+        velocity_variance = sum((v - avg_velocity) ** 2 for v in velocities) / len(velocities)
+        velocity_std = math.sqrt(velocity_variance)
+        avg_magnitude = int(sum(flow_magnitudes) / len(flow_magnitudes))
+
+        # Calculate consistency (how often direction matches average)
+        if avg_velocity != 0:
+            direction_matches = sum(
+                1 for v in velocities
+                if (v > 0) == (avg_velocity > 0)
+            )
+            consistency = direction_matches / len(velocities)
+        else:
+            consistency = 0.5
+
+        # Calculate sample-based confidence
+        sample_confidence = min(1.0, len(bucket_samples) / (INTRADAY_MIN_SAMPLES_PER_BUCKET * 3))
+
+        # Classify pattern type
+        if avg_velocity > INTRADAY_SURGE_VELOCITY:
+            pattern_type = PatternType.SURGE
+        elif avg_velocity < INTRADAY_DRAIN_VELOCITY:
+            pattern_type = PatternType.DRAIN
+        elif abs(avg_velocity) > INTRADAY_ACTIVE_THRESHOLD:
+            pattern_type = PatternType.ACTIVE
+        elif abs(avg_velocity) < INTRADAY_QUIET_THRESHOLD:
+            pattern_type = PatternType.QUIET
+        else:
+            pattern_type = PatternType.TRANSITION
+
+        # Detect regime instability
+        regime_stable = not is_regime_change
+        if velocity_std > abs(avg_velocity) * 2:
+            # High variance relative to mean suggests unstable pattern
+            regime_stable = False
+
+        return IntraDayPattern(
+            channel_id=channel_id,
+            phase=phase,
+            pattern_type=pattern_type,
+            hour_start=hour_start,
+            hour_end=hour_end,
+            avg_velocity=avg_velocity,
+            velocity_std=velocity_std,
+            kalman_confidence=kalman_confidence,
+            sample_confidence=sample_confidence,
+            sample_count=len(bucket_samples),
+            avg_flow_magnitude=avg_magnitude,
+            consistency=consistency,
+            is_regime_stable=regime_stable,
+            regime_change_count=1 if is_regime_change else 0
+        )
+
+    def get_intraday_forecast(
+        self,
+        channel_id: str,
+        current_local_pct: float = 0.5
+    ) -> Optional[IntraDayForecast]:
+        """
+        Get forecast for upcoming intra-day pattern transition.
+
+        Predicts what will happen in the next few hours and recommends
+        preemptive actions.
+
+        Args:
+            channel_id: Channel SCID
+            current_local_pct: Current local balance percentage
+
+        Returns:
+            IntraDayForecast or None if insufficient data
+        """
+        patterns = self.detect_intraday_patterns(channel_id)
+        if not patterns:
+            return None
+
+        # Determine current phase
+        now = datetime.now()
+        current_hour = now.hour
+        current_phase = self._get_phase_for_hour(current_hour)
+        next_phase = self._get_next_phase(current_phase)
+
+        # Get current and next phase patterns
+        current_pattern = next(
+            (p for p in patterns if p.phase == current_phase),
+            None
+        )
+        next_pattern = next(
+            (p for p in patterns if p.phase == next_phase),
+            None
+        )
+
+        if not next_pattern:
+            return None
+
+        # Calculate hours until transition
+        _, current_end = INTRADAY_BUCKETS[current_phase.value]
+        hours_until = (current_end - current_hour) % 24
+        if hours_until == 0:
+            hours_until = 1  # At least 1 hour
+
+        # Determine expected direction
+        if next_pattern.avg_velocity > INTRADAY_ACTIVE_THRESHOLD:
+            expected_direction = "inbound"
+        elif next_pattern.avg_velocity < -INTRADAY_ACTIVE_THRESHOLD:
+            expected_direction = "outbound"
+        else:
+            expected_direction = "balanced"
+
+        # Calculate risk increases
+        depletion_risk_increase = 0.0
+        saturation_risk_increase = 0.0
+
+        if next_pattern.avg_velocity < 0:
+            # Outbound flow increases depletion risk
+            hours_of_drain = INTRADAY_BUCKETS[next_phase.value][1] - INTRADAY_BUCKETS[next_phase.value][0]
+            if hours_of_drain <= 0:
+                hours_of_drain = 24 - INTRADAY_BUCKETS[next_phase.value][0] + INTRADAY_BUCKETS[next_phase.value][1]
+            projected_drain = abs(next_pattern.avg_velocity) * hours_of_drain
+            depletion_risk_increase = min(0.5, projected_drain / current_local_pct) if current_local_pct > 0 else 0.5
+        else:
+            # Inbound flow increases saturation risk
+            hours_of_inflow = INTRADAY_BUCKETS[next_phase.value][1] - INTRADAY_BUCKETS[next_phase.value][0]
+            if hours_of_inflow <= 0:
+                hours_of_inflow = 24 - INTRADAY_BUCKETS[next_phase.value][0] + INTRADAY_BUCKETS[next_phase.value][1]
+            projected_inflow = next_pattern.avg_velocity * hours_of_inflow
+            saturation_risk_increase = min(0.5, projected_inflow / (1 - current_local_pct)) if current_local_pct < 1 else 0.5
+
+        # Determine recommended action and urgency
+        action, urgency = self._determine_intraday_action(
+            current_local_pct=current_local_pct,
+            next_pattern=next_pattern,
+            hours_until=hours_until,
+            depletion_risk_increase=depletion_risk_increase,
+            saturation_risk_increase=saturation_risk_increase
+        )
+
+        # Calculate optimal action window (before transition)
+        action_start = (current_end - INTRADAY_VELOCITY_ONSET_HOURS) % 24
+        action_end = current_end
+
+        return IntraDayForecast(
+            channel_id=channel_id,
+            current_phase=current_phase,
+            next_phase=next_phase,
+            hours_until_transition=hours_until,
+            expected_velocity=next_pattern.avg_velocity,
+            velocity_confidence=next_pattern.combined_confidence,
+            expected_direction=expected_direction,
+            recommended_action=action,
+            action_urgency=urgency,
+            optimal_action_window=(action_start, action_end),
+            depletion_risk_increase=depletion_risk_increase,
+            saturation_risk_increase=saturation_risk_increase
+        )
+
+    def _get_phase_for_hour(self, hour: int) -> IntraDayPhase:
+        """Get the IntraDayPhase for a given hour."""
+        for phase_name, (start, end) in INTRADAY_BUCKETS.items():
+            if end > start:
+                if start <= hour < end:
+                    return IntraDayPhase(phase_name)
+            else:
+                # Overnight bucket
+                if hour >= start or hour < end:
+                    return IntraDayPhase(phase_name)
+        return IntraDayPhase.OVERNIGHT  # Default fallback
+
+    def _get_next_phase(self, current: IntraDayPhase) -> IntraDayPhase:
+        """Get the next phase in the daily cycle."""
+        phase_order = [
+            IntraDayPhase.OVERNIGHT,
+            IntraDayPhase.EARLY_MORNING,
+            IntraDayPhase.MORNING,
+            IntraDayPhase.AFTERNOON,
+            IntraDayPhase.EVENING,
+            IntraDayPhase.NIGHT,
+        ]
+        idx = phase_order.index(current)
+        return phase_order[(idx + 1) % len(phase_order)]
+
+    def _determine_intraday_action(
+        self,
+        current_local_pct: float,
+        next_pattern: IntraDayPattern,
+        hours_until: float,
+        depletion_risk_increase: float,
+        saturation_risk_increase: float
+    ) -> Tuple[str, str]:
+        """
+        Determine recommended action and urgency for intra-day transition.
+
+        Returns:
+            Tuple of (action, urgency)
+        """
+        # Check if pattern is actionable
+        if not next_pattern.is_actionable:
+            return ("monitor", "none")
+
+        max_risk = max(depletion_risk_increase, saturation_risk_increase)
+
+        # High risk scenarios
+        if max_risk > 0.3:
+            if hours_until <= 2:
+                if next_pattern.pattern_type == PatternType.DRAIN and current_local_pct < 0.4:
+                    return ("preposition", "immediate")
+                elif next_pattern.pattern_type == PatternType.SURGE and current_local_pct > 0.6:
+                    return ("lower_fees", "immediate")
+            elif hours_until <= 4:
+                if next_pattern.pattern_type == PatternType.DRAIN:
+                    return ("preposition", "soon")
+                elif next_pattern.pattern_type == PatternType.SURGE:
+                    return ("raise_fees", "soon")
+
+        # Medium risk scenarios
+        if max_risk > 0.15:
+            if next_pattern.pattern_type == PatternType.DRAIN:
+                return ("preposition", "planned")
+            elif next_pattern.pattern_type == PatternType.SURGE:
+                return ("raise_fees", "planned")
+
+        # Low activity periods are good for rebalancing
+        if next_pattern.pattern_type == PatternType.QUIET:
+            if current_local_pct < 0.3 or current_local_pct > 0.7:
+                return ("preposition", "planned")
+
+        return ("monitor", "none")
+
+    def get_intraday_summary(self, channel_id: str = None) -> Dict[str, Any]:
+        """
+        Get summary of intra-day patterns for one or all channels.
+
+        Args:
+            channel_id: Optional specific channel, None for all
+
+        Returns:
+            Summary dict with pattern statistics
+        """
+        if channel_id:
+            patterns = self.detect_intraday_patterns(channel_id)
+            forecasts = [self.get_intraday_forecast(channel_id)]
+            forecasts = [f for f in forecasts if f]
+        else:
+            # Get patterns for all channels with flow history
+            patterns = []
+            forecasts = []
+            for cid in list(self._flow_history.keys())[:20]:  # Limit to 20
+                channel_patterns = self.detect_intraday_patterns(cid)
+                patterns.extend(channel_patterns)
+                forecast = self.get_intraday_forecast(cid)
+                if forecast:
+                    forecasts.append(forecast)
+
+        # Summarize
+        actionable = [p for p in patterns if p.is_actionable]
+        by_type = {}
+        for p in patterns:
+            ptype = p.pattern_type.value
+            by_type[ptype] = by_type.get(ptype, 0) + 1
+
+        urgent_forecasts = [f for f in forecasts if f.action_urgency in ("immediate", "soon")]
+
+        return {
+            "total_patterns": len(patterns),
+            "actionable_patterns": len(actionable),
+            "patterns_by_type": by_type,
+            "total_forecasts": len(forecasts),
+            "urgent_forecasts": len(urgent_forecasts),
+            "patterns": [p.to_dict() for p in patterns[:10]],  # Limit output
+            "forecasts": [f.to_dict() for f in forecasts[:5]]
+        }
 
     # =========================================================================
     # PREDICTION

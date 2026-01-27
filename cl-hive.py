@@ -13745,6 +13745,107 @@ def hive_query_kalman_velocity(plugin: Plugin, channel_id: str):
         return {"error": f"Failed to query Kalman velocity: {e}"}
 
 
+@plugin.method("hive-detect-patterns")
+def hive_detect_patterns(plugin: Plugin, channel_id: str):
+    """
+    Detect Kalman-enhanced intra-day flow patterns for a channel.
+
+    Analyzes historical flow data to find recurring patterns within each day
+    (morning surge, lunch lull, evening peak, overnight recovery), using
+    Kalman velocity estimates for improved confidence.
+
+    Args:
+        channel_id: Channel SCID to analyze
+
+    Returns:
+        Dict with detected intra-day patterns and statistics
+    """
+    ctx = _get_hive_context()
+    if not ctx.anticipatory_manager:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    try:
+        patterns = ctx.anticipatory_manager.detect_intraday_patterns(channel_id)
+        return {
+            "status": "ok",
+            "channel_id": channel_id,
+            "pattern_count": len(patterns),
+            "actionable_count": sum(1 for p in patterns if p.is_actionable),
+            "patterns": [p.to_dict() for p in patterns]
+        }
+    except Exception as e:
+        return {"error": f"Failed to detect patterns: {e}"}
+
+
+@plugin.method("hive-predict-liquidity")
+def hive_predict_liquidity_intraday(
+    plugin: Plugin,
+    channel_id: str,
+    current_local_pct: float = 0.5
+):
+    """
+    Get intra-day liquidity forecast for a channel.
+
+    Predicts what will happen in the next few hours based on detected
+    patterns and current Kalman velocity, with recommended actions.
+
+    Args:
+        channel_id: Channel SCID
+        current_local_pct: Current local balance percentage (0.0-1.0)
+
+    Returns:
+        Dict with forecast and recommended actions
+    """
+    ctx = _get_hive_context()
+    if not ctx.anticipatory_manager:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    try:
+        current_local_pct = float(current_local_pct)
+        forecast = ctx.anticipatory_manager.get_intraday_forecast(
+            channel_id, current_local_pct
+        )
+        if not forecast:
+            return {
+                "status": "no_forecast",
+                "channel_id": channel_id,
+                "message": "Insufficient data for forecast"
+            }
+        return {
+            "status": "ok",
+            **forecast.to_dict()
+        }
+    except Exception as e:
+        return {"error": f"Failed to get forecast: {e}"}
+
+
+@plugin.method("hive-anticipatory-predictions")
+def hive_anticipatory_predictions(plugin: Plugin, channel_id: str = None):
+    """
+    Get intra-day pattern summary for one or all channels.
+
+    Shows detected patterns, forecasts, and urgent actions needed.
+
+    Args:
+        channel_id: Optional specific channel, None for all
+
+    Returns:
+        Dict with pattern summary and forecasts
+    """
+    ctx = _get_hive_context()
+    if not ctx.anticipatory_manager:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    try:
+        summary = ctx.anticipatory_manager.get_intraday_summary(channel_id)
+        return {
+            "status": "ok",
+            **summary
+        }
+    except Exception as e:
+        return {"error": f"Failed to get predictions: {e}"}
+
+
 # =============================================================================
 # PHASE 2 FEE COORDINATION RPC METHODS
 # =============================================================================
