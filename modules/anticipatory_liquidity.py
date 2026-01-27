@@ -1252,8 +1252,12 @@ class AnticipatoryLiquidityManager:
             IntraDayPhase.EVENING,
             IntraDayPhase.NIGHT,
         ]
-        idx = phase_order.index(current)
-        return phase_order[(idx + 1) % len(phase_order)]
+        try:
+            idx = phase_order.index(current)
+            return phase_order[(idx + 1) % len(phase_order)]
+        except ValueError:
+            # Unknown phase - default to overnight as safe fallback
+            return IntraDayPhase.OVERNIGHT
 
     def _determine_intraday_action(
         self,
@@ -2107,6 +2111,21 @@ class AnticipatoryLiquidityManager:
         if not hasattr(self, "_remote_patterns"):
             self._remote_patterns: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
+        # Limit total number of tracked peers to prevent unbounded growth
+        MAX_REMOTE_PEERS = 500
+        if peer_id not in self._remote_patterns and len(self._remote_patterns) >= MAX_REMOTE_PEERS:
+            # Evict oldest peer (by most recent pattern timestamp)
+            oldest_peer = None
+            oldest_time = float('inf')
+            for pid, patterns in self._remote_patterns.items():
+                if patterns:
+                    latest = max(p.get("timestamp", 0) for p in patterns)
+                    if latest < oldest_time:
+                        oldest_time = latest
+                        oldest_peer = pid
+            if oldest_peer:
+                del self._remote_patterns[oldest_peer]
+
         hour = pattern_data.get("hour_of_day", -1)
         day = pattern_data.get("day_of_week", -1)
 
@@ -2226,6 +2245,26 @@ class AnticipatoryLiquidityManager:
             confidence = max(0, min(1, confidence))
         if uncertainty < 0:
             uncertainty = abs(uncertainty)
+
+        # Limit total channels tracked to prevent unbounded growth
+        MAX_KALMAN_CHANNELS = 1000
+        if channel_id not in self._kalman_velocities and len(self._kalman_velocities) >= MAX_KALMAN_CHANNELS:
+            # Evict channel with oldest reports (least recently updated)
+            oldest_channel = None
+            oldest_time = float('inf')
+            for cid, reports in self._kalman_velocities.items():
+                if reports:
+                    latest = max(r.timestamp for r in reports)
+                    if latest < oldest_time:
+                        oldest_time = latest
+                        oldest_channel = cid
+            if oldest_channel:
+                # Clean up peer_to_channels mapping for evicted channel
+                for pid in list(self._peer_to_channels.keys()):
+                    self._peer_to_channels[pid].discard(oldest_channel)
+                    if not self._peer_to_channels[pid]:
+                        del self._peer_to_channels[pid]
+                del self._kalman_velocities[oldest_channel]
 
         report = KalmanVelocityReport(
             channel_id=channel_id,
