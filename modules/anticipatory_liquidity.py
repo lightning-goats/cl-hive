@@ -1609,6 +1609,15 @@ class AnticipatoryLiquidityManager:
         if not channel_id or not reporter_id:
             return False
 
+        # Convert inputs to proper types (RPC may pass strings)
+        try:
+            velocity_pct_per_hour = float(velocity_pct_per_hour)
+            uncertainty = float(uncertainty)
+            flow_ratio = float(flow_ratio)
+            confidence = float(confidence)
+        except (ValueError, TypeError):
+            return False
+
         # Validate inputs
         if confidence < 0 or confidence > 1:
             confidence = max(0, min(1, confidence))
