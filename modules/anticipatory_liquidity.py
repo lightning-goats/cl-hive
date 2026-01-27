@@ -1189,14 +1189,18 @@ class AnticipatoryLiquidityManager:
             if hours_of_drain <= 0:
                 hours_of_drain = 24 - INTRADAY_BUCKETS[next_phase.value][0] + INTRADAY_BUCKETS[next_phase.value][1]
             projected_drain = abs(next_pattern.avg_velocity) * hours_of_drain
-            depletion_risk_increase = min(0.5, projected_drain / current_local_pct) if current_local_pct > 0 else 0.5
+            # Use safe denominator to prevent division by zero/near-zero
+            safe_local = max(0.01, current_local_pct)
+            depletion_risk_increase = min(0.5, projected_drain / safe_local)
         else:
             # Inbound flow increases saturation risk
             hours_of_inflow = INTRADAY_BUCKETS[next_phase.value][1] - INTRADAY_BUCKETS[next_phase.value][0]
             if hours_of_inflow <= 0:
                 hours_of_inflow = 24 - INTRADAY_BUCKETS[next_phase.value][0] + INTRADAY_BUCKETS[next_phase.value][1]
             projected_inflow = next_pattern.avg_velocity * hours_of_inflow
-            saturation_risk_increase = min(0.5, projected_inflow / (1 - current_local_pct)) if current_local_pct < 1 else 0.5
+            # Use safe denominator to prevent division by zero/near-zero
+            safe_remote = max(0.01, 1 - current_local_pct)
+            saturation_risk_increase = min(0.5, projected_inflow / safe_remote)
 
         # Determine recommended action and urgency
         action, urgency = self._determine_intraday_action(
