@@ -597,6 +597,7 @@ def _get_hive_context() -> HiveContext:
     _cost_reduction_mgr = cost_reduction_mgr if 'cost_reduction_mgr' in globals() else None
     _rationalization_mgr = rationalization_mgr if 'rationalization_mgr' in globals() else None
     _strategic_positioning_mgr = strategic_positioning_mgr if 'strategic_positioning_mgr' in globals() else None
+    _anticipatory_liquidity_mgr = anticipatory_liquidity_mgr if 'anticipatory_liquidity_mgr' in globals() else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -622,6 +623,8 @@ def _get_hive_context() -> HiveContext:
         cost_reduction_mgr=_cost_reduction_mgr,
         rationalization_mgr=_rationalization_mgr,
         strategic_positioning_mgr=_strategic_positioning_mgr,
+        anticipatory_manager=_anticipatory_liquidity_mgr,
+        our_id=_our_pubkey or "",
         log=_log,
     )
 

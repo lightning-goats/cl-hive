@@ -43,6 +43,8 @@ class HiveContext:
     cost_reduction_mgr: Any = None  # CostReductionManager (Phase 3 - Cost Reduction)
     rationalization_mgr: Any = None  # RationalizationManager (Channel Rationalization)
     strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
+    anticipatory_manager: Any = None  # AnticipatoryLiquidityManager (Phase 7.1 - Anticipatory Liquidity)
+    our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
