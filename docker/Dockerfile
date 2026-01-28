@@ -78,15 +78,40 @@ RUN apt-get update && apt-get install -y \
 # =============================================================================
 # CORE LIGHTNING
 # =============================================================================
+# AMD64: Use pre-built binary from GitHub releases (fast)
+# ARM64: Build from source (CLN doesn't publish ARM64 Ubuntu 24.04 binaries)
 
-# Install Core Lightning from GitHub releases
 ARG CLN_VERSION=v25.12.1
+
+# Install build dependencies for ARM64 source compilation
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    valgrind \
+    cppcheck \
+    shellcheck \
+    libsecp256k1-dev \
+    lowdown \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CLN: pre-built on AMD64, source build on ARM64
 RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi \
-    && if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi \
-    && curl -SLO "https://github.com/ElementsProject/lightning/releases/download/${CLN_VERSION}/clightning-${CLN_VERSION}-Ubuntu-24.04-${ARCH}.tar.xz" \
-    && tar -xf clightning-${CLN_VERSION}-Ubuntu-24.04-${ARCH}.tar.xz -C /usr/local --strip-components=2 \
-    && rm clightning-${CLN_VERSION}-Ubuntu-24.04-${ARCH}.tar.xz \
+    && if [ "$ARCH" = "x86_64" ]; then \
+        echo "Installing pre-built CLN for AMD64..." \
+        && curl -SLO "https://github.com/ElementsProject/lightning/releases/download/${CLN_VERSION}/clightning-${CLN_VERSION}-Ubuntu-24.04-amd64.tar.xz" \
+        && tar -xf clightning-${CLN_VERSION}-Ubuntu-24.04-amd64.tar.xz -C /usr/local --strip-components=2 \
+        && rm clightning-${CLN_VERSION}-Ubuntu-24.04-amd64.tar.xz; \
+    elif [ "$ARCH" = "aarch64" ]; then \
+        echo "Building CLN from source for ARM64..." \
+        && pip install --no-cache-dir mako grpcio-tools \
+        && git clone --depth 1 --branch ${CLN_VERSION} https://github.com/ElementsProject/lightning.git /tmp/lightning \
+        && cd /tmp/lightning \
+        && pip install --no-cache-dir -r requirements.txt \
+        && ./configure --prefix=/usr/local \
+        && make -j$(nproc) \
+        && make install \
+        && cd / \
+        && rm -rf /tmp/lightning; \
+    fi \
     && ldconfig
 
 # =============================================================================
