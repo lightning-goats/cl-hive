@@ -4,9 +4,9 @@ Settlement module for cl-hive
 Implements BOLT12-based revenue settlement for hive fleet members.
 
 Fair Share Algorithm:
-- 40% weight: Capacity contribution (total_capacity / fleet_capacity)
-- 40% weight: Routing contribution (forwards_routed / fleet_forwards)
-- 20% weight: Uptime contribution (uptime_pct / 100)
+- 30% weight: Capacity contribution (member_capacity / fleet_capacity)
+- 60% weight: Routing contribution (member_forwards / fleet_forwards)
+- 10% weight: Uptime contribution (member_uptime / fleet_uptime)
 
 Settlement Flow:
 1. Each member registers a BOLT12 offer for receiving payments
@@ -364,10 +364,10 @@ class SettlementManager:
         """
         Calculate fair share for each member based on contributions.
 
-        Standard Fair Share Algorithm:
+        Standard Fair Share Algorithm (all scores normalized across fleet):
         - 30% weight: capacity_contribution = member_capacity / total_capacity
         - 60% weight: routing_contribution = member_forwards / total_forwards
-        - 10% weight: uptime_contribution = member_uptime / 100
+        - 10% weight: uptime_contribution = member_uptime / total_uptime
 
         Network-Optimized Mode (Use Case 6):
         - 25% weight: capacity_contribution
@@ -397,6 +397,7 @@ class SettlementManager:
         total_capacity = sum(c.capacity_sats for c in contributions)
         total_forwards = sum(c.forwards_sats for c in contributions)
         total_fees = sum(c.fees_earned_sats for c in contributions)
+        total_uptime = sum(c.uptime_pct for c in contributions)
 
         if total_fees == 0:
             return [
@@ -429,7 +430,10 @@ class SettlementManager:
                 member.forwards_sats / total_forwards
                 if total_forwards > 0 else 0
             )
-            uptime_score = member.uptime_pct / 100.0
+            uptime_score = (
+                member.uptime_pct / total_uptime
+                if total_uptime > 0 else 0
+            )
 
             # Network position score (Use Case 6)
             network_score = 0.0
